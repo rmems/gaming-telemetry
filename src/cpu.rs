@@ -99,11 +99,10 @@ impl CpuMonitor {
         let entries = fs::read_dir("/sys/class/hwmon").ok()?;
         for entry in entries.flatten() {
             let name_path = entry.path().join("name");
-            if let Ok(name) = fs::read_to_string(&name_path) {
-                if name.trim() == "k10temp" {
+            if let Ok(name) = fs::read_to_string(&name_path)
+                && name.trim() == "k10temp" {
                     return Some(entry.path());
                 }
-            }
         }
         None
     }

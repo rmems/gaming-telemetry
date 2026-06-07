@@ -10,14 +10,19 @@ use std::env;
 /// Falls back to returning the original string if $HOME is not set or no match.
 pub fn redact_home(path: &str) -> String {
     if let Some(home) = env::var_os("HOME") {
-        let home = home.to_string_lossy();
-        if home.is_empty() {
+        let home_path = std::path::Path::new(&home);
+        if home_path == std::path::Path::new("/") {
             return path.to_string();
         }
-        path.replace(&*home, "$HOME")
-    } else {
-        path.to_string()
+        let input_path = std::path::Path::new(path);
+        if let Ok(stripped) = input_path.strip_prefix(home_path) {
+            if stripped.as_os_str().is_empty() {
+                return "$HOME".to_string();
+            }
+            return format!("$HOME/{}", stripped.to_string_lossy());
+        }
     }
+    path.to_string()
 }
 
 /// Redact common personal base paths (home, and placeholders for future Steam/Proton
@@ -36,14 +41,17 @@ mod tests {
 
     #[test]
     fn redact_home_replaces_prefix() {
-        // Simulate by temporarily setting HOME if needed; here we test the logic
-        // with a known pattern. In real runs $HOME will be used.
-        let example = "/home/raulmc/.local/share/Steam/steamapps/common/Cyberpunk 2077";
-        // When $HOME=/home/raulmc this should become $HOME/...
-        // We can't easily override env in this test without std::env::set_var (unsafe in tests),
-        // so we just ensure it doesn't panic and returns something.
-        let result = redact_home(example);
-        assert!(result.contains("$HOME") || result == example);
+        let home = env::var_os("HOME").unwrap_or_else(|| "/home/test".into());
+        let example = format!(
+            "{}/.local/share/Steam/steamapps/common/Cyberpunk 2077",
+            home.to_string_lossy()
+        );
+        let result = redact_home(&example);
+        assert!(
+            result.contains("$HOME"),
+            "expected redaction for path: {}",
+            example
+        );
     }
 
     #[test]

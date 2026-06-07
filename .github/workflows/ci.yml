@@ -14,7 +14,7 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -24,20 +24,20 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.3
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
 
   check-strict:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.3
       - name: Cargo check (normal)
         run: cargo check
       - name: Cargo check (strict -D warnings)
@@ -47,16 +47,22 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.3
       - name: Test
         run: cargo test
         env:
           CARGO_INCREMENTAL: 0
           RUSTFLAGS: "-C instrument-coverage"
+      - name: Generate lcov.info
+        run: |
+          cargo install grcov
+          grcov . -s . --binary-path ./target/debug -t lcov --branch --ignore-not-existing -o lcov.info
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@cd8b657745c0c7bb7f101e61a61c9ed5d74b8561 # v5.5.4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
@@ -66,9 +72,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.3
       - name: Build release
         run: cargo build --release
       - name: Build bins
@@ -88,7 +94,10 @@ jobs:
           # cargo run --bin verify_cyberpunk -- --game-path ./tests/fixtures/fake-cp2077 --format text --dry-run
           # and assert no raw personal paths appear in output/logs.
       - name: Cargo audit (non-blocking)
-        run: cargo install cargo-audit && cargo audit || true
+        uses: rustsec/audit-check@v1
+        continue-on-error: true
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   # TODO (post #9 + privacy-safe verify): add a dedicated job that runs
   # the verifier only against test fixtures using explicit --game-path

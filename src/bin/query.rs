@@ -2,6 +2,10 @@ use anyhow::Result;
 use duckdb::Connection;
 use std::env;
 
+#[path = "../privacy.rs"]
+mod privacy;
+use privacy::redact_personal_path;
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -9,10 +13,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let parquet_file = &args[1];
+    let parquet_file_redacted = redact_personal_path(parquet_file);
 
     let conn = Connection::open_in_memory()?;
 
-    println!("--- Analyzing {} with DuckDB ---", parquet_file);
+    println!("--- Analyzing {} with DuckDB ---", parquet_file_redacted);
 
     // Basic stats
     println!("\n[Summary Statistics]");

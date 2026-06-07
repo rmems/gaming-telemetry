@@ -27,20 +27,21 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-      HAS_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN != '' }}
-      SENTRY_ORG: ${{ secrets.SENTRY_ORG || 'your-org' }}
+      HAS_SENTRY_CONFIG: ${{ secrets.SENTRY_AUTH_TOKEN != '' && secrets.SENTRY_ORG != '' }}
+      SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
       SENTRY_PROJECT: gaming-telemetry
     steps:
-      - name: Skip when Sentry auth token is not configured
-        if: ${{ env.HAS_SENTRY_AUTH_TOKEN != 'true' }}
+      - name: Skip when Sentry auth token or org is not configured
+        if: ${{ env.HAS_SENTRY_CONFIG != 'true' }}
         run: |
-          echo "SENTRY_AUTH_TOKEN is not configured for GitHub Actions; skipping Sentry release creation."
+          echo "SENTRY_AUTH_TOKEN or SENTRY_ORG is not configured for GitHub Actions; skipping Sentry release creation."
 
-      - uses: actions/checkout@v4
-        if: ${{ env.HAS_SENTRY_AUTH_TOKEN == 'true' }}
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: ${{ env.HAS_SENTRY_CONFIG == 'true' }}
         with:
           fetch-depth: 0
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
 
       - name: Install pinned sentry-cli
         if: ${{ env.HAS_SENTRY_AUTH_TOKEN == 'true' }}

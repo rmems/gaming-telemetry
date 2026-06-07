@@ -21,6 +21,9 @@ fn git_sha() -> String {
     {
         return value;
     }
+    // For dev runs from source checkout, use local git. In packaged binaries run from
+    // arbitrary CWDs, prefer SENTRY_RELEASE or AGENTOS_GIT_SHA (set by CI) to avoid
+    // deriving from launch directory (see P2 feedback).
     if let Ok(output) = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
@@ -116,7 +119,7 @@ struct GpuSample {
 
 const BUFFER_SIZE: usize = 2000; // ~10 seconds of data at default 5ms intervals
 
-async fn write_to_parquet(samples: Vec<GpuSample>, batch_id: u32) -> Result<()> {
+fn write_to_parquet(samples: Vec<GpuSample>, batch_id: u32) -> Result<()> {
     let timestamps: Vec<i64> = samples
         .iter()
         .map(|s| s.timestamp.timestamp_millis())
@@ -258,12 +261,16 @@ async fn main() -> Result<()> {
                     let samples_to_write = std::mem::replace(&mut buffer, Vec::with_capacity(BUFFER_SIZE));
                     batch_counter += 1;
 
-                    // Write asynchronously to avoid blocking the polling loop
-                    tokio::spawn(async move {
-                        if let Err(e) = write_to_parquet(samples_to_write, batch_counter).await {
-                            eprintln!("Failed to write to Parquet: {:?}", e);
-                            sentry::capture_error(&*e);
-                        }
+                    // Write asynchronously using spawn_blocking to avoid blocking the async runtime.
+                    // Bind Sentry hub so captures in the blocking task are associated (per Sentry async guidance).
+                    let hub = sentry::Hub::current();
+                    tokio::task::spawn_blocking(move || {
+                        sentry::Hub::run(hub, || {
+                            if let Err(e) = write_to_parquet(samples_to_write, batch_counter) {
+                                eprintln!("Failed to write to Parquet: {:?}", e);
+                                sentry::capture_error(&*e);
+                            }
+                        });
                     });
                 }
             }
@@ -271,7 +278,7 @@ async fn main() -> Result<()> {
                 println!("\nShutdown signal received. Finalizing last batch...");
                 if !buffer.is_empty() {
                     batch_counter += 1;
-                    if let Err(e) = write_to_parquet(buffer, batch_counter).await {
+                    if let Err(e) = write_to_parquet(buffer, batch_counter) {
                         eprintln!("Failed to write final batch: {:?}", e);
                         sentry::capture_error(&*e);
                     }

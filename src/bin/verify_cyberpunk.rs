@@ -68,24 +68,23 @@ fn main() {
     let looks_like_cp2077 = exists
         && (p.join("archive").exists()
             || p.join("Cyberpunk2077.exe").exists()
-            || p.join("r6").exists()
-            || gp.contains("mods")/* for our test fixtures */);
+            || p.join("r6").exists());
 
     let ultra_plus_present = exists
         && (p.join("cyber_engine_tweaks/mods/UltraPlus").exists()
-            || p.join("r6/scripts/UltraPlus.reds").exists()
-            || gp.contains("UltraPlus"));
+            || p.join("r6/scripts/UltraPlus.reds").exists());
 
     if fmt == "json" {
-        println!(
-            "{{\"game_path_redacted\":\"{}\",\"exists\":{},\"looks_like_cp2077\":{},\"ultra_plus_detected\":{},\"dry_run\":{},\"verdict\":\"{}\",\"note\":\"All paths redacted by default. Explicit --game-path only (no $HOME/Steam/Proton auto-discovery). See #9 #10 #14.\"}}",
-            display,
-            exists,
-            looks_like_cp2077,
-            ultra_plus_present,
-            dry_run,
-            if looks_like_cp2077 { "pass-basic" } else { "unknown-or-incomplete" }
-        );
+        let json_obj = serde_json::json!({
+            "game_path_redacted": display,
+            "exists": exists,
+            "looks_like_cp2077": looks_like_cp2077,
+            "ultra_plus_detected": ultra_plus_present,
+            "dry_run": dry_run,
+            "verdict": if looks_like_cp2077 { "pass-basic" } else { "unknown-or-incomplete" },
+            "note": "All paths redacted by default. Explicit --game-path only (no $HOME/Steam/Proton auto-discovery). See #9 #10 #14."
+        });
+        println!("{}", serde_json::to_string(&json_obj).unwrap());
     } else {
         println!("=== Cyberpunk 2077 Telemetry Workload Verifier (privacy-safe skeleton) ===");
         println!("Game path (redacted): {}", display);

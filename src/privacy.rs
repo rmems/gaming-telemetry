@@ -27,7 +27,6 @@ pub fn redact_home(path: &str) -> String {
 
 /// Redact common personal base paths (home, and placeholders for future Steam/Proton
 /// awareness without ever auto-discovering them).
-#[allow(dead_code)]
 pub fn redact_personal_path(path: &str) -> String {
     let redacted = redact_home(path);
     // Future: if we ever receive explicit Steam root etc., we can extend here.

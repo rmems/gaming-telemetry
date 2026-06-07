@@ -27,14 +27,22 @@ fn main() {
         match args[i].as_str() {
             "--game-path" | "-g" => {
                 i += 1;
-                if i < args.len() {
+                if i < args.len() && !args[i].starts_with('-') {
                     game_path = Some(args[i].clone());
+                } else {
+                    eprintln!("verify_cyberpunk: missing or invalid value for --game-path");
+                    eprintln!("Usage: cargo run --bin verify_cyberpunk -- --game-path <PATH> [--format text|json] [--dry-run]");
+                    std::process::exit(2);
                 }
             }
             "--format" | "-f" => {
                 i += 1;
-                if i < args.len() {
+                if i < args.len() && !args[i].starts_with('-') {
                     fmt = args[i].clone();
+                } else {
+                    eprintln!("verify_cyberpunk: missing or invalid value for --format");
+                    eprintln!("Usage: cargo run --bin verify_cyberpunk -- --game-path <PATH> [--format text|json] [--dry-run]");
+                    std::process::exit(2);
                 }
             }
             "--dry-run" => dry_run = true,
@@ -58,7 +66,12 @@ fn main() {
     }
 
     let gp = game_path.unwrap();
-    let display = redact_personal_path(&gp);
+    let mut display = redact_personal_path(&gp);
+    // Guard against no-op redaction (e.g. path not under $HOME, /mnt/... paths, containers,
+    // or when HOME unset/mismatched). Prevents leaking original sensitive paths in output.
+    if display == gp {
+        display = "<redacted_path>".to_string();
+    }
     let p = Path::new(&gp);
     let exists = p.exists();
 

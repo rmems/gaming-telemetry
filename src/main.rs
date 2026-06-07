@@ -7,10 +7,88 @@ use cpu::CpuMonitor;
 use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 use nvml_wrapper::Nvml;
 use polars::prelude::*;
+use sentry::ClientInitGuard;
+use std::borrow::Cow;
 use std::fs::File;
 use std::process::Command;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
+
+fn git_sha() -> String {
+    if let Some(value) = std::env::var("AGENTOS_GIT_SHA")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return value;
+    }
+    if let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        && output.status.success()
+    {
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !sha.is_empty() {
+            return sha;
+        }
+    }
+    "unknown".to_owned()
+}
+
+fn resolve_sentry_release(git_sha: &str) -> String {
+    if let Some(release) = std::env::var("SENTRY_RELEASE")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        return release;
+    }
+
+    if !git_sha.trim().is_empty() && git_sha != "unknown" {
+        return format!("gaming-telemetry@{git_sha}");
+    }
+
+    if let Some(release) = sentry::release_name!() {
+        let release = release.into_owned();
+        if !release.trim().is_empty() {
+            return release;
+        }
+    }
+
+    "gaming-telemetry@unknown".to_owned()
+}
+
+fn init_sentry() -> Option<ClientInitGuard> {
+    let dsn = std::env::var("SENTRY_DSN")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())?;
+    let git_sha = git_sha();
+    let release = resolve_sentry_release(&git_sha);
+    let environment = std::env::var("SENTRY_ENVIRONMENT")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "local".to_owned());
+    let parsed_dsn = match dsn.parse() {
+        Ok(dsn) => dsn,
+        Err(error) => {
+            eprintln!("Sentry disabled: invalid SENTRY_DSN ({error})");
+            return None;
+        }
+    };
+
+    let guard = sentry::init(sentry::ClientOptions {
+        dsn: Some(parsed_dsn),
+        release: Some(Cow::Owned(release)),
+        environment: Some(Cow::Owned(environment)),
+        sample_rate: 1.0,
+        traces_sample_rate: 0.0,
+        default_integrations: true,
+        ..Default::default()
+    });
+
+    Some(guard)
+}
 
 #[derive(Debug, Clone)]
 struct GpuSample {
@@ -103,6 +181,8 @@ fn is_mangohud_running() -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _sentry_guard = init_sentry();
+
     let nvml = Arc::new(Nvml::init()?);
     let device = nvml.device_by_index(0)?; // Target first GPU
 
@@ -182,6 +262,7 @@ async fn main() -> Result<()> {
                     tokio::spawn(async move {
                         if let Err(e) = write_to_parquet(samples_to_write, batch_counter).await {
                             eprintln!("Failed to write to Parquet: {:?}", e);
+                            sentry::capture_error(&*e);
                         }
                     });
                 }
@@ -192,6 +273,7 @@ async fn main() -> Result<()> {
                     batch_counter += 1;
                     if let Err(e) = write_to_parquet(buffer, batch_counter).await {
                         eprintln!("Failed to write final batch: {:?}", e);
+                        sentry::capture_error(&*e);
                     }
                 }
                 println!("Graceful shutdown complete.");

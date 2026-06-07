@@ -346,13 +346,15 @@ mod tests {
         assert!(guard.is_none());
 
         unsafe {
-            std::env::set_var("SENTRY_AUTH_TOKEN", "https://key@00000.ingest.sentry.io/0");
+            std::env::set_var("SENTRY_AUTH_TOKEN", "test-token-abc123");
+            std::env::set_var("SENTRY_DSN", "https://key@00000.ingest.sentry.io/0");
             std::env::set_var("SENTRY_ENVIRONMENT", "ci-test");
         }
         let guard = init_sentry();
         assert!(guard.is_some());
         unsafe {
             std::env::remove_var("SENTRY_AUTH_TOKEN");
+            std::env::remove_var("SENTRY_DSN");
             std::env::remove_var("SENTRY_ENVIRONMENT");
         }
     }

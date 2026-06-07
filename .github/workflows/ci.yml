@@ -2,23 +2,87 @@ name: CI
 
 on:
   push:
-    branches: [ main, "fix/issue-7-*" ]
+    branches: [ main ]
   pull_request:
     branches: [ main ]
+  schedule:
+    # Weekly dependency and health audit
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
-  check:
+  fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  check-strict:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Cargo check (normal)
         run: cargo check
       - name: Cargo check (strict -D warnings)
+        # Protects the build and privacy invariants from #7
         run: RUSTFLAGS="-D warnings" cargo check
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build release
         run: cargo build --release
       - name: Build bins
         run: cargo build --bin gaming-telemetry --bin export_csv --bin query
+
+  privacy-and-verify-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Exercise privacy redaction (for #7 / #14 / #15)
+        run: |
+          cargo test privacy -- --quiet
+          # Safe pattern: never auto-discovers $HOME/Steam/Proton.
+          # When verify_cyberpunk is restored (#9), add e.g.:
+          # cargo run --bin verify_cyberpunk -- --game-path ./tests/fixtures/fake-cp2077 --format text --dry-run
+          # and assert no raw personal paths appear in output/logs.
+      - name: Cargo audit (non-blocking)
+        run: cargo install cargo-audit && cargo audit || true
+
+  # TODO (post #9 + privacy-safe verify): add a dedicated job that runs
+  # the verifier only against test fixtures using explicit --game-path
+  # and verifies redaction + no home dir leakage.

@@ -22,9 +22,6 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
-  schedule:
-    # Weekly audit / health check
-    - cron: '0 6 * * 1'
 
 permissions:
   contents: read
@@ -116,7 +113,7 @@ jobs:
 - The dedicated privacy job gives a place to continuously test the redaction helpers (`src/privacy.rs`) and (future) verify without ever scanning the runner's $HOME or real Steam installs.
 - Caching + separate jobs = fast feedback while keeping the "permanent" quality bar high.
 - Explicit permissions + no broad write scopes.
-- Schedule job keeps dependencies and audits fresh.
+- No scheduled jobs; runs only on push and pull requests as requested.
 
 This proposal was generated autonomously on the feature branch while respecting the explicit request to ask permission before any direct commands/edits to the live `ci.yml`.
 

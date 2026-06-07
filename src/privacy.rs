@@ -24,7 +24,7 @@ pub fn redact_home(path: &str) -> String {
 /// awareness without ever auto-discovering them).
 #[allow(dead_code)]
 pub fn redact_personal_path(path: &str) -> String {
-    let mut redacted = redact_home(path);
+    let redacted = redact_home(path);
     // Future: if we ever receive explicit Steam root etc., we can extend here.
     // Never scan $HOME/.steam or similar automatically.
     redacted

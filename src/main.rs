@@ -3,14 +3,14 @@ mod privacy;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use cpu::CpuMonitor;
 use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 use nvml_wrapper::Nvml;
 use polars::prelude::*;
 use std::fs::File;
+use std::process::Command;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
-use std::process::Command;
-use cpu::CpuMonitor;
 
 #[derive(Debug, Clone)]
 struct GpuSample {
@@ -39,7 +39,10 @@ struct GpuSample {
 const BUFFER_SIZE: usize = 2000; // ~10 seconds of data at default 5ms intervals
 
 async fn write_to_parquet(samples: Vec<GpuSample>, batch_id: u32) -> Result<()> {
-    let timestamps: Vec<i64> = samples.iter().map(|s| s.timestamp.timestamp_millis()).collect();
+    let timestamps: Vec<i64> = samples
+        .iter()
+        .map(|s| s.timestamp.timestamp_millis())
+        .collect();
     let power: Vec<u32> = samples.iter().map(|s| s.power_usage_mw).collect();
     let temp: Vec<u32> = samples.iter().map(|s| s.temperature_c).collect();
     let graphics_clock: Vec<u32> = samples.iter().map(|s| s.graphics_clock_mhz).collect();
@@ -84,7 +87,7 @@ async fn write_to_parquet(samples: Vec<GpuSample>, batch_id: u32) -> Result<()> 
     let filename = format!("gpu_telemetry_v1_batch_{}.parquet", batch_id);
     let file = File::create(&filename)?;
     ParquetWriter::new(file).finish(&mut df)?;
-    
+
     println!("Wrote batch {} to {}", batch_id, filename);
     Ok(())
 }
@@ -102,7 +105,7 @@ fn is_mangohud_running() -> bool {
 async fn main() -> Result<()> {
     let nvml = Arc::new(Nvml::init()?);
     let device = nvml.device_by_index(0)?; // Target first GPU
-    
+
     // Configurable poll interval via environment variable
     let poll_interval_ms = std::env::var("POLL_INTERVAL_MS")
         .ok()
@@ -114,7 +117,10 @@ async fn main() -> Result<()> {
     let mut batch_counter = 0;
     let mut cpu_monitor = CpuMonitor::new();
 
-    println!("Starting enhanced GPU telemetry polling every {}ms...", poll_interval_ms);
+    println!(
+        "Starting enhanced GPU telemetry polling every {}ms...",
+        poll_interval_ms
+    );
     println!("Press Ctrl+C to stop gracefully.");
 
     loop {
@@ -124,18 +130,18 @@ async fn main() -> Result<()> {
                 let temperature = device.temperature(TemperatureSensor::Gpu).unwrap_or(0);
                 let graphics_clock = device.clock_info(Clock::Graphics).unwrap_or(0);
                 let memory_clock = device.clock_info(Clock::Memory).unwrap_or(0);
-                
+
                 let pcie_rx = device.pcie_throughput(nvml_wrapper::enum_wrappers::device::PcieUtilCounter::Receive).unwrap_or(0);
                 let pcie_tx = device.pcie_throughput(nvml_wrapper::enum_wrappers::device::PcieUtilCounter::Send).unwrap_or(0);
                 let pstate = device.performance_state().map(|p| p as u32).unwrap_or(0);
                 let throttle = device.current_throttle_reasons().map(|t| t.bits()).unwrap_or(0);
                 let fan = device.fan_speed(0).unwrap_or(0);
                 let mem_info = device.memory_info();
-                
+
                 // Encoder/Decoder utilization
                 let encoder_util = device.encoder_utilization().map(|u| u.utilization).unwrap_or(0);
                 let decoder_util = device.decoder_utilization().map(|u| u.utilization).unwrap_or(0);
-                
+
                 // MangoHud integration
                 let mangohud_active = is_mangohud_running();
 
@@ -171,7 +177,7 @@ async fn main() -> Result<()> {
                 if buffer.len() >= BUFFER_SIZE {
                     let samples_to_write = std::mem::replace(&mut buffer, Vec::with_capacity(BUFFER_SIZE));
                     batch_counter += 1;
-                    
+
                     // Write asynchronously to avoid blocking the polling loop
                     tokio::spawn(async move {
                         if let Err(e) = write_to_parquet(samples_to_write, batch_counter).await {

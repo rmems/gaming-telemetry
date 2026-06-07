@@ -79,7 +79,7 @@ fn main() -> Result<()> {
         "SELECT timestamp_ms, throttle_reasons_bitmask 
          FROM read_parquet('{}') 
          WHERE throttle_reasons_bitmask != 0 
-         LIMIT 5", 
+         LIMIT 5",
         parquet_file
     ))?;
 
@@ -101,7 +101,7 @@ fn main() -> Result<()> {
         "SELECT timestamp_ms, pcie_rx_kbps, power_usage_mw
          FROM read_parquet('{}') 
          ORDER BY pcie_rx_kbps DESC 
-         LIMIT 5", 
+         LIMIT 5",
         parquet_file
     ))?;
 
@@ -120,7 +120,7 @@ fn main() -> Result<()> {
          FROM read_parquet('{}') 
          WHERE cpu_tctl_c > 80.0
          ORDER BY cpu_tctl_c DESC 
-         LIMIT 5", 
+         LIMIT 5",
         parquet_file
     ))?;
 
@@ -133,8 +133,10 @@ fn main() -> Result<()> {
         let ccd1: f32 = row.get(2)?;
         let ccd2: f32 = row.get(3)?;
         let pwr: u32 = row.get(4)?;
-        println!("TS: {} | Tctl: {:5.1} C | CCD1: {:5.1} C | CCD2: {:5.1} C | Power: {:5} mW", 
-                 ts, tctl, ccd1, ccd2, pwr);
+        println!(
+            "TS: {} | Tctl: {:5.1} C | CCD1: {:5.1} C | CCD2: {:5.1} C | Power: {:5} mW",
+            ts, tctl, ccd1, ccd2, pwr
+        );
     }
     if !found {
         println!("No CPU thermal spikes detected.");

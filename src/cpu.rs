@@ -138,4 +138,3 @@ impl CpuMonitor {
             .unwrap_or(0.0)
     }
 }
-

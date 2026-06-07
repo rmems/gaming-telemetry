@@ -43,7 +43,12 @@ fn main() -> Result<()> {
         parquet_file_sql
     )).with_context(|| format!("Failed to prepare summary statistics query for {}", parquet_file_display))?;
 
-    let mut rows = stmt.query([]).with_context(|| format!("Failed to execute summary statistics query for {}", parquet_file_display))?;
+    let mut rows = stmt.query([]).with_context(|| {
+        format!(
+            "Failed to execute summary statistics query for {}",
+            parquet_file_display
+        )
+    })?;
     if let Some(row) = rows.next()? {
         let avg_power: f64 = row.get(0)?;
         let max_power: u32 = row.get(1)?;
@@ -81,15 +86,27 @@ fn main() -> Result<()> {
 
     // Detecting "Inhibitory" Signals (Throttling)
     println!("\n[Throttling / Inhibitory Signals]");
-    let mut stmt = conn.prepare(&format!(
-        "SELECT timestamp_ms, throttle_reasons_bitmask
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT timestamp_ms, throttle_reasons_bitmask
          FROM read_parquet('{}')
          WHERE throttle_reasons_bitmask != 0
          LIMIT 5",
-        parquet_file_sql
-    )).with_context(|| format!("Failed to prepare throttling query for {}", parquet_file_display))?;
+            parquet_file_sql
+        ))
+        .with_context(|| {
+            format!(
+                "Failed to prepare throttling query for {}",
+                parquet_file_display
+            )
+        })?;
 
-    let mut rows = stmt.query([]).with_context(|| format!("Failed to execute throttling query for {}", parquet_file_display))?;
+    let mut rows = stmt.query([]).with_context(|| {
+        format!(
+            "Failed to execute throttling query for {}",
+            parquet_file_display
+        )
+    })?;
     let mut found = false;
     while let Some(row) = rows.next()? {
         found = true;
@@ -103,15 +120,27 @@ fn main() -> Result<()> {
 
     // Spikes (Excitatory)
     println!("\n[Potential PCIe Data Spikes]");
-    let mut stmt = conn.prepare(&format!(
-        "SELECT timestamp_ms, pcie_rx_kbps, power_usage_mw
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT timestamp_ms, pcie_rx_kbps, power_usage_mw
          FROM read_parquet('{}')
          ORDER BY pcie_rx_kbps DESC
          LIMIT 5",
-        parquet_file_sql
-    )).with_context(|| format!("Failed to prepare PCIe spikes query for {}", parquet_file_display))?;
+            parquet_file_sql
+        ))
+        .with_context(|| {
+            format!(
+                "Failed to prepare PCIe spikes query for {}",
+                parquet_file_display
+            )
+        })?;
 
-    let mut rows = stmt.query([]).with_context(|| format!("Failed to execute PCIe spikes query for {}", parquet_file_display))?;
+    let mut rows = stmt.query([]).with_context(|| {
+        format!(
+            "Failed to execute PCIe spikes query for {}",
+            parquet_file_display
+        )
+    })?;
     while let Some(row) = rows.next()? {
         let ts: i64 = row.get(0)?;
         let rx: u32 = row.get(1)?;
@@ -121,16 +150,28 @@ fn main() -> Result<()> {
 
     // CPU Temperature Spikes
     println!("\n[CPU Temperature Spikes (Tctl > 80C)]");
-    let mut stmt = conn.prepare(&format!(
-        "SELECT timestamp_ms, cpu_tctl_c, cpu_ccd1_c, cpu_ccd2_c, power_usage_mw
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT timestamp_ms, cpu_tctl_c, cpu_ccd1_c, cpu_ccd2_c, power_usage_mw
          FROM read_parquet('{}')
          WHERE cpu_tctl_c > 80.0
          ORDER BY cpu_tctl_c DESC
          LIMIT 5",
-        parquet_file_sql
-    )).with_context(|| format!("Failed to prepare CPU temperature spikes query for {}", parquet_file_display))?;
+            parquet_file_sql
+        ))
+        .with_context(|| {
+            format!(
+                "Failed to prepare CPU temperature spikes query for {}",
+                parquet_file_display
+            )
+        })?;
 
-    let mut rows = stmt.query([]).with_context(|| format!("Failed to execute CPU temperature spikes query for {}", parquet_file_display))?;
+    let mut rows = stmt.query([]).with_context(|| {
+        format!(
+            "Failed to execute CPU temperature spikes query for {}",
+            parquet_file_display
+        )
+    })?;
     let mut found = false;
     while let Some(row) = rows.next()? {
         found = true;

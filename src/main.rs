@@ -4,15 +4,15 @@ mod privacy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use cpu::CpuMonitor;
-use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 use nvml_wrapper::Nvml;
+use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 use polars::prelude::*;
 use sentry::ClientInitGuard;
 use std::borrow::Cow;
 use std::fs::File;
 use std::process::Command;
 use std::sync::Arc;
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 
 fn git_sha() -> String {
     if let Some(value) = std::env::var("AGENTOS_GIT_SHA")

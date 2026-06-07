@@ -27,11 +27,12 @@ fn git_sha() -> String {
     if let Ok(output) = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
-        && output.status.success()
     {
-        let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if !sha.is_empty() {
-            return sha;
+        if output.status.success() {
+            let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !sha.is_empty() {
+                return sha;
+            }
         }
     }
     "unknown".to_owned()
@@ -302,32 +303,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_git_sha_falls_back() {
-        unsafe {
-            std::env::remove_var("AGENTOS_GIT_SHA");
-        }
-        let s = git_sha();
-        // In git checkout: short sha; elsewhere or no .git: "unknown" or non-empty.
-        assert!(!s.is_empty());
-    }
-
-    #[test]
-    fn test_resolve_sentry_release_from_sha() {
-        unsafe {
-            std::env::remove_var("SENTRY_RELEASE");
-        }
-        assert_eq!(
-            resolve_sentry_release("feedface"),
-            "gaming-telemetry@feedface"
-        );
-    }
-
-    #[test]
     fn test_sentry_helpers_env_resolution_and_init() {
         // All env-mutating coverage for git_sha/resolve/init in one test to avoid
         // parallel test races on process env (std::env::{set,remove}_var are unsafe
-        // and racy). This single test exercises the branches that give codecov for
-        // the Sentry integration (resolves #17 coverage gap reported on PR).
+        // and racy). This single test exercises the branches (including the "good sha"
+        // fast-path) that give codecov for the Sentry integration (#17).
         unsafe {
             std::env::set_var("AGENTOS_GIT_SHA", "abc123def");
         }
@@ -343,6 +323,15 @@ mod tests {
         unsafe {
             std::env::remove_var("SENTRY_RELEASE");
         }
+
+        // Cover the explicit-sha fast path (no SENTRY_RELEASE) sequentially.
+        unsafe {
+            std::env::remove_var("SENTRY_RELEASE");
+        }
+        assert_eq!(
+            resolve_sentry_release("feedface"),
+            "gaming-telemetry@feedface"
+        );
 
         unsafe {
             std::env::remove_var("SENTRY_RELEASE");

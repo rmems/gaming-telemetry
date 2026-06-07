@@ -78,14 +78,19 @@ The core `gaming-telemetry` collector performs **only hardware telemetry** (NVID
 3. Use `cargo run --bin export_csv ...` and the DuckDB `query` bin for analysis — all outputs remain under your control.
 4. Keep telemetry sessions in version-controlled or ephemeral directories when sharing data for SNN training (e.g. with `corinth-canal`).
 
-**Note on setup verification:** A `verify_cyberpunk` tool previously existed to validate a CP2077 install for the exact workload (`cp2077_modded_ultraplus_pt_dlss4_hdtextures_highcrowd` — checking Path Tracing, DLSS Transformer, UltraPlus/CET mods, crowd density, HD textures, etc.). Its full sources are currently absent from the tree (only the binary + some test fixtures remain). 
+**Note on setup verification:** A minimal `verify_cyberpunk` skeleton has been restored (src/bin/verify_cyberpunk.rs) to address #9. It is a privacy-safe placeholder for the full workload verifier (PT, DLSS 4 Transformer, UltraPlus/CET mods, crowd, HD textures, etc.).
 
-When the verifier is restored (see #9 and #14), it will:
-- Require an **explicit `--game-path`** (or `GAME_PATH`) — no auto-discovery of `$HOME`, `~/.steam`, `~/.local/share/Steam`, or Proton `compatdata/<id>/pfx/...`.
-- Redact or placeholder all personal path components in text/JSON/debug/"forensic" output by default (e.g. `$HOME/...` or `[REDACTED_HOME]`). Full paths only via an opt-in flag.
-- Produce reports usable for confirming a reproducible PT telemetry session **without leaking the operator's home directory or Steam/Proton layout**.
+It **requires** an explicit `--game-path` (never auto-discovers $HOME/Steam/Proton/compatdata). Every path in its text/JSON output is redacted by default using the same `redact_personal_path` helpers (see privacy.rs and #10/#14).
 
-This directly addresses the requirement to make the repo ready for Cyberpunk 2077 telemetry data tracking **without exposing any home directories**. See the parent issue #7 and related #10 (privacy leaks), #14 (implementation plan).
+Example (CI guard also exercises this against fixtures + synthetic redaction test):
+```bash
+cargo run --bin verify_cyberpunk -- --game-path ./tests/fixtures/mods/pass --format text --dry-run
+cargo run --bin verify_cyberpunk -- --game-path /path/you/control/for/Cyberpunk\ 2077 --format json
+```
+
+All output stays redacted. This (plus the core collector never walking personal dirs, the privacy guard job, and updated CI) makes the repo ready for privacy-safe CP2077 telemetry capture. Full deep checks can be expanded in the skeleton later.
+
+See parent #7, #9 (sources), #10 (leaks), #14 (workflow), and the Privacy section above. The CI privacy-and-verify-guard now actually runs it.
 
 ## Architecture for SNNs
 The data collected is structured to be directly useful for Neuromorphic computing:

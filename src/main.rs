@@ -1,4 +1,5 @@
 mod cpu;
+mod privacy;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};

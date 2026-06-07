@@ -13,11 +13,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let parquet_file = &args[1];
-    let parquet_file_redacted = redact_personal_path(parquet_file).replace("'", "''");
+    let parquet_file_display = redact_personal_path(parquet_file);
+    let parquet_file_sql = parquet_file.replace("'", "''");
 
     let conn = Connection::open_in_memory()?;
 
-    println!("--- Analyzing {} with DuckDB ---", parquet_file_redacted);
+    println!("--- Analyzing {} with DuckDB ---", parquet_file_display);
 
     // Basic stats
     println!("\n[Summary Statistics]");
@@ -39,10 +40,10 @@ fn main() -> Result<()> {
             avg(cpu_ccd2_c) as avg_cpu_ccd2,
             max(cpu_ccd2_c) as max_cpu_ccd2
          FROM read_parquet('{}')",
-        parquet_file_redacted
-    )).with_context(|| format!("Failed to prepare summary statistics query for {}", parquet_file_redacted))?;
+        parquet_file_sql
+    )).with_context(|| format!("Failed to prepare summary statistics query for {}", parquet_file_display))?;
 
-    let mut rows = stmt.query([]).with_context(|| format!("Failed to execute summary statistics query for {}", parquet_file_redacted))?;
+    let mut rows = stmt.query([]).with_context(|| format!("Failed to execute summary statistics query for {}", parquet_file_display))?;
     if let Some(row) = rows.next()? {
         let avg_power: f64 = row.get(0)?;
         let max_power: u32 = row.get(1)?;
@@ -85,10 +86,10 @@ fn main() -> Result<()> {
          FROM read_parquet('{}')
          WHERE throttle_reasons_bitmask != 0
          LIMIT 5",
-        parquet_file_redacted
-    )).with_context(|| format!("Failed to prepare throttling query for {}", parquet_file_redacted))?;
+        parquet_file_sql
+    )).with_context(|| format!("Failed to prepare throttling query for {}", parquet_file_display))?;
 
-    let mut rows = stmt.query([]).with_context(|| format!("Failed to execute throttling query for {}", parquet_file_redacted))?;
+    let mut rows = stmt.query([]).with_context(|| format!("Failed to execute throttling query for {}", parquet_file_display))?;
     let mut found = false;
     while let Some(row) = rows.next()? {
         found = true;
@@ -107,10 +108,10 @@ fn main() -> Result<()> {
          FROM read_parquet('{}')
          ORDER BY pcie_rx_kbps DESC
          LIMIT 5",
-        parquet_file_redacted
-    )).with_context(|| format!("Failed to prepare PCIe spikes query for {}", parquet_file_redacted))?;
+        parquet_file_sql
+    )).with_context(|| format!("Failed to prepare PCIe spikes query for {}", parquet_file_display))?;
 
-    let mut rows = stmt.query([]).with_context(|| format!("Failed to execute PCIe spikes query for {}", parquet_file_redacted))?;
+    let mut rows = stmt.query([]).with_context(|| format!("Failed to execute PCIe spikes query for {}", parquet_file_display))?;
     while let Some(row) = rows.next()? {
         let ts: i64 = row.get(0)?;
         let rx: u32 = row.get(1)?;
@@ -126,10 +127,10 @@ fn main() -> Result<()> {
          WHERE cpu_tctl_c > 80.0
          ORDER BY cpu_tctl_c DESC
          LIMIT 5",
-        parquet_file_redacted
-    )).with_context(|| format!("Failed to prepare CPU temperature spikes query for {}", parquet_file_redacted))?;
+        parquet_file_sql
+    )).with_context(|| format!("Failed to prepare CPU temperature spikes query for {}", parquet_file_display))?;
 
-    let mut rows = stmt.query([]).with_context(|| format!("Failed to execute CPU temperature spikes query for {}", parquet_file_redacted))?;
+    let mut rows = stmt.query([]).with_context(|| format!("Failed to execute CPU temperature spikes query for {}", parquet_file_display))?;
     let mut found = false;
     while let Some(row) = rows.next()? {
         found = true;

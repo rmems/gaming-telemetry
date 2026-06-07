@@ -100,9 +100,10 @@ impl CpuMonitor {
         for entry in entries.flatten() {
             let name_path = entry.path().join("name");
             if let Ok(name) = fs::read_to_string(&name_path)
-                && name.trim() == "k10temp" {
-                    return Some(entry.path());
-                }
+                && name.trim() == "k10temp"
+            {
+                return Some(entry.path());
+            }
         }
         None
     }

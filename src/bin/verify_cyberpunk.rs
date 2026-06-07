@@ -12,7 +12,7 @@ use std::path::Path;
 /// - Requires explicit --game-path (no $HOME/Steam/Proton auto-discovery ever).
 /// - All paths in output (text/JSON) are redacted via redact_personal_path by default.
 /// - Basic presence/structure checks that work against test fixtures or a real game dir you provide.
-/// - --dry-run, --format (text|json), --debug supported for compatibility with old binary expectations.
+/// - --dry-run, --format (text|json) supported for compatibility with old binary expectations.
 /// - Expandable for full PT/DLSS/UltraPlus/CET/crowd/HD checks later without changing the privacy contract.
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -20,7 +20,6 @@ fn main() {
     let mut game_path: Option<String> = None;
     let mut fmt = "text".to_string();
     let mut dry_run = false;
-    let mut _debug = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -46,7 +45,6 @@ fn main() {
                 }
             }
             "--dry-run" => dry_run = true,
-            "--debug" => _debug = true,
             _ => {}
         }
         i += 1;

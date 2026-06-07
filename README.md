@@ -68,6 +68,25 @@ Consumer command in `corinth-canal`:
 cargo run --example csv_replay canonical.csv
 ```
 
+## Privacy and Safe Cyberpunk 2077 Telemetry Capture
+
+The core `gaming-telemetry` collector performs **only hardware telemetry** (NVIDIA NVML GPU metrics at 5 ms + CPU power/temps via hwmon/RAPL) and writes Parquet/CSV outputs to the **current working directory**. It does **not** scan user home directories, discover Steam libraries, read Proton prefixes, or embed personal paths anywhere in its operation or data.
+
+### Recommended Safe Workflow for Cyberpunk 2077 (Path Tracing + DLSS 4.0)
+1. Run the collector from a clean, dedicated working directory (or `cd` into one) so that generated `gpu_telemetry_v1_batch_*.parquet` files stay isolated and do not mix with personal data.
+2. Launch Cyberpunk 2077 with MangoHud enabled (the collector detects `mangohud_active` and records it for correlation).
+3. Use `cargo run --bin export_csv ...` and the DuckDB `query` bin for analysis — all outputs remain under your control.
+4. Keep telemetry sessions in version-controlled or ephemeral directories when sharing data for SNN training (e.g. with `corinth-canal`).
+
+**Note on setup verification:** A `verify_cyberpunk` tool previously existed to validate a CP2077 install for the exact workload (`cp2077_modded_ultraplus_pt_dlss4_hdtextures_highcrowd` — checking Path Tracing, DLSS Transformer, UltraPlus/CET mods, crowd density, HD textures, etc.). Its full sources are currently absent from the tree (only the binary + some test fixtures remain). 
+
+When the verifier is restored (see #9 and #14), it will:
+- Require an **explicit `--game-path`** (or `GAME_PATH`) — no auto-discovery of `$HOME`, `~/.steam`, `~/.local/share/Steam`, or Proton `compatdata/<id>/pfx/...`.
+- Redact or placeholder all personal path components in text/JSON/debug/"forensic" output by default (e.g. `$HOME/...` or `[REDACTED_HOME]`). Full paths only via an opt-in flag.
+- Produce reports usable for confirming a reproducible PT telemetry session **without leaking the operator's home directory or Steam/Proton layout**.
+
+This directly addresses the requirement to make the repo ready for Cyberpunk 2077 telemetry data tracking **without exposing any home directories**. See the parent issue #7 and related #10 (privacy leaks), #14 (implementation plan).
+
 ## Architecture for SNNs
 The data collected is structured to be directly useful for Neuromorphic computing:
 - **Excitatory Inputs**: PCIe throughput and VRAM allocation rate.

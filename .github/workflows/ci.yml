@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, "fix/issue-7-*" ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo check (normal)
+        run: cargo check
+      - name: Cargo check (strict -D warnings)
+        run: RUSTFLAGS="-D warnings" cargo check
+      - name: Test
+        run: cargo test
+      - name: Build release
+        run: cargo build --release
+      - name: Build bins
+        run: cargo build --bin gaming-telemetry --bin export_csv --bin query

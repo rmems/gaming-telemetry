@@ -139,26 +139,3 @@ impl CpuMonitor {
     }
 }
 
-/// Legacy CpuTelemetry struct for backward compatibility.
-#[derive(Debug, Clone, Default)]
-pub struct CpuTelemetry {
-    pub tctl_c: f32,
-    pub ccd1_c: f32,
-    pub ccd2_c: f32,
-    pub package_power_w: f32,
-}
-
-impl CpuTelemetry {
-    /// Read CPU telemetry using a temporary CpuMonitor.
-    /// Note: For accurate power readings, use CpuMonitor directly in your polling loop.
-    pub fn read() -> Self {
-        let mut monitor = CpuMonitor::new();
-        let (tctl_c, power_w) = monitor.poll();
-        Self {
-            tctl_c,
-            ccd1_c: monitor.read_ccd1(),
-            ccd2_c: monitor.read_ccd2(),
-            package_power_w: power_w,
-        }
-    }
-}

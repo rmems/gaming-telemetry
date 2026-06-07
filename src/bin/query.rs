@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use duckdb::Connection;
 use std::env;
 
@@ -13,7 +13,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let parquet_file = &args[1];
-    let parquet_file_redacted = redact_personal_path(parquet_file);
+    let parquet_file_redacted = redact_personal_path(parquet_file).replace("'", "''");
 
     let conn = Connection::open_in_memory()?;
 
@@ -22,8 +22,8 @@ fn main() -> Result<()> {
     // Basic stats
     println!("\n[Summary Statistics]");
     let mut stmt = conn.prepare(&format!(
-        "SELECT 
-            avg(power_usage_mw) as avg_power, 
+        "SELECT
+            avg(power_usage_mw) as avg_power,
             max(power_usage_mw) as max_power,
             avg(temperature_c) as avg_temp,
             max(pcie_rx_kbps) as max_pcie_rx,
@@ -38,11 +38,11 @@ fn main() -> Result<()> {
             max(cpu_ccd1_c) as max_cpu_ccd1,
             avg(cpu_ccd2_c) as avg_cpu_ccd2,
             max(cpu_ccd2_c) as max_cpu_ccd2
-         FROM read_parquet('{}')", 
-        parquet_file
-    ))?;
+         FROM read_parquet('{}')",
+        parquet_file_redacted
+    )).with_context(|| format!("Failed to prepare summary statistics query for {}", parquet_file_redacted))?;
 
-    let mut rows = stmt.query([])?;
+    let mut rows = stmt.query([]).with_context(|| format!("Failed to execute summary statistics query for {}", parquet_file_redacted))?;
     if let Some(row) = rows.next()? {
         let avg_power: f64 = row.get(0)?;
         let max_power: u32 = row.get(1)?;
@@ -81,14 +81,14 @@ fn main() -> Result<()> {
     // Detecting "Inhibitory" Signals (Throttling)
     println!("\n[Throttling / Inhibitory Signals]");
     let mut stmt = conn.prepare(&format!(
-        "SELECT timestamp_ms, throttle_reasons_bitmask 
-         FROM read_parquet('{}') 
-         WHERE throttle_reasons_bitmask != 0 
+        "SELECT timestamp_ms, throttle_reasons_bitmask
+         FROM read_parquet('{}')
+         WHERE throttle_reasons_bitmask != 0
          LIMIT 5",
-        parquet_file
-    ))?;
+        parquet_file_redacted
+    )).with_context(|| format!("Failed to prepare throttling query for {}", parquet_file_redacted))?;
 
-    let mut rows = stmt.query([])?;
+    let mut rows = stmt.query([]).with_context(|| format!("Failed to execute throttling query for {}", parquet_file_redacted))?;
     let mut found = false;
     while let Some(row) = rows.next()? {
         found = true;
@@ -104,13 +104,13 @@ fn main() -> Result<()> {
     println!("\n[Potential PCIe Data Spikes]");
     let mut stmt = conn.prepare(&format!(
         "SELECT timestamp_ms, pcie_rx_kbps, power_usage_mw
-         FROM read_parquet('{}') 
-         ORDER BY pcie_rx_kbps DESC 
+         FROM read_parquet('{}')
+         ORDER BY pcie_rx_kbps DESC
          LIMIT 5",
-        parquet_file
-    ))?;
+        parquet_file_redacted
+    )).with_context(|| format!("Failed to prepare PCIe spikes query for {}", parquet_file_redacted))?;
 
-    let mut rows = stmt.query([])?;
+    let mut rows = stmt.query([]).with_context(|| format!("Failed to execute PCIe spikes query for {}", parquet_file_redacted))?;
     while let Some(row) = rows.next()? {
         let ts: i64 = row.get(0)?;
         let rx: u32 = row.get(1)?;
@@ -122,14 +122,14 @@ fn main() -> Result<()> {
     println!("\n[CPU Temperature Spikes (Tctl > 80C)]");
     let mut stmt = conn.prepare(&format!(
         "SELECT timestamp_ms, cpu_tctl_c, cpu_ccd1_c, cpu_ccd2_c, power_usage_mw
-         FROM read_parquet('{}') 
+         FROM read_parquet('{}')
          WHERE cpu_tctl_c > 80.0
-         ORDER BY cpu_tctl_c DESC 
+         ORDER BY cpu_tctl_c DESC
          LIMIT 5",
-        parquet_file
-    ))?;
+        parquet_file_redacted
+    )).with_context(|| format!("Failed to prepare CPU temperature spikes query for {}", parquet_file_redacted))?;
 
-    let mut rows = stmt.query([])?;
+    let mut rows = stmt.query([]).with_context(|| format!("Failed to execute CPU temperature spikes query for {}", parquet_file_redacted))?;
     let mut found = false;
     while let Some(row) = rows.next()? {
         found = true;

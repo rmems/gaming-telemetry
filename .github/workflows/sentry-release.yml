@@ -1,0 +1,66 @@
+name: Sentry Release
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+
+concurrency:
+  group: sentry-release-${{ github.event.workflow_run.head_branch || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sentry-release:
+    name: Create Sentry Release
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main'
+      )
+    runs-on: ubuntu-latest
+    env:
+      SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+      HAS_SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN != '' }}
+      SENTRY_ORG: ${{ secrets.SENTRY_ORG || 'your-org' }}
+      SENTRY_PROJECT: gaming-telemetry
+    steps:
+      - name: Skip when Sentry auth token is not configured
+        if: ${{ env.HAS_SENTRY_AUTH_TOKEN != 'true' }}
+        run: |
+          echo "SENTRY_AUTH_TOKEN is not configured for GitHub Actions; skipping Sentry release creation."
+
+      - uses: actions/checkout@v4
+        if: ${{ env.HAS_SENTRY_AUTH_TOKEN == 'true' }}
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Install pinned sentry-cli
+        if: ${{ env.HAS_SENTRY_AUTH_TOKEN == 'true' }}
+        env:
+          SENTRY_CLI_VERSION: "3.4.0"
+        run: |
+          set -euo pipefail
+          asset_name="sentry-cli-Linux-x86_64"
+          asset_url="https://downloads.sentry-cdn.com/sentry-cli/${SENTRY_CLI_VERSION}/${asset_name}"
+          expected_sha256="$(curl -fsSL "https://release-registry.services.sentry.io/apps/sentry-cli/${SENTRY_CLI_VERSION}" | python -c 'import json,sys; print(json.load(sys.stdin)["files"]["sentry-cli-Linux-x86_64"]["checksums"]["sha256-hex"])')"
+          curl -fsSL "$asset_url" -o sentry-cli
+          echo "${expected_sha256}  sentry-cli" | sha256sum -c -
+          chmod +x sentry-cli
+          sudo mv sentry-cli /usr/local/bin/sentry-cli
+          sentry-cli --version
+
+      - name: Create Sentry Release
+        if: ${{ env.HAS_SENTRY_AUTH_TOKEN == 'true' }}
+        run: |
+          VERSION="gaming-telemetry@$(git rev-parse --short HEAD)"
+          sentry-cli releases new "$VERSION"
+          sentry-cli releases set-commits --auto "$VERSION"
+          sentry-cli releases finalize "$VERSION"

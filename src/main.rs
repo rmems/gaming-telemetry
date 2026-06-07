@@ -61,7 +61,7 @@ fn resolve_sentry_release(git_sha: &str) -> String {
 }
 
 fn init_sentry() -> Option<ClientInitGuard> {
-    let dsn = std::env::var("SENTRY_DSN")
+    let dsn = std::env::var("SENTRY_AUTH_TOKEN")
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())?;
@@ -75,7 +75,7 @@ fn init_sentry() -> Option<ClientInitGuard> {
     let parsed_dsn = match dsn.parse() {
         Ok(dsn) => dsn,
         Err(error) => {
-            eprintln!("Sentry disabled: invalid SENTRY_DSN ({error})");
+            eprintln!("Sentry disabled: invalid SENTRY_AUTH_TOKEN ({error})");
             return None;
         }
     };
@@ -267,8 +267,12 @@ async fn main() -> Result<()> {
                     tokio::task::spawn_blocking(move || {
                         sentry::Hub::run(hub, || {
                             if let Err(e) = write_to_parquet(samples_to_write, batch_counter) {
-                                eprintln!("Failed to write to Parquet: {:?}", e);
-                                sentry::capture_error(&*e);
+                                let redacted = privacy::redact_personal_path(&format!("{:?}", e));
+                                eprintln!("Failed to write to Parquet: {}", redacted);
+                                // Redact error text before sending to Sentry (addresses Coderabbit P1 on
+                                // potential PII in I/O error messages). Also makes `mod privacy` used from
+                                // production code paths in main.rs.
+                                sentry::capture_message(&redacted, sentry::Level::Error);
                             }
                         });
                     });
@@ -279,8 +283,9 @@ async fn main() -> Result<()> {
                 if !buffer.is_empty() {
                     batch_counter += 1;
                     if let Err(e) = write_to_parquet(buffer, batch_counter) {
-                        eprintln!("Failed to write final batch: {:?}", e);
-                        sentry::capture_error(&*e);
+                        let redacted = privacy::redact_personal_path(&format!("{:?}", e));
+                        eprintln!("Failed to write final batch: {}", redacted);
+                        sentry::capture_message(&redacted, sentry::Level::Error);
                     }
                 }
                 println!("Graceful shutdown complete.");
@@ -290,4 +295,76 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_git_sha_falls_back() {
+        unsafe {
+            std::env::remove_var("AGENTOS_GIT_SHA");
+        }
+        let s = git_sha();
+        // In git checkout: short sha; elsewhere or no .git: "unknown" or non-empty.
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_sentry_release_from_sha() {
+        unsafe {
+            std::env::remove_var("SENTRY_RELEASE");
+        }
+        assert_eq!(
+            resolve_sentry_release("feedface"),
+            "gaming-telemetry@feedface"
+        );
+    }
+
+    #[test]
+    fn test_sentry_helpers_env_resolution_and_init() {
+        // All env-mutating coverage for git_sha/resolve/init in one test to avoid
+        // parallel test races on process env (std::env::{set,remove}_var are unsafe
+        // and racy). This single test exercises the branches that give codecov for
+        // the Sentry integration (resolves #17 coverage gap reported on PR).
+        unsafe {
+            std::env::set_var("AGENTOS_GIT_SHA", "abc123def");
+        }
+        assert_eq!(git_sha(), "abc123def");
+        unsafe {
+            std::env::remove_var("AGENTOS_GIT_SHA");
+        }
+
+        unsafe {
+            std::env::set_var("SENTRY_RELEASE", "gaming-telemetry@myrel");
+        }
+        assert_eq!(resolve_sentry_release("ignored"), "gaming-telemetry@myrel");
+        unsafe {
+            std::env::remove_var("SENTRY_RELEASE");
+        }
+
+        unsafe {
+            std::env::remove_var("SENTRY_RELEASE");
+        }
+        let r = resolve_sentry_release("unknown");
+        assert!(r.starts_with("gaming-telemetry@"));
+
+        unsafe {
+            std::env::remove_var("SENTRY_AUTH_TOKEN");
+        }
+        let guard = init_sentry();
+        assert!(guard.is_none());
+
+        unsafe {
+            std::env::set_var("SENTRY_AUTH_TOKEN", "https://key@00000.ingest.sentry.io/0");
+            std::env::set_var("SENTRY_ENVIRONMENT", "ci-test");
+        }
+        let guard = init_sentry();
+        assert!(guard.is_some());
+        unsafe {
+            std::env::remove_var("SENTRY_AUTH_TOKEN");
+            std::env::remove_var("SENTRY_ENVIRONMENT");
+        }
+    }
 }

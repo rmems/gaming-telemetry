@@ -44,7 +44,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned sentry-cli
-        if: ${{ env.HAS_SENTRY_AUTH_TOKEN == 'true' }}
+        if: ${{ env.HAS_SENTRY_CONFIG == 'true' }}
         env:
           SENTRY_CLI_VERSION: "3.4.0"
         run: |
@@ -59,7 +59,7 @@ jobs:
           sentry-cli --version
 
       - name: Create Sentry Release
-        if: ${{ env.HAS_SENTRY_AUTH_TOKEN == 'true' }}
+        if: ${{ env.HAS_SENTRY_CONFIG == 'true' }}
         run: |
           VERSION="gaming-telemetry@$(git rev-parse --short HEAD)"
           sentry-cli releases new "$VERSION"

@@ -1,6 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use duckdb::Connection;
 use std::env;
+
+#[path = "../privacy.rs"]
+mod privacy;
+use privacy::redact_personal_path;
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -9,16 +13,18 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let parquet_file = &args[1];
+    let parquet_file_display = redact_personal_path(parquet_file);
+    let parquet_file_sql = parquet_file.replace("'", "''");
 
     let conn = Connection::open_in_memory()?;
 
-    println!("--- Analyzing {} with DuckDB ---", parquet_file);
+    println!("--- Analyzing {} with DuckDB ---", parquet_file_display);
 
     // Basic stats
     println!("\n[Summary Statistics]");
     let mut stmt = conn.prepare(&format!(
-        "SELECT 
-            avg(power_usage_mw) as avg_power, 
+        "SELECT
+            avg(power_usage_mw) as avg_power,
             max(power_usage_mw) as max_power,
             avg(temperature_c) as avg_temp,
             max(pcie_rx_kbps) as max_pcie_rx,
@@ -33,11 +39,16 @@ fn main() -> Result<()> {
             max(cpu_ccd1_c) as max_cpu_ccd1,
             avg(cpu_ccd2_c) as avg_cpu_ccd2,
             max(cpu_ccd2_c) as max_cpu_ccd2
-         FROM read_parquet('{}')", 
-        parquet_file
-    ))?;
+         FROM read_parquet('{}')",
+        parquet_file_sql
+    )).with_context(|| format!("Failed to prepare summary statistics query for {}", parquet_file_display))?;
 
-    let mut rows = stmt.query([])?;
+    let mut rows = stmt.query([]).with_context(|| {
+        format!(
+            "Failed to execute summary statistics query for {}",
+            parquet_file_display
+        )
+    })?;
     if let Some(row) = rows.next()? {
         let avg_power: f64 = row.get(0)?;
         let max_power: u32 = row.get(1)?;
@@ -75,15 +86,27 @@ fn main() -> Result<()> {
 
     // Detecting "Inhibitory" Signals (Throttling)
     println!("\n[Throttling / Inhibitory Signals]");
-    let mut stmt = conn.prepare(&format!(
-        "SELECT timestamp_ms, throttle_reasons_bitmask 
-         FROM read_parquet('{}') 
-         WHERE throttle_reasons_bitmask != 0 
-         LIMIT 5", 
-        parquet_file
-    ))?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT timestamp_ms, throttle_reasons_bitmask
+         FROM read_parquet('{}')
+         WHERE throttle_reasons_bitmask != 0
+         LIMIT 5",
+            parquet_file_sql
+        ))
+        .with_context(|| {
+            format!(
+                "Failed to prepare throttling query for {}",
+                parquet_file_display
+            )
+        })?;
 
-    let mut rows = stmt.query([])?;
+    let mut rows = stmt.query([]).with_context(|| {
+        format!(
+            "Failed to execute throttling query for {}",
+            parquet_file_display
+        )
+    })?;
     let mut found = false;
     while let Some(row) = rows.next()? {
         found = true;
@@ -97,15 +120,27 @@ fn main() -> Result<()> {
 
     // Spikes (Excitatory)
     println!("\n[Potential PCIe Data Spikes]");
-    let mut stmt = conn.prepare(&format!(
-        "SELECT timestamp_ms, pcie_rx_kbps, power_usage_mw
-         FROM read_parquet('{}') 
-         ORDER BY pcie_rx_kbps DESC 
-         LIMIT 5", 
-        parquet_file
-    ))?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT timestamp_ms, pcie_rx_kbps, power_usage_mw
+         FROM read_parquet('{}')
+         ORDER BY pcie_rx_kbps DESC
+         LIMIT 5",
+            parquet_file_sql
+        ))
+        .with_context(|| {
+            format!(
+                "Failed to prepare PCIe spikes query for {}",
+                parquet_file_display
+            )
+        })?;
 
-    let mut rows = stmt.query([])?;
+    let mut rows = stmt.query([]).with_context(|| {
+        format!(
+            "Failed to execute PCIe spikes query for {}",
+            parquet_file_display
+        )
+    })?;
     while let Some(row) = rows.next()? {
         let ts: i64 = row.get(0)?;
         let rx: u32 = row.get(1)?;
@@ -115,16 +150,28 @@ fn main() -> Result<()> {
 
     // CPU Temperature Spikes
     println!("\n[CPU Temperature Spikes (Tctl > 80C)]");
-    let mut stmt = conn.prepare(&format!(
-        "SELECT timestamp_ms, cpu_tctl_c, cpu_ccd1_c, cpu_ccd2_c, power_usage_mw
-         FROM read_parquet('{}') 
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT timestamp_ms, cpu_tctl_c, cpu_ccd1_c, cpu_ccd2_c, power_usage_mw
+         FROM read_parquet('{}')
          WHERE cpu_tctl_c > 80.0
-         ORDER BY cpu_tctl_c DESC 
-         LIMIT 5", 
-        parquet_file
-    ))?;
+         ORDER BY cpu_tctl_c DESC
+         LIMIT 5",
+            parquet_file_sql
+        ))
+        .with_context(|| {
+            format!(
+                "Failed to prepare CPU temperature spikes query for {}",
+                parquet_file_display
+            )
+        })?;
 
-    let mut rows = stmt.query([])?;
+    let mut rows = stmt.query([]).with_context(|| {
+        format!(
+            "Failed to execute CPU temperature spikes query for {}",
+            parquet_file_display
+        )
+    })?;
     let mut found = false;
     while let Some(row) = rows.next()? {
         found = true;
@@ -133,8 +180,10 @@ fn main() -> Result<()> {
         let ccd1: f32 = row.get(2)?;
         let ccd2: f32 = row.get(3)?;
         let pwr: u32 = row.get(4)?;
-        println!("TS: {} | Tctl: {:5.1} C | CCD1: {:5.1} C | CCD2: {:5.1} C | Power: {:5} mW", 
-                 ts, tctl, ccd1, ccd2, pwr);
+        println!(
+            "TS: {} | Tctl: {:5.1} C | CCD1: {:5.1} C | CCD2: {:5.1} C | Power: {:5} mW",
+            ts, tctl, ccd1, ccd2, pwr
+        );
     }
     if !found {
         println!("No CPU thermal spikes detected.");

@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,llvm-tools-preview
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.3
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  check-strict:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.3
+      - name: Cargo check (normal)
+        run: cargo check
+      - name: Cargo check (strict -D warnings)
+        # Protects the build and privacy invariants from #7
+        run: RUSTFLAGS="-D warnings" cargo check
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.3
+      - name: Test
+        run: cargo test
+        env:
+          CARGO_INCREMENTAL: 0
+          RUSTFLAGS: "-C instrument-coverage"
+      - name: Generate lcov.info
+        run: |
+          cargo install grcov
+          grcov . -s . --binary-path ./target/debug -t lcov --branch --ignore-not-existing -o lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@cd8b657745c0c7bb7f101e61a61c9ed5d74b8561 # v5.5.4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: false
+          verbose: true
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.3
+      - name: Build release
+        run: cargo build --release
+      - name: Build bins
+        run: cargo build --bin gaming-telemetry --bin export_csv --bin query --bin verify_cyberpunk
+
+  privacy-and-verify-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.3
+      - name: Exercise privacy redaction (for #7 / #14 / #15)
+        run: |
+          cargo test privacy -- --quiet
+
+          # Exercise the restored verify_cyberpunk skeleton (#9) with *explicit* --game-path only.
+          # No auto-discovery of $HOME/Steam/Proton ever. All output paths redacted by construction
+          # (the binary calls redact_personal_path on every path it receives or emits).
+          # Uses the test fixture that mirrors the UltraPlus mod layout under the provided path.
+          cargo run --bin verify_cyberpunk -- --game-path ./tests/fixtures/mods/pass --format text --dry-run
+          cargo run --bin verify_cyberpunk -- --game-path ./tests/fixtures/mods/pass --format json --dry-run
+      - name: Cargo audit (non-blocking)
+        uses: rustsec/audit-check@v1
+        continue-on-error: true
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # The verify runs above (explicit --game-path on fixture + the bin's built-in redaction for any
+  # input) + the privacy unit tests + the fact that the collector itself never walks personal dirs
+  # close the loop for #9 (sources), #10 (no leaks), #14 (safe CP2077 workflow exercised in CI).
+  # Full deep checks (PT/DLSS/UltraPlus/CET/crowd/HD) can be added inside the same binary later.

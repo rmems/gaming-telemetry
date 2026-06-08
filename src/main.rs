@@ -1,15 +1,102 @@
 mod cpu;
+mod privacy;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use cpu::CpuMonitor;
 use nvml_wrapper::enum_wrappers::device::{Clock, TemperatureSensor};
 use nvml_wrapper::Nvml;
 use polars::prelude::*;
+use sentry::ClientInitGuard;
+use std::borrow::Cow;
 use std::fs::File;
+use std::process::Command;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
-use std::process::Command;
-use cpu::CpuMonitor;
+
+fn git_sha() -> String {
+    if let Some(value) = std::env::var("AGENTOS_GIT_SHA")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return value;
+    }
+    // For dev runs from source checkout, use local git. In packaged binaries run from
+    // arbitrary CWDs, prefer SENTRY_RELEASE or AGENTOS_GIT_SHA (set by CI) to avoid
+    // deriving from launch directory (see P2 feedback).
+    if let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+    {
+        if output.status.success() {
+            let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !sha.is_empty() {
+                return sha;
+            }
+        }
+    }
+    "unknown".to_owned()
+}
+
+fn resolve_sentry_release(git_sha: &str) -> String {
+    if let Some(release) = std::env::var("SENTRY_RELEASE")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        return release;
+    }
+
+    if !git_sha.trim().is_empty() && git_sha != "unknown" {
+        return format!("gaming-telemetry@{git_sha}");
+    }
+
+    if let Some(release) = sentry::release_name!() {
+        let release = release.into_owned();
+        if !release.trim().is_empty() {
+            return release;
+        }
+    }
+
+    // Embed the release SHA (when available via the passed git_sha or prior checks)
+    // before any final fallback. Avoid "@unknown" to prevent mismatch with the
+    // Sentry release workflow which always creates names with the actual SHA
+    // (e.g. gaming-telemetry@<sha> from git rev-parse in CI).
+    "gaming-telemetry".to_owned()
+}
+
+fn init_sentry() -> Option<ClientInitGuard> {
+    let dsn = std::env::var("SENTRY_AUTH_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())?;
+    let git_sha = git_sha();
+    let release = resolve_sentry_release(&git_sha);
+    let environment = std::env::var("SENTRY_ENVIRONMENT")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "local".to_owned());
+    let parsed_dsn = match dsn.parse() {
+        Ok(dsn) => dsn,
+        Err(error) => {
+            eprintln!("Sentry disabled: invalid SENTRY_AUTH_TOKEN ({error})");
+            return None;
+        }
+    };
+
+    let guard = sentry::init(sentry::ClientOptions {
+        dsn: Some(parsed_dsn),
+        release: Some(Cow::Owned(release)),
+        environment: Some(Cow::Owned(environment)),
+        sample_rate: 1.0,
+        traces_sample_rate: 0.0,
+        default_integrations: true,
+        ..Default::default()
+    });
+
+    Some(guard)
+}
 
 #[derive(Debug, Clone)]
 struct GpuSample {
@@ -37,8 +124,11 @@ struct GpuSample {
 
 const BUFFER_SIZE: usize = 2000; // ~10 seconds of data at default 5ms intervals
 
-async fn write_to_parquet(samples: Vec<GpuSample>, batch_id: u32) -> Result<()> {
-    let timestamps: Vec<i64> = samples.iter().map(|s| s.timestamp.timestamp_millis()).collect();
+fn write_to_parquet(samples: Vec<GpuSample>, batch_id: u32) -> Result<()> {
+    let timestamps: Vec<i64> = samples
+        .iter()
+        .map(|s| s.timestamp.timestamp_millis())
+        .collect();
     let power: Vec<u32> = samples.iter().map(|s| s.power_usage_mw).collect();
     let temp: Vec<u32> = samples.iter().map(|s| s.temperature_c).collect();
     let graphics_clock: Vec<u32> = samples.iter().map(|s| s.graphics_clock_mhz).collect();
@@ -83,7 +173,7 @@ async fn write_to_parquet(samples: Vec<GpuSample>, batch_id: u32) -> Result<()> 
     let filename = format!("gpu_telemetry_v1_batch_{}.parquet", batch_id);
     let file = File::create(&filename)?;
     ParquetWriter::new(file).finish(&mut df)?;
-    
+
     println!("Wrote batch {} to {}", batch_id, filename);
     Ok(())
 }
@@ -99,9 +189,11 @@ fn is_mangohud_running() -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _sentry_guard = init_sentry();
+
     let nvml = Arc::new(Nvml::init()?);
     let device = nvml.device_by_index(0)?; // Target first GPU
-    
+
     // Configurable poll interval via environment variable
     let poll_interval_ms = std::env::var("POLL_INTERVAL_MS")
         .ok()
@@ -113,7 +205,10 @@ async fn main() -> Result<()> {
     let mut batch_counter = 0;
     let mut cpu_monitor = CpuMonitor::new();
 
-    println!("Starting enhanced GPU telemetry polling every {}ms...", poll_interval_ms);
+    println!(
+        "Starting enhanced GPU telemetry polling every {}ms...",
+        poll_interval_ms
+    );
     println!("Press Ctrl+C to stop gracefully.");
 
     loop {
@@ -123,18 +218,18 @@ async fn main() -> Result<()> {
                 let temperature = device.temperature(TemperatureSensor::Gpu).unwrap_or(0);
                 let graphics_clock = device.clock_info(Clock::Graphics).unwrap_or(0);
                 let memory_clock = device.clock_info(Clock::Memory).unwrap_or(0);
-                
+
                 let pcie_rx = device.pcie_throughput(nvml_wrapper::enum_wrappers::device::PcieUtilCounter::Receive).unwrap_or(0);
                 let pcie_tx = device.pcie_throughput(nvml_wrapper::enum_wrappers::device::PcieUtilCounter::Send).unwrap_or(0);
                 let pstate = device.performance_state().map(|p| p as u32).unwrap_or(0);
                 let throttle = device.current_throttle_reasons().map(|t| t.bits()).unwrap_or(0);
                 let fan = device.fan_speed(0).unwrap_or(0);
                 let mem_info = device.memory_info();
-                
+
                 // Encoder/Decoder utilization
                 let encoder_util = device.encoder_utilization().map(|u| u.utilization).unwrap_or(0);
                 let decoder_util = device.decoder_utilization().map(|u| u.utilization).unwrap_or(0);
-                
+
                 // MangoHud integration
                 let mangohud_active = is_mangohud_running();
 
@@ -170,12 +265,21 @@ async fn main() -> Result<()> {
                 if buffer.len() >= BUFFER_SIZE {
                     let samples_to_write = std::mem::replace(&mut buffer, Vec::with_capacity(BUFFER_SIZE));
                     batch_counter += 1;
-                    
-                    // Write asynchronously to avoid blocking the polling loop
-                    tokio::spawn(async move {
-                        if let Err(e) = write_to_parquet(samples_to_write, batch_counter).await {
-                            eprintln!("Failed to write to Parquet: {:?}", e);
-                        }
+
+                    // Write asynchronously using spawn_blocking to avoid blocking the async runtime.
+                    // Bind Sentry hub so captures in the blocking task are associated (per Sentry async guidance).
+                    let hub = sentry::Hub::current();
+                    tokio::task::spawn_blocking(move || {
+                        sentry::Hub::run(hub, || {
+                            if let Err(e) = write_to_parquet(samples_to_write, batch_counter) {
+                                let redacted = privacy::redact_personal_path(&format!("{:?}", e));
+                                eprintln!("Failed to write to Parquet: {}", redacted);
+                                // Redact error text before sending to Sentry (addresses Coderabbit P1 on
+                                // potential PII in I/O error messages). Also makes `mod privacy` used from
+                                // production code paths in main.rs.
+                                sentry::capture_message(&redacted, sentry::Level::Error);
+                            }
+                        });
                     });
                 }
             }
@@ -183,8 +287,10 @@ async fn main() -> Result<()> {
                 println!("\nShutdown signal received. Finalizing last batch...");
                 if !buffer.is_empty() {
                     batch_counter += 1;
-                    if let Err(e) = write_to_parquet(buffer, batch_counter).await {
-                        eprintln!("Failed to write final batch: {:?}", e);
+                    if let Err(e) = write_to_parquet(buffer, batch_counter) {
+                        let redacted = privacy::redact_personal_path(&format!("{:?}", e));
+                        eprintln!("Failed to write final batch: {}", redacted);
+                        sentry::capture_message(&redacted, sentry::Level::Error);
                     }
                 }
                 println!("Graceful shutdown complete.");
@@ -194,4 +300,64 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sentry_helpers_env_resolution_and_init() {
+        // All env-mutating coverage for git_sha/resolve/init in one test to avoid
+        // parallel test races on process env (std::env::{set,remove}_var are unsafe
+        // and racy). This single test exercises the branches (including the "good sha"
+        // fast-path) that give codecov for the Sentry integration (#17).
+        unsafe {
+            std::env::set_var("AGENTOS_GIT_SHA", "abc123def");
+        }
+        assert_eq!(git_sha(), "abc123def");
+        unsafe {
+            std::env::remove_var("AGENTOS_GIT_SHA");
+        }
+
+        unsafe {
+            std::env::set_var("SENTRY_RELEASE", "gaming-telemetry@myrel");
+        }
+        assert_eq!(resolve_sentry_release("ignored"), "gaming-telemetry@myrel");
+        unsafe {
+            std::env::remove_var("SENTRY_RELEASE");
+        }
+
+        // Cover the explicit-sha fast path (no SENTRY_RELEASE) sequentially.
+        unsafe {
+            std::env::remove_var("SENTRY_RELEASE");
+        }
+        assert_eq!(
+            resolve_sentry_release("feedface"),
+            "gaming-telemetry@feedface"
+        );
+
+        unsafe {
+            std::env::remove_var("SENTRY_RELEASE");
+        }
+        let r = resolve_sentry_release("unknown");
+        assert!(r.starts_with("gaming-telemetry"));
+
+        unsafe {
+            std::env::remove_var("SENTRY_AUTH_TOKEN");
+        }
+        let guard = init_sentry();
+        assert!(guard.is_none());
+
+        unsafe {
+            std::env::set_var("SENTRY_AUTH_TOKEN", "https://key@00000.ingest.sentry.io/0");
+            std::env::set_var("SENTRY_ENVIRONMENT", "ci-test");
+        }
+        let guard = init_sentry();
+        assert!(guard.is_some());
+        unsafe {
+            std::env::remove_var("SENTRY_AUTH_TOKEN");
+            std::env::remove_var("SENTRY_ENVIRONMENT");
+        }
+    }
 }

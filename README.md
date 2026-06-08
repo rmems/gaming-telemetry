@@ -68,6 +68,30 @@ Consumer command in `corinth-canal`:
 cargo run --example csv_replay canonical.csv
 ```
 
+## Privacy and Safe Cyberpunk 2077 Telemetry Capture
+
+The core `gaming-telemetry` collector performs **only hardware telemetry** (NVIDIA NVML GPU metrics at 5 ms + CPU power/temps via hwmon/RAPL) and writes Parquet/CSV outputs to the **current working directory**. It does **not** scan user home directories, discover Steam libraries, read Proton prefixes, or embed personal paths anywhere in its operation or data.
+
+### Recommended Safe Workflow for Cyberpunk 2077 (Path Tracing + DLSS 4.0)
+1. Run the collector from a clean, dedicated working directory (or `cd` into one) so that generated `gpu_telemetry_v1_batch_*.parquet` files stay isolated and do not mix with personal data.
+2. Launch Cyberpunk 2077 with MangoHud enabled (the collector detects `mangohud_active` and records it for correlation).
+3. Use `cargo run --bin export_csv ...` and the DuckDB `query` bin for analysis — all outputs remain under your control.
+4. Keep telemetry sessions in version-controlled or ephemeral directories when sharing data for SNN training (e.g. with `corinth-canal`).
+
+**Note on setup verification:** A minimal `verify_cyberpunk` skeleton has been restored (src/bin/verify_cyberpunk.rs) to address #9. It is a privacy-safe placeholder for the full workload verifier (PT, DLSS 4 Transformer, UltraPlus/CET mods, crowd, HD textures, etc.).
+
+It **requires** an explicit `--game-path` (never auto-discovers $HOME/Steam/Proton/compatdata). Every path in its text/JSON output is redacted by default using the same `redact_personal_path` helpers (see privacy.rs and #10/#14).
+
+Example (CI guard also exercises this against fixtures + synthetic redaction test):
+```bash
+cargo run --bin verify_cyberpunk -- --game-path ./tests/fixtures/mods/pass --format text --dry-run
+cargo run --bin verify_cyberpunk -- --game-path /path/you/control/for/Cyberpunk\ 2077 --format json
+```
+
+All output stays redacted. This (plus the core collector never walking personal dirs, the privacy guard job, and updated CI) makes the repo ready for privacy-safe CP2077 telemetry capture. Full deep checks can be expanded in the skeleton later.
+
+See parent #7, #9 (sources), #10 (leaks), #14 (workflow), and the Privacy section above. The CI privacy-and-verify-guard now actually runs it.
+
 ## Architecture for SNNs
 The data collected is structured to be directly useful for Neuromorphic computing:
 - **Excitatory Inputs**: PCIe throughput and VRAM allocation rate.

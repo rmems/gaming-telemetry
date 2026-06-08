@@ -51,6 +51,10 @@ mod tests {
             "expected redaction for path: {}",
             example
         );
+        assert_ne!(
+            result, example,
+            "expected the home path to be actually redacted (not left unchanged)"
+        );
     }
 
     #[test]

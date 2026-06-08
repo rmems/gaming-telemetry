@@ -58,7 +58,11 @@ fn resolve_sentry_release(git_sha: &str) -> String {
         }
     }
 
-    "gaming-telemetry@unknown".to_owned()
+    // Embed the release SHA (when available via the passed git_sha or prior checks)
+    // before any final fallback. Avoid "@unknown" to prevent mismatch with the
+    // Sentry release workflow which always creates names with the actual SHA
+    // (e.g. gaming-telemetry@<sha> from git rev-parse in CI).
+    "gaming-telemetry".to_owned()
 }
 
 fn init_sentry() -> Option<ClientInitGuard> {
@@ -337,7 +341,7 @@ mod tests {
             std::env::remove_var("SENTRY_RELEASE");
         }
         let r = resolve_sentry_release("unknown");
-        assert!(r.starts_with("gaming-telemetry@"));
+        assert!(r.starts_with("gaming-telemetry"));
 
         unsafe {
             std::env::remove_var("SENTRY_AUTH_TOKEN");

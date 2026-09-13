@@ -90,8 +90,14 @@ pub struct PriorRun {
 
 impl Workload {
     pub fn new(label: &str) -> Self {
-        let class = std::env::var("WORKLOAD_CLASS")
-            .ok()
+        Self::with_class(std::env::var("WORKLOAD_CLASS").ok(), label)
+    }
+
+    /// Class selection split from the environment lookup, so the rules can be
+    /// tested without mutating process env — which is `unsafe` under edition 2024
+    /// and races other tests in the same process.
+    fn with_class(raw_class: Option<String>, label: &str) -> Self {
+        let class = raw_class
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "gaming".to_owned());
@@ -149,6 +155,126 @@ fn temp_path(dir: &Path) -> PathBuf {
         std::process::id(),
         nanos
     ))
+}
+
+/// Remove manifest temporaries left behind by a process that died between
+/// `create_new` and `rename`.
+///
+/// In-process failures clean up after themselves, but a SIGKILL (or a power loss)
+/// in that window strands the file forever. A collector that restarts often would
+/// otherwise accumulate them in the session directory indefinitely. Safe to run at
+/// startup: the caller holds the exclusive session lock, so no live writer owns a
+/// temporary here.
+/// True only for the exact filename shape `temp_path` generates:
+/// `session_manifest.json.<pid>.<nanos>.<sequence>.tmp`, all three numeric.
+///
+/// Deliberately not a `session_manifest.json*.tmp` glob. The sweep deletes files,
+/// so it must recognise only what this module itself writes — an operator's
+/// `session_manifest.json.backup.tmp` matches the loose pattern and is exactly the
+/// kind of file that must survive.
+fn is_generated_temporary(name: &str) -> bool {
+    let Some(fields) = name
+        .strip_prefix(MANIFEST_FILENAME)
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .and_then(|rest| rest.strip_prefix('.'))
+    else {
+        return false;
+    };
+    let fields: Vec<&str> = fields.split('.').collect();
+    fields.len() == 3
+        && fields
+            .iter()
+            .all(|field| !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// What a sweep did, so the caller can report both halves.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SweepOutcome {
+    pub removed: usize,
+    /// Temporaries that matched but could not be deleted.
+    pub failed: Vec<PathBuf>,
+    /// Directory entries that could not be read at all.
+    ///
+    /// Each one may have been a stale temporary the sweep has now failed to
+    /// reclaim, so a non-zero count means "swept, but not exhaustively" — which
+    /// the caller must be able to say rather than reporting a clean sweep.
+    pub unreadable_entries: usize,
+}
+
+/// Whether a directory entry is a generated manifest temporary the sweep
+/// should act on.
+enum StaleMatch {
+    /// The name isn't a shape this module generates -- not the sweep's business.
+    NotOurs,
+    /// The name matches, but its type couldn't be confirmed (a transient or
+    /// mounted-filesystem metadata error). Folding this into `NotOurs` would
+    /// let a real stale temporary be silently skipped while the sweep still
+    /// reports a clean pass.
+    Unreadable,
+    /// A confirmed regular file matching the generated shape.
+    Match(PathBuf),
+}
+
+/// Classify `entry` against the generated-temporary name shape.
+fn stale_temporary_path(entry: &std::fs::DirEntry) -> StaleMatch {
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else {
+        return StaleMatch::NotOurs;
+    };
+    if !is_generated_temporary(name) {
+        return StaleMatch::NotOurs;
+    }
+    match entry.file_type() {
+        Ok(kind) if kind.is_file() => StaleMatch::Match(entry.path()),
+        Ok(_) => StaleMatch::NotOurs,
+        Err(_) => StaleMatch::Unreadable,
+    }
+}
+
+pub fn sweep_stale_temporaries(dir: &Path) -> Result<SweepOutcome> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // A directory that does not exist yet simply has nothing to sweep.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SweepOutcome::default());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to enumerate {} while sweeping stale manifests",
+                    crate::privacy::redact_personal_path(&dir.display().to_string())
+                )
+            });
+        }
+    };
+
+    // A failed removal is not fatal -- stale debris wastes space but blocks
+    // nothing, and refusing to start a capture over it would be worse -- but it is
+    // returned rather than dropped, so it can be reported instead of recurring
+    // silently on every restart.
+    let mut outcome = SweepOutcome::default();
+    for entry in entries {
+        // `ReadDir` can fail per entry after the directory opened — an I/O error
+        // on a mounted SESSION_DIR, say. Dropping those made a partial sweep
+        // indistinguishable from a complete one.
+        let Ok(entry) = entry else {
+            outcome.unreadable_entries += 1;
+            continue;
+        };
+        let path = match stale_temporary_path(&entry) {
+            StaleMatch::NotOurs => continue,
+            StaleMatch::Unreadable => {
+                outcome.unreadable_entries += 1;
+                continue;
+            }
+            StaleMatch::Match(path) => path,
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => outcome.removed += 1,
+            Err(_) => outcome.failed.push(path),
+        }
+    }
+    Ok(outcome)
 }
 
 impl SessionManifest {
@@ -405,6 +531,112 @@ mod tests {
         assert_eq!(host.gpu_name, "unknown");
         assert_eq!(host.driver, "unknown");
         assert!(!host.cpu_model.is_empty());
+    }
+
+    /// A SIGKILL between `create_new` and `rename` strands a temporary that no
+    /// in-process cleanup can reach. Startup must reclaim it.
+    #[test]
+    fn sweep_removes_stale_temporaries_but_spares_real_files() {
+        let dir = temp_dir("sweep");
+        let stale_a = dir.join(format!("{MANIFEST_FILENAME}.999.123.0.tmp"));
+        let stale_b = dir.join(format!("{MANIFEST_FILENAME}.998.456.1.tmp"));
+        let manifest = dir.join(MANIFEST_FILENAME);
+        let unrelated = dir.join("canonical.csv");
+        let other_tmp = dir.join("something_else.tmp");
+        // An operator's own backup matches a loose `*.tmp` glob and must survive.
+        let backup = dir.join(format!("{MANIFEST_FILENAME}.backup.tmp"));
+        for path in [
+            &stale_a, &stale_b, &manifest, &unrelated, &other_tmp, &backup,
+        ] {
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        let outcome = sweep_stale_temporaries(&dir).unwrap();
+        assert_eq!(outcome.removed, 2);
+        assert!(outcome.failed.is_empty());
+        assert!(!stale_a.exists() && !stale_b.exists());
+        assert!(
+            manifest.exists() && unrelated.exists() && other_tmp.exists() && backup.exists(),
+            "the sweep must only claim the names it generates"
+        );
+
+        // Idempotent: a second startup finds nothing left to do.
+        assert_eq!(sweep_stale_temporaries(&dir).unwrap().removed, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only the generated `<pid>.<nanos>.<sequence>` shape, all numeric.
+    #[test]
+    fn only_generated_temporary_names_are_swept() {
+        for name in [
+            "session_manifest.json.1.2.3.tmp",
+            "session_manifest.json.999999.1788746199000000000.42.tmp",
+        ] {
+            assert!(is_generated_temporary(name), "{name} should match");
+        }
+        for name in [
+            "session_manifest.json.backup.tmp",  // an operator's backup
+            "session_manifest.json.tmp",         // no fields
+            "session_manifest.json.1.2.tmp",     // too few fields
+            "session_manifest.json.1.2.3.4.tmp", // too many fields
+            "session_manifest.json.1.2.x.tmp",   // non-numeric field
+            "session_manifest.json.1..3.tmp",    // empty field
+            "session_manifest.json",             // the real manifest
+            "other.json.1.2.3.tmp",              // a different file
+        ] {
+            assert!(!is_generated_temporary(name), "{name} must be spared");
+        }
+    }
+
+    /// A temporary that cannot be deleted is returned, not silently dropped --
+    /// otherwise it recurs on every restart with no diagnostic.
+    #[cfg(unix)]
+    #[test]
+    fn undeletable_temporaries_are_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("sweep_fail");
+        let guarded = dir.join("guarded");
+        std::fs::create_dir_all(&guarded).unwrap();
+        let stuck = guarded.join(format!("{MANIFEST_FILENAME}.1.2.3.tmp"));
+        std::fs::write(&stuck, b"x").unwrap();
+        // Removing a directory entry needs write permission on the directory.
+        std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let outcome = sweep_stale_temporaries(&guarded).unwrap();
+        // Running as root defeats the permission bits, so only assert when it took.
+        if outcome.removed == 0 {
+            assert_eq!(outcome.failed, vec![stuck], "the failure must be surfaced");
+        }
+
+        let _ = std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_of_a_missing_directory_is_not_an_error() {
+        assert_eq!(
+            sweep_stale_temporaries(Path::new("/nonexistent/session/dir")).unwrap(),
+            SweepOutcome::default()
+        );
+    }
+
+    /// `WORKLOAD_CLASS` segments the training mix downstream; only its default
+    /// was previously exercised.
+    #[test]
+    fn workload_class_comes_from_the_environment_with_a_gaming_default() {
+        assert_eq!(Workload::with_class(None, "kcd2").class, "gaming");
+        assert_eq!(
+            Workload::with_class(Some("  benchmark  ".to_owned()), "kcd2").class,
+            "benchmark",
+            "the value is trimmed"
+        );
+        assert_eq!(
+            Workload::with_class(Some("   ".to_owned()), "kcd2").class,
+            "gaming",
+            "a whitespace-only value falls back to the default"
+        );
+        assert_eq!(Workload::with_class(None, "kcd2").label, "kcd2");
     }
 
     #[test]

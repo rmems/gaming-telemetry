@@ -3,7 +3,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use gaming_telemetry::cpu::CpuMonitor;
-use gaming_telemetry::manifest::{HostInfo, SessionManifest};
+use gaming_telemetry::manifest::{self, HostInfo, SessionManifest};
 use gaming_telemetry::privacy;
 use gaming_telemetry::session;
 use gaming_telemetry::timing::TimingStats;
@@ -287,6 +287,41 @@ async fn main() -> Result<()> {
 
     let output_dir = session::resolve_dir()?;
     let _session_lock = session::acquire_exclusive(&output_dir)?;
+
+    // Only safe under the exclusive lock: no other collector owns a temporary in
+    // this directory, so anything left is from a process that was killed mid-write.
+    match manifest::sweep_stale_temporaries(&output_dir) {
+        Ok(outcome) => {
+            if outcome.removed > 0 {
+                println!(
+                    "Removed {} stale manifest temporary file(s).",
+                    outcome.removed
+                );
+            }
+            if outcome.unreadable_entries > 0 {
+                report_failure(
+                    "Stale-manifest sweep was not exhaustive",
+                    &format!(
+                        "{} directory entr(y/ies) could not be read;                          any stale temporary among them remains",
+                        outcome.unreadable_entries
+                    ),
+                );
+            }
+            // Surfaced rather than dropped: an undeletable temporary otherwise
+            // recurs on every restart with no diagnostic.
+            for path in &outcome.failed {
+                report_failure(
+                    "Could not remove a stale manifest temporary",
+                    &path.display().to_string(),
+                );
+            }
+        }
+        Err(e) => report_failure(
+            "Could not sweep stale manifest temporaries",
+            &format!("{e:?}"),
+        ),
+    }
+
     let started_at = Utc::now();
     let session_id = session::session_id(
         &session_label,

@@ -1,0 +1,20 @@
+src/export.rs
+  s_70a7ba7079c559::t_d3a15a71020509 134-165,181,194,202
+  s_70a7ba7079c559::t_a0c44acec5c405 220-221,225,230,235-236,238-242,258-276
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "5f45775679a99798be5ca571cda2275ba08f7790",
+  "prompts": {},
+  "sessions": {
+    "s_70a7ba7079c559": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "626c5f8f-aa8e-4f60-8bd6-e646175353c1",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}

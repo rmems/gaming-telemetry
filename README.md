@@ -22,9 +22,12 @@ There is **no** game-install verifier, Steam/Proton discovery, or mod scanner. G
 - Performance state & throttle reasons
 - Fan speed, VRAM used/total
 - Encoder/decoder utilization
-- CPU Tctl / CCD temps and package power (hwmon + RAPL energy delta) — **nullable**,
-  see [CPU sensor availability](#cpu-sensor-availability)
+- CPU Tctl / CCD temps and package power (hwmon + RAPL energy delta)
 - **`session_label`** (string; same for every row in a run)
+
+Every NVML and CPU **sensor** column is **nullable**. A null means *not measured*,
+never *measured zero* — see [Missing measurements](#missing-measurements-null-vs-0).
+`session_label` and `timestamp_ms` stay required.
 
 MangoHud (or any overlay) is **not** recorded. You may still run it yourself for on-screen monitoring; the collector only writes hardware telemetry.
 
@@ -170,10 +173,30 @@ Header:
 
 `timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`
 
-`gpu_power_w` is `power_usage_mw / 1000.0`. `cpu_tctl_c` and `cpu_package_power_w`
+`gpu_power_w` is `power_usage_mw / 1000.0`. GPU and CPU sensor columns
 are empty when no valid measurement was obtained for that sample — see below.
 
-## CPU sensor availability
+## Missing measurements (null vs 0)
+
+A null in Parquet (empty cell in the exported CSV) means *no valid measurement
+was obtained for that sample*. It never means the sensor measured zero.
+**Do not treat a null as 0.** Downstream ETL (`spikenaut-telemetry-etl`
+`system_telemetry_v1`) refuses a literal `0` on power, temperature, clocks,
+VRAM capacity, and CPU sensors — those zeros were the old producer writing a
+failed read as a measurement.
+
+| Column | Null when | Successful `0` |
+|---|---|---|
+| `power_usage_mw`, `temperature_c`, `graphics_clock_mhz`, `memory_clock_mhz` | NVML call failed | Physically implausible; do not invent |
+| `memory_used_mb`, `memory_total_mb` | `memory_info` failed | Used-idle `0` is kept; total `0` is not a real GPU |
+| `pcie_rx_kbps`, `pcie_tx_kbps`, `fan_speed_perc` | NVML call failed | Idle/stopped `0` is kept |
+| `encoder_util_perc`, `decoder_util_perc` | NVML call failed | Idle `0` is kept (a whole session may be encoder-idle) |
+| `pstate`, `throttle_reasons_bitmask` | NVML call failed | `P0` / "not throttling" `0` is kept — do not invent either |
+| CPU columns | see below | never fabricated |
+
+`session_label` and `timestamp_ms` are not sensor readings and stay populated.
+
+### CPU sensor availability
 
 The four CPU columns (`cpu_tctl_c`, `cpu_ccd1_c`, `cpu_ccd2_c`,
 `cpu_package_power_w`) are **nullable**. A null means *no valid measurement was
@@ -224,9 +247,11 @@ CPU package power unavailable: no readable RAPL energy counter. ...
 To record CPU power, run the collector as root, or grant read access to the
 counter for your user.
 
-**Consumers must handle nulls.** Treating a null as `0.0` reintroduces exactly the
-bug this avoids: a model trained on zero-filled CPU power learns that CPU power is
-constant. Drop the rows, mask them, or impute deliberately.
+**Consumers must handle nulls.** Treating a null as `0` or `0.0` reintroduces
+exactly the bug this avoids: a model trained on zero-filled power, clocks, or
+CPU package power learns that the machine was idle (or in P0, or not
+throttling) when the sensor was simply unread. Drop the rows, mask them, or
+impute deliberately.
 
 ### 3. Optional: DuckDB query helper
 

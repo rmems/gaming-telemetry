@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **GPU NVML telemetry recorded fabricated zeros.** Every NVML sensor field used
+  `unwrap_or(0)` (or `map(...).unwrap_or(0)`) when a call failed, so a missed
+  power/temp/clock/PCIe/fan/VRAM/encoder/decoder/pstate/throttle read became a
+  plausible `0` in Parquet. Downstream ETL (`system_telemetry_v1`) refuses a
+  literal `0` on `UNAVAILABLE_ZERO_FIELDS` (power, temp, clocks, VRAM total, CPU)
+  and expects null for missing. Those GPU columns are now `Option`; a failed NVML
+  call writes null. A successful read of `0` (idle encoder, idle PCIe, P0, no
+  throttle, fan stopped) stays `0`.
+
+  **Breaking for consumers:** GPU sensor columns can now be null in Parquet and
+  empty in the exported CSV. Treating a null as `0` reintroduces the bug.
 - **CPU telemetry recorded fabricated zeros.** `CpuMonitor` seeded its energy
   counter with `unwrap_or(0)` and fell back to the previous reading on every failed
   read, so when RAPL's `energy_uj` was unreadable — the common case, since it is

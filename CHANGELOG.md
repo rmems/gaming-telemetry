@@ -17,6 +17,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `session_manifest.json.<pid>.<nanos>.<sequence>.tmp`, all three numeric. An
   operator's `session_manifest.json.backup.tmp` is deliberately spared. A
   temporary that cannot be deleted is reported rather than dropped.
+- **A `SESSION_LABEL` that sanitizes away is no longer silent.** `sanitize_label`
+  strips everything outside `A-Z a-z 0-9 _ - .`, so a mistyped label could reduce
+  to the empty string and land every row in the same anonymous bucket as setting
+  no label at all — only visible after the capture. The collector now says so at
+  startup.
+- **Label precedence was decided before sanitization.**
+  `resolve_label_from_sources` filtered candidates on their *raw* emptiness, so a
+  non-empty CLI label that sanitized away won precedence and silently discarded a
+  valid `SESSION_LABEL`. Each candidate is sanitized first, then the first
+  surviving one wins.
+- Histogram bucket indices are computed with checked conversions instead of `as
+  usize`. On a 32-bit target an extreme stall could wrap into a small index and be
+  misfiled as a fast sample, corrupting the tail the histogram exists to measure.
+- `TimingStats::new` asserts a non-zero cadence in debug builds. Zero makes every
+  `skipped_tick_estimate` division return `None`, reporting zero skipped ticks
+  forever rather than surfacing the misconfiguration.
 
 - **The build was broken.** The dependency bump to `polars 0.55.2` changed
   `LazyFrame::scan_parquet` to take a `PlRefPath`, made `DataFrame::new` take an
@@ -88,6 +104,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Removed
 
+- **Qodana**, entirely — `qodana.yaml`, `.github/workflows/qodana_code_quality.yml`,
+  and the `QODANA_TOKEN_1849579870` Cloud scan. `qodana-rust` is Ultimate/EAP only;
+  with Cloud membership expired the workflow cannot run usefully and there is no
+  community Rust linter to fall back to. Remaining gates stay in `ci.yml`
+  ([#42](https://github.com/rmems/gaming-telemetry/issues/42)).
 - **Sentry, entirely** — the dependency, the ~100-line bootstrap in `main.rs`, the
   `SENTRY_*` environment variables, and the `sentry-release` workflow
   ([#20](https://github.com/rmems/gaming-telemetry/issues/20)). It was a hard

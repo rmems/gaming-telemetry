@@ -27,7 +27,7 @@ path = "src/bin/query.rs"
 required-features = ["query"]
 
 [dependencies]
-nvml-wrapper = { version = "0.12.1", features = ["serde"] }
+nvml-wrapper = { version = "0.13.0", features = ["serde"] }
 tokio = { version = "1.53.1", features = ["full"] }
 polars = { version = "0.55.2", features = ["parquet", "lazy"] }
 chrono = { version = "0.4.45", features = ["serde"] }

@@ -1,0 +1,24 @@
+CHANGELOG.md
+  s_70a7ba7079c559::t_75f5e19f99940b 22-34
+src/privacy.rs
+  s_70a7ba7079c559::t_245be643b1bad0 102-104,106-132,137-174,176-177,181-187
+  s_70a7ba7079c559::t_267f1c38300ed5 29-41
+  s_70a7ba7079c559::t_a1fe4297bd7ca2 369-435
+  s_70a7ba7079c559::t_2b876892bd9afc 213,218-223,225,229-231
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "d30d2a96984915ed5148e875369ee11f5cd2a774",
+  "prompts": {},
+  "sessions": {
+    "s_70a7ba7079c559": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "626c5f8f-aa8e-4f60-8bd6-e646175353c1",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}

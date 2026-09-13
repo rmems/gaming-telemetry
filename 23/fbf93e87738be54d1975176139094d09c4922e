@@ -1,0 +1,29 @@
+src/export.rs
+  s_70a7ba7079c559::t_3ae683b55738a9 303-312
+  s_70a7ba7079c559::t_9e5d5ebc5ceab6 137-143,168-175,181-188,191-196
+  s_70a7ba7079c559::t_643ddd26d83a27 16-17,19
+  s_70a7ba7079c559::t_1fa7dbadcb09a6 235,238-240
+  s_70a7ba7079c559::t_fbc9dafb15176d 108-116
+  s_70a7ba7079c559::t_d76b4a69631e3e 56-62,64-71
+  s_70a7ba7079c559::t_18b8362690cd10 199-209,217-221,226,229-233,236-237,241-242,248-258
+  s_70a7ba7079c559::t_df3580d86002d7 414-430
+  s_70a7ba7079c559::t_90169fe0a243af 462
+README.md
+  s_70a7ba7079c559::t_4be82fbfaabc18 173-177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "23fbf93e87738be54d1975176139094d09c4922e",
+  "prompts": {},
+  "sessions": {
+    "s_70a7ba7079c559": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "626c5f8f-aa8e-4f60-8bd6-e646175353c1",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}

@@ -201,14 +201,34 @@ pub struct SweepOutcome {
     pub unreadable_entries: usize,
 }
 
-/// The path of `entry`, if it is a generated manifest temporary.
-fn stale_temporary_path(entry: &std::fs::DirEntry) -> Option<PathBuf> {
+/// Whether a directory entry is a generated manifest temporary the sweep
+/// should act on.
+enum StaleMatch {
+    /// The name isn't a shape this module generates -- not the sweep's business.
+    NotOurs,
+    /// The name matches, but its type couldn't be confirmed (a transient or
+    /// mounted-filesystem metadata error). Folding this into `NotOurs` would
+    /// let a real stale temporary be silently skipped while the sweep still
+    /// reports a clean pass.
+    Unreadable,
+    /// A confirmed regular file matching the generated shape.
+    Match(PathBuf),
+}
+
+/// Classify `entry` against the generated-temporary name shape.
+fn stale_temporary_path(entry: &std::fs::DirEntry) -> StaleMatch {
     let name = entry.file_name();
-    if !is_generated_temporary(name.to_str()?) {
-        return None;
+    let Some(name) = name.to_str() else {
+        return StaleMatch::NotOurs;
+    };
+    if !is_generated_temporary(name) {
+        return StaleMatch::NotOurs;
     }
-    entry.file_type().ok().filter(|kind| kind.is_file())?;
-    Some(entry.path())
+    match entry.file_type() {
+        Ok(kind) if kind.is_file() => StaleMatch::Match(entry.path()),
+        Ok(_) => StaleMatch::NotOurs,
+        Err(_) => StaleMatch::Unreadable,
+    }
 }
 
 pub fn sweep_stale_temporaries(dir: &Path) -> Result<SweepOutcome> {
@@ -241,8 +261,13 @@ pub fn sweep_stale_temporaries(dir: &Path) -> Result<SweepOutcome> {
             outcome.unreadable_entries += 1;
             continue;
         };
-        let Some(path) = stale_temporary_path(&entry) else {
-            continue;
+        let path = match stale_temporary_path(&entry) {
+            StaleMatch::NotOurs => continue,
+            StaleMatch::Unreadable => {
+                outcome.unreadable_entries += 1;
+                continue;
+            }
+            StaleMatch::Match(path) => path,
         };
         match std::fs::remove_file(&path) {
             Ok(()) => outcome.removed += 1,

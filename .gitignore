@@ -10,6 +10,7 @@
 .cline/
 .claude/
 .codex/
+.grok/
 .opencode/
 docs/superpowers/
 
@@ -45,10 +46,6 @@ remotes.txt
 !.mimocode/mimocode.jsonc
 !.mimocode/AGENTS.md
 !.kilocodeignore
-
-# Lockfile untracked for this simplify PR (avoids multi-kLOC PR noise /
-# transitive advisory surface; generate locally with `cargo generate-lockfile`)
-Cargo.lock
 
 # Generated telemetry batches (collector writes to CWD by default)
 *.parquet

@@ -15,10 +15,55 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: rustfmt
           toolchain: "1.98.0"
+      - name: MSRV pin matches Cargo.toml
+        # The toolchain version lives in Cargo.toml, rust-toolchain.toml and every
+        # job below. Parse the workflow as YAML rather than pattern-matching it: a
+        # regex keyed to one quoting style silently skips `toolchain: stable` or
+        # `toolchain: 'stable'`, and the guard then passes on the entries it did
+        # match -- failing open exactly when a job has drifted.
+        run: |
+          set -euo pipefail
+          python3 - <<'GUARD'
+          import re, sys
+          try:
+              import yaml
+          except ImportError:
+              sys.exit("::error::PyYAML unavailable; the MSRV guard cannot verify anything")
+
+          def scalar(path, pattern):
+              text = open(path, encoding="utf-8").read()
+              found = re.search(pattern, text, re.MULTILINE)
+              if not found:
+                  sys.exit(f"::error::no {pattern!r} in {path}")
+              return found.group(1)
+
+          declared = scalar("Cargo.toml", r'^rust-version\s*=\s*"([^"]+)"')
+          pinned = scalar("rust-toolchain.toml", r'^channel\s*=\s*"([^"]+)"')
+          print(f"Cargo.toml rust-version={declared}  rust-toolchain.toml channel={pinned}")
+          if declared != pinned:
+              sys.exit(f"::error::MSRV drift: Cargo.toml {declared}, rust-toolchain.toml {pinned}")
+
+          workflow = yaml.safe_load(open(".github/workflows/ci.yml", encoding="utf-8"))
+          pins = [
+              (job, str(step["with"]["toolchain"]))
+              for job, body in (workflow.get("jobs") or {}).items()
+              for step in (body.get("steps") or [])
+              if isinstance(step.get("with"), dict) and "toolchain" in step["with"]
+          ]
+          if not pins:
+              sys.exit("::error::no toolchain pins found; the guard would pass vacuously")
+
+          print(f"checked {len(pins)} job pin(s)")
+          drifted = [(job, pin) for job, pin in pins if pin != declared]
+          if drifted:
+              for job, pin in drifted:
+                  print(f"::error::job {job} pins {pin!r} but Cargo.toml declares {declared}")
+              sys.exit(1)
+          GUARD
       - name: rustfmt
         run: cargo fmt --all -- --check
 
@@ -26,33 +71,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: clippy,llvm-tools-preview
           toolchain: "1.98.0"
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.3
       - name: clippy
         # --all-features so the optional `query` code is linted too.
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   check-strict:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.98.0"
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.3
       - name: Cargo check (default features)
-        run: cargo check
+        run: cargo check --locked
       - name: Cargo check (strict -D warnings, all features)
-        run: RUSTFLAGS="-D warnings" cargo check --all-features
+        run: RUSTFLAGS="-D warnings" cargo check --locked --all-features
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: llvm-tools-preview
           toolchain: "1.98.0"
@@ -61,8 +106,8 @@ jobs:
         # Both configurations: `--all-features` alone never builds the tests for
         # the default (no-`query`) build that operators actually run.
         run: |
-          cargo test
-          cargo test --all-features
+          cargo test --locked
+          cargo test --locked --all-features
         env:
           CARGO_INCREMENTAL: 0
           RUSTFLAGS: "-C instrument-coverage"
@@ -82,15 +127,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.98.0"
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.3
       - name: Build release (default features)
-        run: cargo build --release
+        run: cargo build --locked --release
       - name: Build bins (all features)
         # `query` is behind the `query` feature, which pulls in bundled DuckDB.
-        run: cargo build --all-features --bin gaming-telemetry --bin export_csv --bin query
+        run: cargo build --locked --all-features --bin gaming-telemetry --bin export_csv --bin query
       - name: Cargo audit (non-blocking)
         # rustsec/audit-check@v1 — pinned; advisory noise must not block capture PRs.
         uses: rustsec/audit-check@e9159ac5f7d7d873ce074ca134da2f445c0a4a61 # v1

@@ -8,6 +8,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A `SESSION_LABEL` that sanitizes away is no longer silent.** `sanitize_label`
+  strips everything outside `A-Z a-z 0-9 _ - .`, so a mistyped label could reduce
+  to the empty string and land every row in the same anonymous bucket as setting
+  no label at all — only visible after the capture. The collector now says so at
+  startup.
+- **Label precedence was decided before sanitization.**
+  `resolve_label_from_sources` filtered candidates on their *raw* emptiness, so a
+  non-empty CLI label that sanitized away won precedence and silently discarded a
+  valid `SESSION_LABEL`. Each candidate is sanitized first, then the first
+  surviving one wins.
+- Histogram bucket indices are computed with checked conversions instead of `as
+  usize`. On a 32-bit target an extreme stall could wrap into a small index and be
+  misfiled as a fast sample, corrupting the tail the histogram exists to measure.
+- `TimingStats::new` asserts a non-zero cadence in debug builds. Zero makes every
+  `skipped_tick_estimate` division return `None`, reporting zero skipped ticks
+  forever rather than surfacing the misconfiguration.
+
 - **The build was broken.** The dependency bump to `polars 0.55.2` changed
   `LazyFrame::scan_parquet` to take a `PlRefPath`, made `DataFrame::new` take an
   explicit height, and dropped `IntoIterator` for `&ChunkedArray`. No call site had

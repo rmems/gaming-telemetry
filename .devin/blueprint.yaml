@@ -11,17 +11,23 @@ initialize: |
   sudo apt-get install -y --no-install-recommends build-essential ca-certificates cmake curl pkg-config libssl-dev
   sudo rm -rf /var/lib/apt/lists/*
 
-  # Ensure a stable Rust toolchain with clippy and rustfmt; use RUSTUP_TOOLCHAIN so
-  # the repo does not mutate the global default toolchain for other snapshots.
+  # Bootstrap rustup without pinning a toolchain here: `rust-toolchain.toml`
+  # declares the version, and rustup installs it on the first cargo invocation.
+  #
+  # Deliberately no RUSTUP_TOOLCHAIN export. That variable overrides
+  # rust-toolchain.toml ("overridden by environment variable RUSTUP_TOOLCHAIN"),
+  # so setting it to `stable` here would silently build this repo on a different
+  # compiler than CI pins -- the exact drift rust-toolchain.toml exists to stop.
+  # `--profile minimal --default-toolchain none` keeps the global default
+  # untouched for other snapshots, which is what the export was guarding.
   if ! command -v rustup >/dev/null 2>&1; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --component clippy,rustfmt
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
     echo "PATH=$HOME/.cargo/bin:$PATH" >> "$ENVRC"
     export PATH="$HOME/.cargo/bin:$PATH"
-  else
-    rustup toolchain install stable --component clippy,rustfmt
   fi
-  echo 'RUSTUP_TOOLCHAIN=stable' >> "$ENVRC"
-  export RUSTUP_TOOLCHAIN=stable
+  # Installs the version named by rust-toolchain.toml, with the components CI uses.
+  rustup show active-toolchain || true
+  rustup component add clippy rustfmt
 
 maintenance: |
   # Pre-warm dependency cache for faster first builds/tests.

@@ -35,12 +35,21 @@ pub struct CpuMonitor {
 
 /// Consecutive zero-energy deltas before a stuck counter is reported.
 ///
-/// At a 5 ms poll a genuine zero delta is not physically meaningful: even an idle
-/// package accumulates tens of thousands of microjoules per tick, far above RAPL
-/// counter resolution. A run of them means the counter is not advancing, and a
-/// readable-but-frozen counter would otherwise differentiate to a plausible 0 W —
-/// the very failure this module exists to prevent.
+/// A genuine zero energy delta is not physically meaningful at any poll interval
+/// this collector supports: even an idle package accumulates tens of thousands of
+/// microjoules per tick, far above RAPL counter resolution. A run of them means
+/// the counter is not advancing, and a readable-but-frozen counter would
+/// otherwise differentiate to a plausible 0 W — the very failure this module
+/// exists to prevent.
 const STUCK_COUNTER_TICKS: u32 = 200;
+
+/// No RAPL-metered CPU package draws anywhere close to this much power. A delta
+/// implying more means the counter didn't wrap, it *reset* — S3/S4 resume, driver
+/// reload — and got misread as one: `energy_delta_uj` cannot tell a genuine wrap
+/// (previous reading near the ceiling) from a reset to an arbitrary low value
+/// using the two counter readings alone, so implausible results are caught here
+/// instead, where the elapsed time makes an implied wattage available to check.
+const MAX_PLAUSIBLE_PACKAGE_POWER_W: f64 = 1000.0;
 
 impl Default for CpuMonitor {
     fn default() -> Self {
@@ -93,8 +102,9 @@ impl CpuMonitor {
         if rapl_path.is_some() && rapl_max_range_uj.is_none() {
             eprintln!(
                 "CPU package power: `max_energy_range_uj` is unreadable, so counter \
-                 wraparound cannot be resolved. Power will be empty for every tick \
-                 after the counter first wraps (roughly every 11 minutes at 100 W)."
+                 wraparound cannot be resolved. Power will be empty for the single \
+                 tick where the counter wraps (roughly every 11 minutes at 100 W), \
+                 not continuously after — every other tick is unaffected."
             );
         }
 
@@ -123,6 +133,13 @@ impl CpuMonitor {
 
     /// Read every CPU sensor for this tick.
     pub fn poll(&mut self) -> CpuSample {
+        // `TEMP_INPUTS` is consumed generically in `new()`'s startup probe, but
+        // these three fields are bound to it positionally — reordering the array
+        // would compile cleanly and silently rename Parquet columns. These pin
+        // the assumption so a reorder fails loudly in any build that runs tests.
+        debug_assert_eq!(TEMP_INPUTS[0].1, "cpu_tctl_c");
+        debug_assert_eq!(TEMP_INPUTS[1].1, "cpu_ccd1_c");
+        debug_assert_eq!(TEMP_INPUTS[2].1, "cpu_ccd2_c");
         CpuSample {
             tctl_c: self.read_temp(TEMP_INPUTS[0].0),
             ccd1_c: self.read_temp(TEMP_INPUTS[1].0),
@@ -154,18 +171,16 @@ impl CpuMonitor {
         let previous = self.last_energy.replace((current_uj, now));
         let (previous_uj, previous_at) = previous?;
 
-        if current_uj == previous_uj {
-            self.zero_delta_ticks = self.zero_delta_ticks.saturating_add(1);
-            if self.zero_delta_ticks >= STUCK_COUNTER_TICKS && !self.stuck_reported {
-                self.stuck_reported = true;
-                eprintln!(
-                    "CPU package power counter has not advanced in {STUCK_COUNTER_TICKS} \
-                     consecutive reads. It is readable but frozen, so recorded power is \
-                     not trustworthy for this session."
-                );
-            }
-        } else {
-            self.zero_delta_ticks = 0;
+        if Self::note_zero_delta(
+            &mut self.zero_delta_ticks,
+            &mut self.stuck_reported,
+            current_uj == previous_uj,
+        ) {
+            eprintln!(
+                "CPU package power counter has not advanced in {STUCK_COUNTER_TICKS} \
+                 consecutive reads. It is readable but frozen, so recorded power is \
+                 not trustworthy for this session."
+            );
         }
 
         power_watts(
@@ -211,6 +226,31 @@ impl CpuMonitor {
     fn read_max_energy_range(energy_path: &Path) -> Option<u64> {
         let max_path = energy_path.parent()?.join("max_energy_range_uj");
         read_u64_file(&max_path).filter(|max| *max > 0)
+    }
+
+    /// Track a run of unchanged energy-counter reads, latching a one-shot report
+    /// when it crosses `STUCK_COUNTER_TICKS`. Movement clears both the run and
+    /// the latch, so a counter that recovers and later freezes again is reported
+    /// again rather than staying silent for the rest of the session. A free
+    /// function of its state rather than a method so the state machine is
+    /// testable without touching the filesystem.
+    fn note_zero_delta(
+        zero_delta_ticks: &mut u32,
+        stuck_reported: &mut bool,
+        unchanged: bool,
+    ) -> bool {
+        if !unchanged {
+            *zero_delta_ticks = 0;
+            *stuck_reported = false;
+            return false;
+        }
+        *zero_delta_ticks = zero_delta_ticks.saturating_add(1);
+        if *zero_delta_ticks >= STUCK_COUNTER_TICKS && !*stuck_reported {
+            *stuck_reported = true;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -258,7 +298,14 @@ fn power_watts(
 
     let delta_uj = energy_delta_uj(previous_uj, current_uj, max_range_uj)?;
     let watts = (delta_uj as f64 / 1_000_000.0) / elapsed_sec;
-    watts.is_finite().then_some(watts as f32)
+    // A counter reset (S3/S4 resume, driver reload) that lands on a backwards
+    // step is indistinguishable from a genuine wrap by `energy_delta_uj` alone —
+    // both are "current_uj < previous_uj". A reset unwrapped as a wrap implies an
+    // arbitrarily large, physically impossible wattage; a real wrap never does.
+    if !watts.is_finite() || watts > MAX_PLAUSIBLE_PACKAGE_POWER_W {
+        return None;
+    }
+    Some(watts as f32)
 }
 
 /// hwmon input filename paired with the Parquet column it feeds.
@@ -291,7 +338,7 @@ fn read_u64_file(path: &Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CpuMonitor, energy_delta_uj, power_watts};
+    use super::{CpuMonitor, STUCK_COUNTER_TICKS, energy_delta_uj, power_watts};
 
     const MAX_RANGE: u64 = 65_532_610_987;
 
@@ -351,8 +398,32 @@ mod tests {
             None,
             "an over-range current reading must not yield a value"
         );
-        // With no known ceiling there is nothing to validate against.
-        assert!(power_watts(1, MAX_RANGE + 1, None, 0.005).is_some());
+        // With no known ceiling there is nothing to validate the reading against,
+        // but the implied wattage (~1.31e7 W) is still implausible on its own —
+        // the plausibility cap rejects it independently of the ceiling check.
+        assert_eq!(power_watts(1, MAX_RANGE + 1, None, 0.005), None);
+    }
+
+    /// A counter *reset* (S3/S4 resume, driver reload) to an arbitrary low value
+    /// looks identical to a wrap to `energy_delta_uj` — both are a backwards
+    /// step — but unwrapping it against the ceiling fabricates a huge, physically
+    /// impossible reading instead of the small genuine delta. The plausibility
+    /// cap in `power_watts` is what actually catches this, not the delta helper.
+    #[test]
+    fn a_counter_reset_misread_as_a_wrap_is_rejected_as_implausible() {
+        assert_eq!(power_watts(1_000, 500, Some(MAX_RANGE), 0.005), None);
+    }
+
+    #[test]
+    fn implausibly_high_power_is_rejected_even_within_a_valid_range() {
+        // A real wrap, but over a duration too short for the resulting wattage
+        // to be physically plausible.
+        let previous = MAX_RANGE - 400_000;
+        let current = 100_000;
+        assert_eq!(
+            power_watts(previous, current, Some(MAX_RANGE), 0.000_001),
+            None
+        );
     }
 
     #[test]
@@ -360,6 +431,52 @@ mod tests {
         assert_eq!(power_watts(0, 1_000_000, Some(MAX_RANGE), 0.0), None);
         assert_eq!(power_watts(0, 1_000_000, Some(MAX_RANGE), -1.0), None);
         assert_eq!(power_watts(0, 1_000_000, Some(MAX_RANGE), f64::NAN), None);
+    }
+
+    /// The threshold latches exactly once per stuck episode and re-arms once the
+    /// counter moves again, so a second freeze later in the session is reported
+    /// too. Pure state, no filesystem: this is the seam `read_power` could not
+    /// otherwise expose to a test.
+    #[test]
+    fn stuck_counter_reports_once_then_rearms_after_recovery() {
+        let mut ticks = 0u32;
+        let mut reported = false;
+
+        for _ in 0..STUCK_COUNTER_TICKS - 1 {
+            assert!(!CpuMonitor::note_zero_delta(
+                &mut ticks,
+                &mut reported,
+                true
+            ));
+        }
+        assert!(
+            CpuMonitor::note_zero_delta(&mut ticks, &mut reported, true),
+            "crossing the threshold must report"
+        );
+        assert!(
+            !CpuMonitor::note_zero_delta(&mut ticks, &mut reported, true),
+            "already latched, must not report twice"
+        );
+
+        assert!(!CpuMonitor::note_zero_delta(
+            &mut ticks,
+            &mut reported,
+            false
+        ));
+        assert_eq!(ticks, 0, "movement clears the run");
+        assert!(!reported, "movement clears the latch");
+
+        for _ in 0..STUCK_COUNTER_TICKS - 1 {
+            assert!(!CpuMonitor::note_zero_delta(
+                &mut ticks,
+                &mut reported,
+                true
+            ));
+        }
+        assert!(
+            CpuMonitor::note_zero_delta(&mut ticks, &mut reported, true),
+            "a second freeze later in the session must be reported too"
+        );
     }
 
     fn fixture_dir(tag: &str) -> std::path::PathBuf {
@@ -383,6 +500,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Restores permissions and removes the fixture directory on drop, including
+    /// on an unwinding panic — a failed assertion must not leave a `0o000` file
+    /// behind for a later test run to inherit if the OS reuses this PID.
+    struct UnreadableFixtureGuard {
+        dir: std::path::PathBuf,
+        unreadable: std::path::PathBuf,
+    }
+
+    impl Drop for UnreadableFixtureGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(&self.unreadable, std::fs::Permissions::from_mode(0o644));
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     /// The core claim of the RAPL fix: prefer a counter that can be *read*, not
     /// merely one that exists.
     #[test]
@@ -392,6 +526,10 @@ mod tests {
         let dir = fixture_dir("readable");
         let unreadable = dir.join("energy_uj_denied");
         let readable = dir.join("energy_uj_ok");
+        let _guard = UnreadableFixtureGuard {
+            dir: dir.clone(),
+            unreadable: unreadable.clone(),
+        };
         std::fs::write(&unreadable, "111\n").unwrap();
         std::fs::write(&readable, "222\n").unwrap();
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -402,9 +540,6 @@ mod tests {
                 CpuMonitor::first_readable([unreadable.as_path(), readable.as_path()].into_iter());
             assert_eq!(picked.as_deref(), Some(readable.as_path()));
         }
-
-        let _ = std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

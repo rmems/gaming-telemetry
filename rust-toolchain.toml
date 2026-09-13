@@ -1,0 +1,9 @@
+# Pins the toolchain for local builds so a contributor's `cargo` matches CI.
+#
+# Without this, a distro toolchain older than the MSRV fails with a bare
+# "rustc X is not supported by the following packages", which reads like a
+# dependency problem rather than a toolchain one. Keep `channel` equal to
+# `rust-version` in Cargo.toml -- CI fails the `fmt` job if they drift.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

@@ -4,6 +4,9 @@
 //!
 //! Accepts either a whole session directory (every batch, in order, one header) or
 //! a single batch file. The column contract lives in `gaming_telemetry::export`.
+//!
+//! GPU and CPU sensor columns are nullable. A missing NVML/hwmon/RAPL read
+//! is an empty CSV cell, never a fabricated `0`. Do not treat empty as zero.
 
 use anyhow::Result;
 use gaming_telemetry::export::{

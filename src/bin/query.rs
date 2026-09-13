@@ -14,6 +14,13 @@ fn format_celsius(value: Option<f32>) -> String {
     }
 }
 
+fn print_optional_stat(label: &str, value: Option<f64>, formatted: impl FnOnce(f64) -> String) {
+    match value {
+        Some(value) => println!("{label}: {}", formatted(value)),
+        None => println!("{label}: unavailable (sensor not readable during capture)"),
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -64,13 +71,13 @@ fn main() -> Result<()> {
         )
     })?;
     if let Some(row) = rows.next()? {
-        let avg_power: f64 = row.get(0)?;
-        let max_power: u32 = row.get(1)?;
-        let avg_temp: f64 = row.get(2)?;
-        let max_rx: u32 = row.get(3)?;
-        let max_tx: u32 = row.get(4)?;
-        let avg_enc: f64 = row.get(5)?;
-        let avg_dec: f64 = row.get(6)?;
+        let avg_power: Option<f64> = row.get(0)?;
+        let max_power: Option<u32> = row.get(1)?;
+        let avg_temp: Option<f64> = row.get(2)?;
+        let max_rx: Option<u32> = row.get(3)?;
+        let max_tx: Option<u32> = row.get(4)?;
+        let avg_enc: Option<f64> = row.get(5)?;
+        let avg_dec: Option<f64> = row.get(6)?;
         let count: i64 = row.get(7)?;
         let avg_cpu_temp: Option<f64> = row.get(8)?;
         let max_cpu_temp: Option<f64> = row.get(9)?;
@@ -80,13 +87,19 @@ fn main() -> Result<()> {
         let max_cpu_ccd2: Option<f64> = row.get(13)?;
 
         println!("Samples: {}", count);
-        println!("Avg Power: {:.2} W", avg_power / 1000.0);
-        println!("Max Power: {:.2} W", max_power as f64 / 1000.0);
-        println!("Avg Temp:  {:.1} C", avg_temp);
-        println!("Max PCIe RX: {:.2} MB/s", max_rx as f64 / 1024.0);
-        println!("Max PCIe TX: {:.2} MB/s", max_tx as f64 / 1024.0);
-        println!("Avg Encoder: {:.1}%", avg_enc);
-        println!("Avg Decoder: {:.1}%", avg_dec);
+        print_optional_stat("Avg Power", avg_power, |mw| format!("{:.2} W", mw / 1000.0));
+        print_optional_stat("Max Power", max_power.map(f64::from), |mw| {
+            format!("{:.2} W", mw / 1000.0)
+        });
+        print_optional_stat("Avg Temp", avg_temp, |c| format!("{c:.1} C"));
+        print_optional_stat("Max PCIe RX", max_rx.map(f64::from), |kbps| {
+            format!("{:.2} MB/s", kbps / 1024.0)
+        });
+        print_optional_stat("Max PCIe TX", max_tx.map(f64::from), |kbps| {
+            format!("{:.2} MB/s", kbps / 1024.0)
+        });
+        print_optional_stat("Avg Encoder", avg_enc, |pct| format!("{pct:.1}%"));
+        print_optional_stat("Avg Decoder", avg_dec, |pct| format!("{pct:.1}%"));
         println!("\n--- CPU Telemetry ---");
         // A CPU column is null for every row when the sensor was unavailable, so
         // these aggregates are themselves NULL. Report that, rather than failing
@@ -112,7 +125,7 @@ fn main() -> Result<()> {
         .prepare(&format!(
             "SELECT timestamp_ms, throttle_reasons_bitmask
          FROM read_parquet('{}')
-         WHERE throttle_reasons_bitmask != 0
+         WHERE throttle_reasons_bitmask IS NOT NULL AND throttle_reasons_bitmask != 0
          LIMIT 5",
             parquet_file_sql
         ))
@@ -146,7 +159,7 @@ fn main() -> Result<()> {
         .prepare(&format!(
             "SELECT timestamp_ms, pcie_rx_kbps, power_usage_mw
          FROM read_parquet('{}')
-         ORDER BY pcie_rx_kbps DESC
+         ORDER BY pcie_rx_kbps DESC NULLS LAST
          LIMIT 5",
             parquet_file_sql
         ))
@@ -165,9 +178,16 @@ fn main() -> Result<()> {
     })?;
     while let Some(row) = rows.next()? {
         let ts: i64 = row.get(0)?;
-        let rx: u32 = row.get(1)?;
-        let pwr: u32 = row.get(2)?;
-        println!("TS: {} | PCIe RX: {:6} KB/s | Power: {:5} mW", ts, rx, pwr);
+        let rx: Option<u32> = row.get(1)?;
+        let pwr: Option<u32> = row.get(2)?;
+        println!(
+            "TS: {} | PCIe RX: {:>6} KB/s | Power: {:>5} mW",
+            ts,
+            rx.map(|v| v.to_string())
+                .unwrap_or_else(|| "n/a".to_owned()),
+            pwr.map(|v| v.to_string())
+                .unwrap_or_else(|| "n/a".to_owned()),
+        );
     }
 
     // CPU Temperature Spikes
@@ -204,14 +224,15 @@ fn main() -> Result<()> {
         let tctl: f32 = row.get(1)?;
         let ccd1: Option<f32> = row.get(2)?;
         let ccd2: Option<f32> = row.get(3)?;
-        let pwr: u32 = row.get(4)?;
+        let pwr: Option<u32> = row.get(4)?;
         println!(
-            "TS: {} | Tctl: {:5.1} C | CCD1: {} | CCD2: {} | Power: {:5} mW",
+            "TS: {} | Tctl: {:5.1} C | CCD1: {} | CCD2: {} | Power: {:>5} mW",
             ts,
             tctl,
             format_celsius(ccd1),
             format_celsius(ccd2),
-            pwr
+            pwr.map(|v| v.to_string())
+                .unwrap_or_else(|| "n/a".to_owned()),
         );
     }
     if !found {

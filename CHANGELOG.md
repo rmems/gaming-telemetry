@@ -17,6 +17,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   redacts the whole error chain at its exit point, so no layer can leak regardless
   of which one produced the path.
 
+- **GPU NVML telemetry recorded fabricated zeros.** Every NVML sensor field used
+  `unwrap_or(0)` (or `map(...).unwrap_or(0)`) when a call failed, so a missed
+  power/temp/clock/PCIe/fan/VRAM/encoder/decoder/pstate/throttle read became a
+  plausible `0` in Parquet. Downstream ETL (`system_telemetry_v1`) refuses a
+  literal `0` on `UNAVAILABLE_ZERO_FIELDS` (power, temp, clocks, VRAM total, CPU)
+  and expects null for missing. Those GPU columns are now `Option`; a failed NVML
+  call writes null. A successful read of `0` (idle encoder, idle PCIe, P0, no
+  throttle, fan stopped) stays `0`.
+
+  **Breaking for consumers:** GPU sensor columns can now be null in Parquet and
+  empty in the exported CSV. Treating a null as `0` reintroduces the bug.
 - **CPU telemetry recorded fabricated zeros.** `CpuMonitor` seeded its energy
   counter with `unwrap_or(0)` and fell back to the previous reading on every failed
   read, so when RAPL's `energy_uj` was unreadable — the common case, since it is
@@ -39,14 +50,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a legitimate sub-zero reading failed to parse and was recorded as "sensor
   unavailable". They now parse as `i64`.
 - A readable-but-frozen energy counter (VM passthrough, driver quirk) still
-  differentiates to a plausible `0.0 W`. A run of zero deltas is now reported: at a
-  5 ms poll even an idle package accumulates far more than RAPL counter resolution,
-  so a stalled counter is not an idle CPU.
+  differentiates to a plausible `0.0 W`. A run of zero deltas is now reported: even
+  an idle package accumulates far more than RAPL counter resolution per tick at
+  any poll interval this collector supports, so a stalled counter is not an idle
+  CPU.
+- A counter *reset* (S3/S4 resume, driver reload) to an arbitrary low value looked
+  identical to a wrap — both are a backwards step — and unwrapped against the
+  ceiling anyway, fabricating a huge, physically impossible reading instead of the
+  small genuine delta. Implausibly high wattage (over 1000 W) is now rejected
+  regardless of which branch produced it.
 - Startup reporting covers each temperature input individually. CCD sensors do not
   exist on every k10temp SKU, and a single unreadable input previously left one
   column empty for a whole session with no notice.
 - An unreadable `max_energy_range_uj` is now reported at startup: without it a wrap
-  cannot be resolved, so power goes empty from the first wrap onward.
+  cannot be resolved, so the single tick where the counter wraps goes empty
+  (roughly every 11 minutes at 100 W) — every other tick is unaffected.
 - `query`'s CPU-spike listing read `cpu_ccd1_c`/`cpu_ccd2_c` as `f32`. Those
   columns are unfiltered by the `Tctl > 80` predicate and absent on single-CCD
   parts, so the first thermal spike aborted the whole command. They are read as
@@ -57,6 +75,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - RAPL discovery now requires a counter it can actually *read*. It previously
   accepted any path that merely existed, which selected an unreadable root-only
   file and froze the counter at its initial value.
+- **A `SESSION_LABEL` that sanitizes away is no longer silent.** `sanitize_label`
+  strips everything outside `A-Z a-z 0-9 _ - .`, so a mistyped label could reduce
+  to the empty string and land every row in the same anonymous bucket as setting
+  no label at all — only visible after the capture. The collector now says so at
+  startup.
+- **Label precedence was decided before sanitization.**
+  `resolve_label_from_sources` filtered candidates on their *raw* emptiness, so a
+  non-empty CLI label that sanitized away won precedence and silently discarded a
+  valid `SESSION_LABEL`. Each candidate is sanitized first, then the first
+  surviving one wins.
+- Histogram bucket indices are computed with checked conversions instead of `as
+  usize`. On a 32-bit target an extreme stall could wrap into a small index and be
+  misfiled as a fast sample, corrupting the tail the histogram exists to measure.
+- `TimingStats::new` asserts a non-zero cadence in debug builds. Zero makes every
+  `skipped_tick_estimate` division return `None`, reporting zero skipped ticks
+  forever rather than surfacing the misconfiguration.
 
 - **The build was broken.** The dependency bump to `polars 0.55.2` changed
   `LazyFrame::scan_parquet` to take a `PlRefPath`, made `DataFrame::new` take an
@@ -144,6 +178,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Removed
 
+- **Qodana**, entirely — `qodana.yaml`, `.github/workflows/qodana_code_quality.yml`,
+  and the `QODANA_TOKEN_1849579870` Cloud scan. `qodana-rust` is Ultimate/EAP only;
+  with Cloud membership expired the workflow cannot run usefully and there is no
+  community Rust linter to fall back to. Remaining gates stay in `ci.yml`
+  ([#42](https://github.com/rmems/gaming-telemetry/issues/42)).
 - **Sentry, entirely** — the dependency, the ~100-line bootstrap in `main.rs`, the
   `SENTRY_*` environment variables, and the `sentry-release` workflow
   ([#20](https://github.com/rmems/gaming-telemetry/issues/20)). It was a hard

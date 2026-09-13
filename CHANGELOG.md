@@ -19,6 +19,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   component of `$HOME`. Component-wise, so a word that merely contains the name
   (`alice` inside `/opt/alicent`) is untouched; `root` and names under three
   characters are skipped as ambiguous.
+
+  Four gaps found in review, all now fixed: the structural `/home/<name>` pass
+  ran *after* a generic `$HOME` (e.g. `/home` exactly) had already been
+  literally substituted, hiding the very text it needed to match; the same pass
+  matched `home`/`media` anywhere in a path rather than only at its root, so
+  `/srv/home/captures/run1` misread `captures` as a username; a doubled path
+  separator (`/home//alice`) left an empty component where the username was
+  expected and the whole path went unredacted; and replacing a matched
+  component wholesale silently deleted any diagnostic text glued onto it, e.g.
+  `/home/alice: permission denied` lost the reason once `alice` was redacted.
+  Also added `empty` and `nonexistent` to the never-a-username list, alongside
+  `/tmp` and the rest — the placeholder home directories glibc and several
+  service managers actually assign.
 - **A `SESSION_LABEL` that sanitizes away is no longer silent.** `sanitize_label`
   strips everything outside `A-Z a-z 0-9 _ - .`, so a mistyped label could reduce
   to the empty string and land every row in the same anonymous bucket as setting

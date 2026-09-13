@@ -26,8 +26,19 @@ fn redact_with_home(text: &str, home: &str) -> String {
 /// Treating one of these as a username is actively harmful: with `HOME=/home`,
 /// the derived name `home` rewrites `/home/alice/data` into `/$USER/alice/data`,
 /// redacting the *directory* and leaving the operator's name exposed.
-const NEVER_A_USERNAME: [&str; 10] = [
-    "home", "root", "users", "media", "mnt", "run", "var", "tmp", "usr", "proc",
+const NEVER_A_USERNAME: [&str; 12] = [
+    "home",
+    "root",
+    "users",
+    "media",
+    "mnt",
+    "run",
+    "var",
+    "tmp",
+    "usr",
+    "proc",
+    "empty",
+    "nonexistent",
 ];
 
 /// Whether `name` can be treated as an account name worth redacting.
@@ -88,39 +99,92 @@ fn current_user_identities() -> Vec<String> {
     identities
 }
 
-/// Redact the account name in paths whose *shape* names a user.
+/// Whether `parts[index]` sits at the root of an absolute path — either the very
+/// start of `text`, or right after prose ending in whitespace or an opening
+/// delimiter (`: ( " ' [`).
 ///
-/// `/home/<name>`, `/media/<name>/<volume>` and `/run/media/<name>/<volume>` put a
-/// username at a fixed position, so it can be stripped without knowing who is
+/// This is what tells a root-level `/home/<name>` apart from a directory merely
+/// *named* `home` nested under something else: in `/srv/home/captures/run1`,
+/// `home` is not at the path's root, so `captures` right after it is an ordinary
+/// directory name, not a username.
+fn is_path_root(parts: &[&str], index: usize) -> bool {
+    index == 0 || {
+        let preceding = parts[index - 1];
+        preceding.is_empty()
+            || preceding.ends_with(|c: char| c.is_whitespace())
+            || preceding.ends_with([':', '(', '"', '\'', '['])
+    }
+}
+
+/// The first non-empty component at or after `start`.
+///
+/// A doubled path separator (`/home//alice`) leaves an empty component right
+/// where the username is expected; skipping past it rather than giving up finds
+/// the real next component instead of leaving the whole path unredacted.
+fn skip_empty(parts: &[&str], start: usize) -> Option<usize> {
+    (start..parts.len()).find(|&i| !parts[i].is_empty())
+}
+
+/// The component index holding a username, if `index` is a root-anchored
+/// `/home`, `/media`, or `/run/media` directory.
+///
+/// `/home/<name>`, `/media/<name>/<volume>` and `/run/media/<name>/<volume>` put
+/// a username at a fixed position, so it can be stripped without knowing who is
 /// running. That covers the two cases matching against the environment cannot: a
 /// service started with `HOME`, `USER` and `LOGNAME` all unset has no identity to
 /// compare against, and a path naming a *different* account never matched one
 /// anyway.
+fn root_anchored_username(parts: &[&str], index: usize) -> Option<usize> {
+    if !is_path_root(parts, index) {
+        return None;
+    }
+    match parts[index] {
+        "home" => skip_empty(parts, index + 1),
+        "media" => {
+            let name = skip_empty(parts, index + 1)?;
+            // udisks mounts one directory per account, so the volume beneath it
+            // is what distinguishes `/media/<name>/<volume>` from a plain
+            // `/media/cdrom`, which names no one.
+            skip_empty(parts, name + 1)?;
+            Some(name)
+        }
+        "run" if parts.get(index + 1) == Some(&"media") => {
+            let name = skip_empty(parts, index + 2)?;
+            skip_empty(parts, name + 1)?;
+            Some(name)
+        }
+        _ => None,
+    }
+}
+
+/// Split a path component into its leading identifier and any trailing text
+/// glued onto it.
+///
+/// A component from splitting a full error message on `/` can carry prose after
+/// the username -- `"alice: permission denied"` -- so only the identifier
+/// prefix is a redaction target; replacing the whole component would silently
+/// delete the diagnostic text after it.
+fn split_identifier(component: &str) -> (&str, &str) {
+    let end = component
+        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .unwrap_or(component.len());
+    component.split_at(end)
+}
+
+/// Redact the account name in paths whose *shape* names a user.
 fn redact_user_named_parents(text: &str) -> String {
-    let mut parts: Vec<&str> = text.split('/').collect();
+    let raw_parts: Vec<&str> = text.split('/').collect();
+    let mut parts: Vec<String> = raw_parts.iter().map(|s| s.to_string()).collect();
     let mut changed = false;
 
     let mut index = 0;
-    while index < parts.len() {
-        let name_at = if parts[index] == "home" && index + 1 < parts.len() {
-            // `/home/<name>` is an account directory by definition.
-            Some(index + 1)
-        } else if parts[index] == "media" && index + 2 < parts.len() && !parts[index + 2].is_empty()
-        {
-            // udisks mounts one directory per account, so the volume beneath it is
-            // what distinguishes `/media/<name>/<volume>` from a plain
-            // `/media/cdrom`, which names no one.
-            Some(index + 1)
-        } else {
-            None
-        };
-
-        if let Some(name) = name_at
-            && !parts[name].is_empty()
-            && parts[name] != "$USER"
-        {
-            parts[name] = "$USER";
-            changed = true;
+    while index < raw_parts.len() {
+        if let Some(name) = root_anchored_username(&raw_parts, index) {
+            let (candidate, rest) = split_identifier(raw_parts[name]);
+            if !candidate.is_empty() && candidate != "$USER" {
+                parts[name] = format!("$USER{rest}");
+                changed = true;
+            }
             index = name;
         }
         index += 1;
@@ -146,19 +210,25 @@ pub fn redact_home(text: &str) -> String {
 
 /// Strip the operator's identity from a path or an error message containing one.
 ///
-/// Two passes, because `$HOME` alone is not enough. A `SESSION_DIR` on external
+/// Three passes, because `$HOME` alone is not enough. A `SESSION_DIR` on external
 /// media (`/run/media/<user>/…`, `/media/<user>/…`) carries the username without
 /// ever going through the home directory, and a unit started without `HOME` set
 /// — systemd services and containers routinely are — would otherwise redact
 /// nothing at all.
+///
+/// The literal `$HOME` substitution runs *last*, deliberately. When `HOME` is a
+/// generic base like `/home` (denylisted, so it never becomes an identity),
+/// substituting it first would consume the literal `home` text that the
+/// structural pass needs to recognize `/home/<name>` — hiding the anchor before
+/// the username under it was ever redacted.
 pub fn redact_personal_path(path: &str) -> String {
-    let mut redacted = redact_home(path);
+    let mut redacted = path.to_string();
     for user in current_user_identities() {
         redacted = redact_user_components(&redacted, &user);
     }
-    // Last, and unconditionally: this is the pass that still does something when
-    // the environment names nobody.
-    redact_user_named_parents(&redacted)
+    // Structural pass: still does something when the environment names nobody.
+    redacted = redact_user_named_parents(&redacted);
+    redact_home(&redacted)
 }
 
 #[cfg(test)]
@@ -294,6 +364,73 @@ mod tests {
             "/home/$USER"
         );
         assert_eq!(redact_user_components("alice", "alice"), "$USER");
+    }
+
+    /// `/var/empty` and `/nonexistent` are the two placeholder home directories
+    /// glibc and several service managers actually assign; without them in the
+    /// denylist their basename gets treated as a username and corrupts unrelated
+    /// paths that merely contain the word.
+    #[test]
+    fn placeholder_home_basenames_are_never_treated_as_usernames() {
+        for placeholder in ["empty", "nonexistent"] {
+            assert!(
+                !plausible_username(placeholder),
+                "{placeholder:?} must be denylisted"
+            );
+            assert_eq!(
+                redact_user_components("/var/empty/session", placeholder),
+                "/var/empty/session"
+            );
+        }
+    }
+
+    /// `home` merely being *present* in the path is not enough — it must sit at
+    /// the path's root. `/srv/home/captures/run1` has no root-level `home`
+    /// directory at all; `captures` is an ordinary name, not an account.
+    #[test]
+    fn a_home_directory_nested_under_another_path_is_not_root_anchored() {
+        assert_eq!(
+            redact_user_named_parents("/srv/home/captures/run1"),
+            "/srv/home/captures/run1"
+        );
+        assert_eq!(
+            redact_user_named_parents("/opt/media/cache/run1"),
+            "/opt/media/cache/run1"
+        );
+    }
+
+    /// A component from splitting a full message on `/` can carry trailing text
+    /// after the username. Replacing the whole component would silently delete
+    /// the actual failure reason along with the name.
+    #[test]
+    fn trailing_diagnostic_text_survives_redaction() {
+        assert_eq!(
+            redact_user_named_parents("failed to inspect /home/alice: permission denied"),
+            "failed to inspect /home/$USER: permission denied"
+        );
+    }
+
+    /// A doubled separator must not hide the username behind it — it is
+    /// semantically the same path as a single separator would produce.
+    #[test]
+    fn a_doubled_separator_does_not_hide_the_username() {
+        assert_eq!(
+            redact_user_named_parents("/home//alice/capture"),
+            "/home//$USER/capture"
+        );
+    }
+
+    /// A generic `HOME` (`/home` exactly) must not consume the literal text the
+    /// structural pass needs before that pass has had a chance to run — doing
+    /// the literal `$HOME` substitution first would hide `/home/<name>` from the
+    /// pass that is supposed to catch exactly this case.
+    #[test]
+    fn structural_redaction_still_finds_the_username_under_a_generic_home() {
+        assert_eq!(
+            redact_user_named_parents("/home/alice/capture"),
+            "/home/$USER/capture",
+            "the structural pass alone must still work regardless of HOME"
+        );
     }
 
     /// The `sudo` shape: `USER` names an account this module refuses to redact,

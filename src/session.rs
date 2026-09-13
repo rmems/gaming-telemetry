@@ -75,9 +75,16 @@ pub fn sanitize_label(raw: &str) -> String {
 /// Multi-game session tag. Production uses `SESSION_LABEL` only; the optional
 /// `cli_label` parameter exists so precedence and sanitization stay unit testable.
 pub fn resolve_label_from_sources(cli_label: Option<&str>, env_label: Option<&str>) -> String {
-    let cli_filtered = cli_label.map(str::trim).filter(|value| !value.is_empty());
-    let env_filtered = env_label.map(str::trim).filter(|value| !value.is_empty());
-    sanitize_label(cli_filtered.or(env_filtered).unwrap_or(""))
+    // Sanitize each candidate *before* choosing between them. Filtering on the raw
+    // value first lets a non-empty CLI label that sanitizes away — all punctuation,
+    // or non-ASCII — win the precedence check and silently discard a perfectly
+    // good env label, leaving the run unlabelled.
+    [cli_label, env_label]
+        .into_iter()
+        .flatten()
+        .map(sanitize_label)
+        .find(|label| !label.is_empty())
+        .unwrap_or_default()
 }
 
 /// Runtime label resolution. Operators set `SESSION_LABEL` (see README).
@@ -86,7 +93,22 @@ pub fn resolve_label_from_sources(cli_label: Option<&str>, env_label: Option<&st
 /// security surface for the long-running daemon, and env alone is enough for
 /// multi-title capture.
 pub fn resolve_label() -> String {
-    resolve_label_from_sources(None, std::env::var("SESSION_LABEL").ok().as_deref())
+    let raw = std::env::var("SESSION_LABEL").ok();
+    let label = resolve_label_from_sources(None, raw.as_deref());
+
+    // An operator who mistypes a label otherwise gets the same silent result as
+    // setting none at all: every row lands in the anonymous bucket, and the loss
+    // is only visible after the capture.
+    if label.is_empty()
+        && let Some(raw) = raw.as_deref().map(str::trim)
+        && !raw.is_empty()
+    {
+        eprintln!(
+            "SESSION_LABEL {raw:?} has no usable characters (allowed: A-Z a-z 0-9 _ - .); \
+             this session will be recorded with an empty label."
+        );
+    }
+    label
 }
 
 /// Where this run writes its batches, manifest, and events.
@@ -203,6 +225,16 @@ mod tests {
             resolve_label_from_sources(Some(""), Some("env")),
             "env",
             "empty CLI label should fall back to env"
+        );
+        assert_eq!(
+            resolve_label_from_sources(Some("!!!"), Some("kcd2")),
+            "kcd2",
+            "a CLI label that sanitizes away must not discard a valid env label"
+        );
+        assert_eq!(
+            resolve_label_from_sources(Some("!!!"), None),
+            "",
+            "nothing usable anywhere resolves to the empty label"
         );
     }
 

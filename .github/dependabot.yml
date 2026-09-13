@@ -1,0 +1,19 @@
+# Advisory visibility. `cargo audit` runs non-blocking in CI, so without this
+# nothing surfaces an outdated or vulnerable dependency on its own.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for routine bumps; security updates still arrive separately.
+      patch-and-minor:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3

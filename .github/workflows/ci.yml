@@ -138,7 +138,7 @@ jobs:
         run: cargo build --locked --all-features --bin gaming-telemetry --bin export_csv --bin query
       - name: Cargo audit (non-blocking)
         # rustsec/audit-check@v1 — pinned; advisory noise must not block capture PRs.
-        uses: rustsec/audit-check@e9159ac5f7d7d873ce074ca134da2f445c0a4a61 # v1
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v1
         continue-on-error: true
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

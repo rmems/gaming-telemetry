@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Stale manifest temporaries are reclaimed at startup.** In-process failures
+  already clean up after themselves, but a `SIGKILL` (or power loss) between
+  `create_new` and `rename` stranded the temporary permanently. A collector that
+  restarts often accumulated them in the session directory indefinitely. The sweep
+  runs under the exclusive session lock, so it can only ever claim files no live
+  writer owns, and it matches only the exact shape it generates —
+  `session_manifest.json.<pid>.<nanos>.<sequence>.tmp`, all three numeric. An
+  operator's `session_manifest.json.backup.tmp` is deliberately spared. A
+  temporary that cannot be deleted is reported rather than dropped.
 - **`export_csv` leaked the operator's absolute path on error.** Redaction covered
   the contexts this repo writes, but not the errors underneath them: polars embeds
   the path in its own message (`No such file or directory (os error 2):

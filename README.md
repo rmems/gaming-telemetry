@@ -198,8 +198,9 @@ counter readings over the interval between them — so it is null in more cases 
 
 Expect one startup null at the beginning of **each collector run**, even on a
 fully working machine — the energy counter is re-seeded by every new process. A
-session that was restarted therefore contains one startup null *per run*, so their
-count tracks `restart_count` in the manifest rather than being a single occurrence.
+session that was restarted therefore contains one startup null *per run* — total
+runs, and so total startup nulls, equal `restart_count + 1` in the manifest (the
+first run plus one per restart), not `restart_count` alone.
 
 Treat a null as "unknown for this sample", not "sensor absent".
 

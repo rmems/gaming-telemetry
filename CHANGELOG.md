@@ -30,14 +30,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a legitimate sub-zero reading failed to parse and was recorded as "sensor
   unavailable". They now parse as `i64`.
 - A readable-but-frozen energy counter (VM passthrough, driver quirk) still
-  differentiates to a plausible `0.0 W`. A run of zero deltas is now reported: at a
-  5 ms poll even an idle package accumulates far more than RAPL counter resolution,
-  so a stalled counter is not an idle CPU.
+  differentiates to a plausible `0.0 W`. A run of zero deltas is now reported: even
+  an idle package accumulates far more than RAPL counter resolution per tick at
+  any poll interval this collector supports, so a stalled counter is not an idle
+  CPU.
+- A counter *reset* (S3/S4 resume, driver reload) to an arbitrary low value looked
+  identical to a wrap — both are a backwards step — and unwrapped against the
+  ceiling anyway, fabricating a huge, physically impossible reading instead of the
+  small genuine delta. Implausibly high wattage (over 1000 W) is now rejected
+  regardless of which branch produced it.
 - Startup reporting covers each temperature input individually. CCD sensors do not
   exist on every k10temp SKU, and a single unreadable input previously left one
   column empty for a whole session with no notice.
 - An unreadable `max_energy_range_uj` is now reported at startup: without it a wrap
-  cannot be resolved, so power goes empty from the first wrap onward.
+  cannot be resolved, so the single tick where the counter wraps goes empty
+  (roughly every 11 minutes at 100 W) — every other tick is unaffected.
 - `query`'s CPU-spike listing read `cpu_ccd1_c`/`cpu_ccd2_c` as `f32`. Those
   columns are unfiltered by the `Tctl > 80` predicate and absent on single-CCD
   parts, so the first thermal spike aborted the whole command. They are read as

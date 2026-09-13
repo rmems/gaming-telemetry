@@ -83,6 +83,11 @@ pub struct TimingStats {
 
 impl TimingStats {
     pub fn new(requested_ms: u64) -> Self {
+        // `parse_poll_interval_ms` rejects zero, so this only fires on a direct
+        // construction. Zero would make every `skipped_tick_estimate` division
+        // return `None`, silently reporting zero skipped ticks forever rather
+        // than surfacing the misconfiguration.
+        debug_assert!(requested_ms > 0, "TimingStats needs a non-zero cadence");
         Self {
             requested_ms,
             sample_count: 0,
@@ -114,13 +119,24 @@ impl TimingStats {
 
     /// Interval ingestion split out from the clock so it can be unit tested.
     fn record_interval_us(&mut self, delta_us: u64) {
-        let index = (delta_us / BUCKET_US) as usize;
+        // Checked, not `as`: on a 32-bit target an extreme stall would otherwise
+        // wrap into a small index and be misfiled as a fast sample — corrupting
+        // exactly the tail the histogram exists to measure. Every index below is
+        // then used through `get_mut`, so the `usize::MAX` saturation lands in the
+        // overflow tier rather than panicking.
+        let index = usize::try_from(delta_us / BUCKET_US).unwrap_or(usize::MAX);
+        let tail_index = delta_us
+            .checked_sub(BUCKET_COUNT as u64 * BUCKET_US)
+            .map(|above_fast| above_fast / TAIL_BUCKET_US)
+            .and_then(|i| usize::try_from(i).ok());
+
         if let Some(bucket) = self.buckets.get_mut(index) {
             *bucket += 1;
-        } else if delta_us < TAIL_CEILING_US {
-            let tail_index =
-                ((delta_us - (BUCKET_COUNT as u64 * BUCKET_US)) / TAIL_BUCKET_US) as usize;
-            self.tail_buckets[tail_index] += 1;
+        } else if let Some(bucket) = tail_index
+            .filter(|_| delta_us < TAIL_CEILING_US)
+            .and_then(|i| self.tail_buckets.get_mut(i))
+        {
+            *bucket += 1;
         } else {
             let mut upper = TAIL_CEILING_US;
             for (index, bucket) in self.overflow_buckets.iter_mut().enumerate() {
@@ -273,6 +289,26 @@ mod tests {
         stats.record_scheduled_tick(base);
         stats.record_scheduled_tick(base + std::time::Duration::from_millis(20));
         assert_eq!(stats.summary().skipped_tick_estimate, 3);
+    }
+
+    /// Every bucket tier must be reachable without panicking, including the
+    /// saturating index the checked conversion can produce.
+    #[test]
+    fn extreme_intervals_land_in_overflow_without_panicking() {
+        let mut stats = TimingStats::new(5);
+        for delta in [
+            0u64,
+            1,
+            BUCKET_US,
+            TAIL_CEILING_US - 1,
+            TAIL_CEILING_US,
+            u64::MAX,
+        ] {
+            stats.record_interval_us(delta);
+        }
+        // Reaching here at all is the assertion: an out-of-range index would have
+        // panicked. `max_us` confirms the extreme sample was still recorded.
+        assert_eq!(stats.max_us, u64::MAX);
     }
 
     #[test]

@@ -8,6 +8,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **GPU NVML telemetry recorded fabricated zeros.** Every NVML sensor field used
+  `unwrap_or(0)` (or `map(...).unwrap_or(0)`) when a call failed, so a missed
+  power/temp/clock/PCIe/fan/VRAM/encoder/decoder/pstate/throttle read became a
+  plausible `0` in Parquet. Downstream ETL (`system_telemetry_v1`) refuses a
+  literal `0` on `UNAVAILABLE_ZERO_FIELDS` (power, temp, clocks, VRAM total, CPU)
+  and expects null for missing. Those GPU columns are now `Option`; a failed NVML
+  call writes null. A successful read of `0` (idle encoder, idle PCIe, P0, no
+  throttle, fan stopped) stays `0`.
+
+  **Breaking for consumers:** GPU sensor columns can now be null in Parquet and
+  empty in the exported CSV. Treating a null as `0` reintroduces the bug.
+- **CPU telemetry recorded fabricated zeros.** `CpuMonitor` seeded its energy
+  counter with `unwrap_or(0)` and fell back to the previous reading on every failed
+  read, so when RAPL's `energy_uj` was unreadable — the common case, since it is
+  typically root-only after CVE-2020-8694 — `cpu_package_power_w` differentiated to
+  a stable, plausible `0.0 W` for the entire session, with no error and no log. The
+  temperature readers collapsed "sensor absent" into `0.0 °C` the same way. All four
+  CPU columns are now nullable: a null means "not measured", never "measured zero".
+  The collector reports unavailable sensors on startup.
+
+  **Breaking for consumers:** `cpu_tctl_c`, `cpu_ccd1_c`, `cpu_ccd2_c` and
+  `cpu_package_power_w` can now be null in Parquet and empty in the exported CSV.
+  Treating a null as `0.0` reintroduces the bug.
+- **RAPL counter wraparound was unhandled.** `max_energy_range_uj` is ~65 kJ on a
+  typical desktop, so the counter wraps roughly every 11 minutes at 100 W — many
+  times per capture. Each wrap produced a spurious `0.0 W` sample; the delta is now
+  unwrapped against the ceiling.
+- The first poll no longer reports a power figure differentiated over an arbitrary
+  startup window; a delta needs two samples, so the first is null.
+- **hwmon temperatures are signed millidegrees**, but were parsed as unsigned, so
+  a legitimate sub-zero reading failed to parse and was recorded as "sensor
+  unavailable". They now parse as `i64`.
+- A readable-but-frozen energy counter (VM passthrough, driver quirk) still
+  differentiates to a plausible `0.0 W`. A run of zero deltas is now reported: even
+  an idle package accumulates far more than RAPL counter resolution per tick at
+  any poll interval this collector supports, so a stalled counter is not an idle
+  CPU.
+- A counter *reset* (S3/S4 resume, driver reload) to an arbitrary low value looked
+  identical to a wrap — both are a backwards step — and unwrapped against the
+  ceiling anyway, fabricating a huge, physically impossible reading instead of the
+  small genuine delta. Implausibly high wattage (over 1000 W) is now rejected
+  regardless of which branch produced it.
+- Startup reporting covers each temperature input individually. CCD sensors do not
+  exist on every k10temp SKU, and a single unreadable input previously left one
+  column empty for a whole session with no notice.
+- An unreadable `max_energy_range_uj` is now reported at startup: without it a wrap
+  cannot be resolved, so the single tick where the counter wraps goes empty
+  (roughly every 11 minutes at 100 W) — every other tick is unaffected.
+- `query`'s CPU-spike listing read `cpu_ccd1_c`/`cpu_ccd2_c` as `f32`. Those
+  columns are unfiltered by the `Tctl > 80` predicate and absent on single-CCD
+  parts, so the first thermal spike aborted the whole command. They are read as
+  nullable and rendered `n/a`.
+- `query` reports unavailable CPU aggregates instead of failing. With nullable
+  columns, `avg`/`max` over an all-null column return NULL, which the `f64`
+  accessor rejected.
+- RAPL discovery now requires a counter it can actually *read*. It previously
+  accepted any path that merely existed, which selected an unreadable root-only
+  file and froze the counter at its initial value.
 - **A `SESSION_LABEL` that sanitizes away is no longer silent.** `sanitize_label`
   strips everything outside `A-Z a-z 0-9 _ - .`, so a mistyped label could reduce
   to the empty string and land every row in the same anonymous bucket as setting

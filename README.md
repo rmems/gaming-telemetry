@@ -25,6 +25,10 @@ There is **no** game-install verifier, Steam/Proton discovery, or mod scanner. G
 - CPU Tctl / CCD temps and package power (hwmon + RAPL energy delta)
 - **`session_label`** (string; same for every row in a run)
 
+Every NVML and CPU **sensor** column is **nullable**. A null means *not measured*,
+never *measured zero* — see [Missing measurements](#missing-measurements-null-vs-0).
+`session_label` and `timestamp_ms` stay required.
+
 MangoHud (or any overlay) is **not** recorded. You may still run it yourself for on-screen monitoring; the collector only writes hardware telemetry.
 
 ## Prerequisites
@@ -169,7 +173,85 @@ Header:
 
 `timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`
 
-`gpu_power_w` is `power_usage_mw / 1000.0`.
+`gpu_power_w` is `power_usage_mw / 1000.0`. GPU and CPU sensor columns
+are empty when no valid measurement was obtained for that sample — see below.
+
+## Missing measurements (null vs 0)
+
+A null in Parquet (empty cell in the exported CSV) means *no valid measurement
+was obtained for that sample*. It never means the sensor measured zero.
+**Do not treat a null as 0.** Downstream ETL (`spikenaut-telemetry-etl`
+`system_telemetry_v1`) refuses a literal `0` on power, temperature, clocks,
+VRAM capacity, and CPU sensors — those zeros were the old producer writing a
+failed read as a measurement.
+
+| Column | Null when | Successful `0` |
+|---|---|---|
+| `power_usage_mw`, `temperature_c`, `graphics_clock_mhz`, `memory_clock_mhz` | NVML call failed | Physically implausible; do not invent |
+| `memory_used_mb`, `memory_total_mb` | `memory_info` failed | Used-idle `0` is kept; total `0` is not a real GPU |
+| `pcie_rx_kbps`, `pcie_tx_kbps`, `fan_speed_perc` | NVML call failed | Idle/stopped `0` is kept |
+| `encoder_util_perc`, `decoder_util_perc` | NVML call failed | Idle `0` is kept (a whole session may be encoder-idle) |
+| `pstate`, `throttle_reasons_bitmask` | NVML call failed | `P0` / "not throttling" `0` is kept — do not invent either |
+| CPU columns | see below | never fabricated |
+
+`session_label` and `timestamp_ms` are not sensor readings and stay populated.
+
+### CPU sensor availability
+
+The four CPU columns (`cpu_tctl_c`, `cpu_ccd1_c`, `cpu_ccd2_c`,
+`cpu_package_power_w`) are **nullable**. A null means *no valid measurement was
+obtained for that sample*. It never means the CPU measured zero.
+
+For the temperatures, that is always a read that did not succeed: no k10temp
+device, an input the SKU does not have (CCD sensors are absent on some parts), or
+an unreadable file.
+
+`cpu_package_power_w` is a **derived** value — the difference between two energy
+counter readings over the interval between them — so it is null in more cases than
+"sensor missing":
+
+| Null because | When |
+|---|---|
+| No readable RAPL counter | `energy_uj` absent or permission-denied (see below) |
+| A single failed read | that tick's counter read did not succeed |
+| **No previous reading** | the **first** poll of a run — a delta needs two samples |
+| Wrap with no ceiling | the counter went backwards and `max_energy_range_uj` is unreadable |
+| Reading out of range | either counter value exceeds `max_energy_range_uj` |
+| Unusable interval | elapsed time was not positive and finite |
+
+Expect one startup null at the beginning of **each collector run**, even on a
+fully working machine — the energy counter is re-seeded by every new process. A
+session that was restarted therefore contains one startup null *per run* — total
+runs, and so total startup nulls, equal `restart_count + 1` in the manifest (the
+first run plus one per restart), not `restart_count` alone.
+
+Treat a null as "unknown for this sample", not "sensor absent".
+
+This matters most for package power. Since
+[CVE-2020-8694](https://nvd.nist.gov/vuln/detail/CVE-2020-8694), RAPL's
+`energy_uj` is typically root-only (`0400`):
+
+```console
+$ ls -l /sys/class/powercap/intel-rapl:0/energy_uj
+-r--------. 1 root root 4096 /sys/class/powercap/intel-rapl:0/energy_uj
+```
+
+Unless the collector can read that file, `cpu_package_power_w` is null for the
+whole session. The collector says so on startup rather than leaving you to find
+out after the capture:
+
+```text
+CPU package power unavailable: no readable RAPL energy counter. ...
+```
+
+To record CPU power, run the collector as root, or grant read access to the
+counter for your user.
+
+**Consumers must handle nulls.** Treating a null as `0` or `0.0` reintroduces
+exactly the bug this avoids: a model trained on zero-filled power, clocks, or
+CPU package power learns that the machine was idle (or in P0, or not
+throttling) when the sensor was simply unread. Drop the rows, mask them, or
+impute deliberately.
 
 ### 3. Optional: DuckDB query helper
 

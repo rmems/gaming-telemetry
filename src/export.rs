@@ -13,7 +13,10 @@ use polars::prelude::{
     CsvWriter, DataFrame, LazyFrame, PlRefPath, ScanArgsParquet, SerWriter, UnionArgs, col, concat,
     lit,
 };
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::privacy::redact_personal_path;
 use crate::session::{BATCH_PREFIX, BATCH_SUFFIX};
@@ -50,13 +53,22 @@ pub fn batch_files_in(dir: &Path) -> Result<Vec<PathBuf>> {
     for entry in entries {
         let entry = entry.context("failed to enumerate a session directory entry")?;
 
-        // Match on the entry being a regular file, not just on its name. A
-        // directory sharing the batch name would fail confusingly at scan time,
-        // and a FIFO would block the export indefinitely.
+        // `metadata()` rather than `file_type()`: the latter does not follow
+        // symlinks, so a batch relocated to another mount and symlinked back
+        // would be dropped as silently as the directory/FIFO cases this check
+        // targets. A lookup failure (transient or mounted-fs error) is
+        // propagated instead of being folded into "not a match" -- otherwise a
+        // real stale-match could be silently skipped while the sweep still
+        // reports success.
         let is_file = entry
-            .file_type()
-            .map(|kind| kind.is_file())
-            .unwrap_or(false);
+            .metadata()
+            .with_context(|| {
+                format!(
+                    "failed to inspect session entry {}",
+                    redact_personal_path(&entry.path().display().to_string())
+                )
+            })?
+            .is_file();
         if !is_file {
             continue;
         }
@@ -93,6 +105,15 @@ pub fn resolve_inputs(path: &Path) -> Result<Vec<PathBuf>> {
         );
         Ok(batches)
     } else {
+        // The directory branch above rejects a FIFO or device masquerading as a
+        // batch name; a single explicit path deserves the same protection, or a
+        // typo'd device path blocks the export indefinitely at read time instead
+        // of failing here with a clear message.
+        anyhow::ensure!(
+            path.is_file(),
+            "{} is not a regular file",
+            redact_personal_path(&path.display().to_string())
+        );
         Ok(vec![path.to_path_buf()])
     }
 }
@@ -113,7 +134,13 @@ fn canonical_projection(frame: LazyFrame) -> LazyFrame {
 /// Build the canonical frame for a whole session, in batch order.
 ///
 /// Concatenating projected frames (rather than projecting a concatenation) keeps
-/// each batch's own schema local, so one malformed batch names itself in the error.
+/// each batch's own schema local, so an IO-shaped failure (missing file,
+/// permission denied) names itself in the error via the path polars embeds in
+/// its own message. A schema-shaped failure -- a batch that scans cleanly but is
+/// missing a projected column, e.g. a legacy batch or any schema drift -- fails
+/// lazily at `concat`/`collect` instead, where polars names no path or column;
+/// the batch count and list are attached here so directory-mode failures are
+/// still attributable to *a* batch, even when polars itself cannot say which one.
 pub fn canonical_frame(paths: &[PathBuf]) -> Result<DataFrame> {
     anyhow::ensure!(!paths.is_empty(), "no Parquet batches to export");
 
@@ -138,18 +165,48 @@ pub fn canonical_frame(paths: &[PathBuf]) -> Result<DataFrame> {
         frames.push(canonical_projection(scanned));
     }
 
+    let batch_list = || {
+        paths
+            .iter()
+            .map(|p| redact_personal_path(&p.display().to_string()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
     let combined = if frames.len() == 1 {
         frames.remove(0)
     } else {
         concat(&frames, UnionArgs::default())
             .map_err(redacted)
-            .context("failed to concatenate session batches")?
+            .with_context(|| {
+                format!(
+                    "failed to concatenate {} session batches: one of [{}] likely has a schema \
+                     mismatch (missing a projected column, e.g. a legacy batch)",
+                    paths.len(),
+                    batch_list()
+                )
+            })?
     };
 
-    combined
-        .collect()
-        .map_err(redacted)
-        .context("failed to build the canonical export frame")
+    combined.collect().map_err(redacted).with_context(|| {
+        format!(
+            "failed to build the canonical export frame from [{}]",
+            batch_list()
+        )
+    })
+}
+
+/// Temp-file names get a pid/nanos/sequence suffix, not just a pid, so two calls
+/// in the same process (or a process whose pid was reused) never share a path.
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn temp_export_path(path: &Path) -> PathBuf {
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    path.with_extension(format!("tmp.{}.{nanos}.{sequence}", std::process::id()))
 }
 
 /// Write CSV to `path` without truncating an existing export on failure.
@@ -157,22 +214,48 @@ pub fn canonical_frame(paths: &[PathBuf]) -> Result<DataFrame> {
 /// A direct write truncates the destination before the new bytes land, so an I/O
 /// failure part-way leaves a consumer with a partial or empty CSV that still looks
 /// like a valid export. Writing beside the target and renaming makes the
-/// replacement atomic.
+/// replacement atomic. Mirrors `manifest.rs`'s `write_temp_manifest`/
+/// `publish_manifest`: `create_new` refuses to write through a pre-planted
+/// symlink at the temp path (CWE-59/377), the file is `sync_all`'d before the
+/// rename, cleanup runs on any failure (not just a failed rename), and the
+/// directory is fsynced after so the rename itself survives a crash.
 ///
 /// (This is the third temp-then-rename site in the tree, after `manifest.rs` and
 /// the Parquet writer in `main.rs`; consolidating them is tracked separately.)
 pub fn write_csv_atomically(path: &Path, csv: &str) -> Result<()> {
-    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
+    let temporary = temp_export_path(path);
     let redacted = || redact_personal_path(&path.display().to_string());
 
-    std::fs::write(&temporary, csv)
-        .with_context(|| format!("failed to write the temporary export beside {}", redacted()))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .with_context(|| format!("failed to create a temporary export beside {}", redacted()))?;
+
+    if let Err(error) = file.write_all(csv.as_bytes()).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error).with_context(|| {
+            format!("failed to write the temporary export beside {}", redacted())
+        });
+    }
+    drop(file);
 
     if let Err(error) = std::fs::rename(&temporary, path) {
         let _ = std::fs::remove_file(&temporary);
         return Err(error).with_context(|| format!("failed to publish {}", redacted()));
     }
-    Ok(())
+
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| {
+            format!(
+                "failed to persist export rename in {}",
+                redact_personal_path(&parent.display().to_string())
+            )
+        })
 }
 
 /// Wrap a foreign error with its operator path stripped.
@@ -215,6 +298,16 @@ mod tests {
             ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The last `n` characters of `text`, at a char boundary. Byte-slicing at a
+    /// raw offset (`&text[text.len() - n..]`) can land inside a multi-byte
+    /// character and panic -- safe today with ASCII-only fixtures, wrong the day
+    /// a non-ASCII session label is tested.
+    fn last_chars(text: &str, n: usize) -> String {
+        let mut chars: Vec<char> = text.chars().rev().take(n).collect();
+        chars.reverse();
+        chars.into_iter().collect()
     }
 
     /// Write a batch carrying only the columns the projection reads.
@@ -318,6 +411,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The mW-to-W conversion is the only arithmetic transformation in the
+    /// export contract; pin its exact value rather than only checking presence,
+    /// so a wrong divisor or a raw passthrough would fail this test.
+    #[test]
+    fn power_is_converted_from_milliwatts_to_watts() {
+        let dir = fixture_dir("power_units");
+        write_batch(&dir, 1, &[1], "kcd2");
+
+        let mut df = canonical_frame(&batch_files_in(&dir).unwrap()).unwrap();
+        let csv = to_csv(&mut df).unwrap();
+        let row = csv.lines().nth(1).unwrap();
+        let power_w: f64 = row.split(',').nth(2).unwrap().parse().unwrap();
+        assert_eq!(power_w, 120.0, "120_000 mW must export as 120 W");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An unavailable CPU sensor stays empty in the CSV rather than becoming 0.0.
     #[test]
     fn null_cpu_readings_export_as_empty_fields() {
@@ -349,7 +459,7 @@ mod tests {
         assert!(
             csv.ends_with('\n'),
             "writer must terminate the last record; got {:?}",
-            &csv[csv.len().saturating_sub(20)..]
+            last_chars(&csv, 20)
         );
         assert!(
             !csv.ends_with("\n\n"),

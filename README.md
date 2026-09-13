@@ -170,6 +170,11 @@ a single header:
 cargo run --bin export_csv -- "$SESSION_DIR" canonical.csv
 ```
 
+Directory export lists the files present at scan time. The collector publishes a
+batch atomically only once it completes, so exporting a still-running session
+omits the most recent (in-flight) batch — re-run the export after the collector
+stops for the complete session.
+
 A single batch file still works, for spot checks:
 
 ```bash

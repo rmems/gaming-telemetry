@@ -3,6 +3,9 @@
 //! Export canonical 5-column CSV from Parquet for corinth-canal ingestion.
 //!
 //! Canonical format: timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w
+//!
+//! GPU and CPU sensor columns are nullable. A missing NVML/hwmon/RAPL read
+//! is an empty CSV cell, never a fabricated `0`. Do not treat empty as zero.
 
 use polars::prelude::*;
 use std::env;

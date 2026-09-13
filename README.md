@@ -163,18 +163,36 @@ inventory — only hardware model names.
 
 ### 2. Export canonical CSV for `corinth-canal`
 
-Stable **5-column** replay schema (unchanged; `session_label` stays in Parquet):
+Point it at the **session directory** to export every batch, in batch order, under
+a single header:
 
 ```bash
-cargo run --bin export_csv -- "$SESSION_DIR/gpu_telemetry_v2_batch_1.parquet" canonical.csv
+cargo run --bin export_csv -- "$SESSION_DIR" canonical.csv
+```
+
+Directory export lists the files present at scan time. The collector publishes a
+batch atomically only once it completes, so exporting a still-running session
+omits the most recent (in-flight) batch — re-run the export after the collector
+stops for the complete session.
+
+A single batch file still works, for spot checks:
+
+```bash
+cargo run --bin export_csv -- "$SESSION_DIR/gpu_telemetry_v2_batch_1.parquet" -
 ```
 
 Header:
 
-`timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`
+`timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w,session_label`
 
-`gpu_power_w` is `power_usage_mw / 1000.0`. GPU and CPU sensor columns
-are empty when no valid measurement was obtained for that sample — see below.
+- `gpu_power_w` is `power_usage_mw / 1000.0` — the only unit conversion.
+- `session_label` is appended **last**, so a consumer reading the original five
+  columns positionally keeps working while multi-title captures become separable.
+- `gpu_temp_c`, `gpu_power_w`, `cpu_tctl_c`, and `cpu_package_power_w` are empty
+  when no valid measurement was obtained for that sample — see
+  [Missing measurements](#missing-measurements-null-vs-0).
+- Batches are ordered numerically, so `batch_10` follows `batch_2`. A shell glob
+  would order them lexically and silently scramble the time series.
 
 ## Missing measurements (null vs 0)
 

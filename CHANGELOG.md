@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`export_csv` leaked the operator's absolute path on error.** Redaction covered
+  the contexts this repo writes, but not the errors underneath them: polars embeds
+  the path in its own message (`No such file or directory (os error 2):
+  /home/<user>/…`), and `scan_parquet` is lazy, so a missing or unreadable batch
+  fails at `collect()` — outside every context that had been redacted. The
+  dependency's message is now flattened through the redactor, and the binary
+  redacts the whole error chain at its exit point, so no layer can leak regardless
+  of which one produced the path.
+
 - **GPU NVML telemetry recorded fabricated zeros.** Every NVML sensor field used
   `unwrap_or(0)` (or `map(...).unwrap_or(0)`) when a call failed, so a missed
   power/temp/clock/PCIe/fan/VRAM/encoder/decoder/pstate/throttle read became a
@@ -105,6 +114,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   ([#22](https://github.com/rmems/gaming-telemetry/issues/22))
 
 ### Changed
+
+- **`export_csv` now carries `session_label`, and exports a whole session.**
+  The canonical CSV is the documented bridge to `corinth-canal`, but it dropped
+  the one column that separates titles — so the multi-game capture added in
+  [#20](https://github.com/rmems/gaming-telemetry/issues/20) was unusable through
+  the documented path. The label is appended **last**, keeping the original five
+  columns positionally stable.
+
+  The binary now accepts a session directory and emits every batch in batch order
+  under one header. It previously took a single file, so exporting a session meant
+  N invocations producing N headers, and any shell glob ordered `batch_10` before
+  `batch_2` — silently scrambling the exported time series.
+
+  The column contract and batch ordering moved into `gaming_telemetry::export`,
+  which has tests; `bin/export_csv.rs` was previously all `main()` with no seam and
+  no coverage at all.
 
 - **`duckdb` is now optional**, behind an off-by-default `query` cargo feature
   ([#20](https://github.com/rmems/gaming-telemetry/issues/20)). Its `bundled` feature

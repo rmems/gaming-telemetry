@@ -131,6 +131,38 @@ fn canonical_projection(frame: LazyFrame) -> LazyFrame {
     ])
 }
 
+/// Scan one batch and apply the canonical projection, with the path named in
+/// every error this step can raise.
+fn scan_and_project(path: &Path) -> Result<LazyFrame> {
+    let scanned = LazyFrame::scan_parquet(
+        PlRefPath::try_from_path(path).with_context(|| {
+            format!(
+                "not a usable Parquet path: {}",
+                redact_personal_path(&path.display().to_string())
+            )
+        })?,
+        ScanArgsParquet::default(),
+    )
+    .map_err(redacted)
+    .with_context(|| {
+        format!(
+            "failed to scan {}",
+            redact_personal_path(&path.display().to_string())
+        )
+    })?;
+    Ok(canonical_projection(scanned))
+}
+
+/// Redacted, comma-joined batch paths, for schema-shaped failures that polars
+/// itself cannot attribute to a specific batch (see `canonical_frame`).
+fn redacted_batch_list(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| redact_personal_path(&p.display().to_string()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Build the canonical frame for a whole session, in batch order.
 ///
 /// Concatenating projected frames (rather than projecting a concatenation) keeps
@@ -146,32 +178,8 @@ pub fn canonical_frame(paths: &[PathBuf]) -> Result<DataFrame> {
 
     let mut frames: Vec<LazyFrame> = Vec::with_capacity(paths.len());
     for path in paths {
-        let scanned = LazyFrame::scan_parquet(
-            PlRefPath::try_from_path(path).with_context(|| {
-                format!(
-                    "not a usable Parquet path: {}",
-                    redact_personal_path(&path.display().to_string())
-                )
-            })?,
-            ScanArgsParquet::default(),
-        )
-        .map_err(redacted)
-        .with_context(|| {
-            format!(
-                "failed to scan {}",
-                redact_personal_path(&path.display().to_string())
-            )
-        })?;
-        frames.push(canonical_projection(scanned));
+        frames.push(scan_and_project(path)?);
     }
-
-    let batch_list = || {
-        paths
-            .iter()
-            .map(|p| redact_personal_path(&p.display().to_string()))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
 
     let combined = if frames.len() == 1 {
         frames.remove(0)
@@ -183,7 +191,7 @@ pub fn canonical_frame(paths: &[PathBuf]) -> Result<DataFrame> {
                     "failed to concatenate {} session batches: one of [{}] likely has a schema \
                      mismatch (missing a projected column, e.g. a legacy batch)",
                     paths.len(),
-                    batch_list()
+                    redacted_batch_list(paths)
                 )
             })?
     };
@@ -191,7 +199,7 @@ pub fn canonical_frame(paths: &[PathBuf]) -> Result<DataFrame> {
     combined.collect().map_err(redacted).with_context(|| {
         format!(
             "failed to build the canonical export frame from [{}]",
-            batch_list()
+            redacted_batch_list(paths)
         )
     })
 }
@@ -207,6 +215,44 @@ fn temp_export_path(path: &Path) -> PathBuf {
         .unwrap_or_default()
         .as_nanos();
     path.with_extension(format!("tmp.{}.{nanos}.{sequence}", std::process::id()))
+}
+
+/// Create `temporary`, write and fsync `csv` into it, cleaning up on any failure.
+fn write_temp_export(temporary: &Path, csv: &str, redacted: impl Fn() -> String) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temporary)
+        .with_context(|| format!("failed to create a temporary export beside {}", redacted()))?;
+
+    if let Err(error) = file.write_all(csv.as_bytes()).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(temporary);
+        return Err(error).with_context(|| {
+            format!("failed to write the temporary export beside {}", redacted())
+        });
+    }
+    Ok(())
+}
+
+/// Rename `temporary` into place and fsync its parent directory, cleaning up
+/// the temporary on a failed rename.
+fn publish_temp_export(temporary: &Path, path: &Path, redacted: impl Fn() -> String) -> Result<()> {
+    if let Err(error) = std::fs::rename(temporary, path) {
+        let _ = std::fs::remove_file(temporary);
+        return Err(error).with_context(|| format!("failed to publish {}", redacted()));
+    }
+
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| Path::new("."));
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| {
+            format!(
+                "failed to persist export rename in {}",
+                redact_personal_path(&parent.display().to_string())
+            )
+        })
 }
 
 /// Write CSV to `path` without truncating an existing export on failure.
@@ -226,36 +272,8 @@ pub fn write_csv_atomically(path: &Path, csv: &str) -> Result<()> {
     let temporary = temp_export_path(path);
     let redacted = || redact_personal_path(&path.display().to_string());
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .with_context(|| format!("failed to create a temporary export beside {}", redacted()))?;
-
-    if let Err(error) = file.write_all(csv.as_bytes()).and_then(|_| file.sync_all()) {
-        drop(file);
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error).with_context(|| {
-            format!("failed to write the temporary export beside {}", redacted())
-        });
-    }
-    drop(file);
-
-    if let Err(error) = std::fs::rename(&temporary, path) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error).with_context(|| format!("failed to publish {}", redacted()));
-    }
-
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let parent = parent.unwrap_or_else(|| Path::new("."));
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .with_context(|| {
-            format!(
-                "failed to persist export rename in {}",
-                redact_personal_path(&parent.display().to_string())
-            )
-        })
+    write_temp_export(&temporary, csv, redacted)?;
+    publish_temp_export(&temporary, path, redacted)
 }
 
 /// Wrap a foreign error with its operator path stripped.

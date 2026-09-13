@@ -1,0 +1,39 @@
+Cargo.lock
+  ai_agent 1-4287
+src/timing.rs
+  s_70a7ba7079c559::t_82e2913f1a0cce 86-90,122-132,135-139,294-311
+.github/workflows/ci.yml
+  s_70a7ba7079c559::t_82e2913f1a0cce 17-18,22-66,73-74,78,81,86-87,90,92,94,99-100,104,109-110,129-130,133,135,138,141
+.devin/blueprint.yaml
+  s_70a7ba7079c559::t_82e2913f1a0cce 14-22,24,28-30
+rust-toolchain.toml
+  s_70a7ba7079c559::t_82e2913f1a0cce 1-9
+src/manifest_failure_tests.rs
+  s_70a7ba7079c559::t_82e2913f1a0cce 62-109
+.gitignore
+  s_70a7ba7079c559::t_82e2913f1a0cce 13
+Cargo.toml
+  s_70a7ba7079c559::t_82e2913f1a0cce 30
+.github/dependabot.yml
+  s_70a7ba7079c559::t_82e2913f1a0cce 1-19
+src/session.rs
+  s_70a7ba7079c559::t_82e2913f1a0cce 78-87,96-111,229-237
+CHANGELOG.md
+  ai_agent 51-66,138-142
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "e2176fa8db3807f5a53e45eac6921f8b56b8cdaf",
+  "prompts": {},
+  "sessions": {
+    "s_70a7ba7079c559": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "626c5f8f-aa8e-4f60-8bd6-e646175353c1",
+        "model": "claude-sonnet-5"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}

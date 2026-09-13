@@ -78,6 +78,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Removed
 
+- **Qodana**, entirely — `qodana.yaml`, `.github/workflows/qodana_code_quality.yml`,
+  and the `QODANA_TOKEN_1849579870` Cloud scan. `qodana-rust` is Ultimate/EAP only;
+  with Cloud membership expired the workflow cannot run usefully and there is no
+  community Rust linter to fall back to. Remaining gates stay in `ci.yml`
+  ([#42](https://github.com/rmems/gaming-telemetry/issues/42)).
 - **Sentry, entirely** — the dependency, the ~100-line bootstrap in `main.rs`, the
   `SENTRY_*` environment variables, and the `sentry-release` workflow
   ([#20](https://github.com/rmems/gaming-telemetry/issues/20)). It was a hard

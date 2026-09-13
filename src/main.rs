@@ -502,6 +502,49 @@ mod tests {
         dir
     }
 
+    fn write_and_reload_batch(
+        samples: Vec<GpuSample>,
+        tag: &str,
+        batch_id: u32,
+    ) -> (PathBuf, DataFrame) {
+        let tmp = unique_fixture_dir(tag);
+        write_to_parquet(samples, batch_id, &tmp).expect("parquet write");
+        let path = tmp.join(format!(
+            "{}{}{}",
+            session::BATCH_PREFIX,
+            batch_id,
+            session::BATCH_SUFFIX
+        ));
+        let df = LazyFrame::scan_parquet(
+            PlRefPath::try_from_path(&path).unwrap(),
+            ScanArgsParquet::default(),
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+        (tmp, df)
+    }
+
+    fn assert_first_u32(df: &DataFrame, column: &str, expected: Option<u32>) {
+        let values = df.column(column).unwrap().u32().unwrap();
+        assert_eq!(values.get(0), expected, "{column}");
+        assert_eq!(
+            values.null_count(),
+            usize::from(expected.is_none()),
+            "{column} null_count"
+        );
+    }
+
+    fn assert_first_u64(df: &DataFrame, column: &str, expected: Option<u64>) {
+        let values = df.column(column).unwrap().u64().unwrap();
+        assert_eq!(values.get(0), expected, "{column}");
+        assert_eq!(
+            values.null_count(),
+            usize::from(expected.is_none()),
+            "{column} null_count"
+        );
+    }
+
     #[test]
     fn write_to_parquet_emits_labeled_batch_file() {
         let base = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -741,12 +784,7 @@ mod tests {
         );
     }
 
-    /// NVML miss path: every GPU sensor column must reach Parquet as a null,
-    /// never as a fabricated 0 that ETL #21 refuses on UNAVAILABLE_ZERO_FIELDS
-    /// (or that a model would treat as idle PCIe / no-throttle / P0).
-    #[test]
-    fn unavailable_nvml_sensors_round_trip_as_nulls_not_zeros() {
-        let mut sample = sample_fixture("kcd2");
+    fn nvml_all_miss(mut sample: GpuSample) -> GpuSample {
         sample.power_usage_mw = None;
         sample.temperature_c = None;
         sample.graphics_clock_mhz = None;
@@ -760,25 +798,19 @@ mod tests {
         sample.memory_total_mb = None;
         sample.encoder_util_perc = None;
         sample.decoder_util_perc = None;
+        sample
+    }
 
-        let tmp = unique_fixture_dir("gt_null_nvml");
-        let batch_id = 8;
-        write_to_parquet(vec![sample], batch_id, &tmp).expect("parquet write");
-
-        let path = tmp.join(format!(
-            "{}{}{}",
-            session::BATCH_PREFIX,
-            batch_id,
-            session::BATCH_SUFFIX
-        ));
-        let df = LazyFrame::scan_parquet(
-            PlRefPath::try_from_path(&path).unwrap(),
-            ScanArgsParquet::default(),
-        )
-        .unwrap()
-        .collect()
-        .unwrap();
-
+    /// NVML miss path: every GPU sensor column must reach Parquet as a null,
+    /// never as a fabricated 0 that ETL #21 refuses on UNAVAILABLE_ZERO_FIELDS
+    /// (or that a model would treat as idle PCIe / no-throttle / P0).
+    #[test]
+    fn unavailable_nvml_sensors_round_trip_as_nulls_not_zeros() {
+        let (tmp, df) = write_and_reload_batch(
+            vec![nvml_all_miss(sample_fixture("kcd2"))],
+            "gt_null_nvml",
+            8,
+        );
         for column in [
             "power_usage_mw",
             "temperature_c",
@@ -791,20 +823,15 @@ mod tests {
             "encoder_util_perc",
             "decoder_util_perc",
         ] {
-            let values = df.column(column).unwrap().u32().unwrap();
-            assert_eq!(values.get(0), None, "{column} must be null, not 0");
-            assert_eq!(values.null_count(), 1, "{column} must record a null");
+            assert_first_u32(&df, column, None);
         }
         for column in [
             "throttle_reasons_bitmask",
             "memory_used_mb",
             "memory_total_mb",
         ] {
-            let values = df.column(column).unwrap().u64().unwrap();
-            assert_eq!(values.get(0), None, "{column} must be null, not 0");
-            assert_eq!(values.null_count(), 1, "{column} must record a null");
+            assert_first_u64(&df, column, None);
         }
-
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -822,49 +849,19 @@ mod tests {
         sample.decoder_util_perc = Some(0);
         sample.memory_used_mb = Some(0);
 
-        let tmp = unique_fixture_dir("gt_zero_nvml");
-        let batch_id = 9;
-        write_to_parquet(vec![sample], batch_id, &tmp).expect("parquet write");
-
-        let path = tmp.join(format!(
-            "{}{}{}",
-            session::BATCH_PREFIX,
-            batch_id,
-            session::BATCH_SUFFIX
-        ));
-        let df = LazyFrame::scan_parquet(
-            PlRefPath::try_from_path(&path).unwrap(),
-            ScanArgsParquet::default(),
-        )
-        .unwrap()
-        .collect()
-        .unwrap();
-
-        for (column, expected) in [
-            ("pcie_rx_kbps", 0u32),
-            ("pcie_tx_kbps", 0),
-            ("pstate", 0),
-            ("fan_speed_perc", 0),
-            ("encoder_util_perc", 0),
-            ("decoder_util_perc", 0),
+        let (tmp, df) = write_and_reload_batch(vec![sample], "gt_zero_nvml", 9);
+        for column in [
+            "pcie_rx_kbps",
+            "pcie_tx_kbps",
+            "pstate",
+            "fan_speed_perc",
+            "encoder_util_perc",
+            "decoder_util_perc",
         ] {
-            let values = df.column(column).unwrap().u32().unwrap();
-            assert_eq!(values.get(0), Some(expected), "{column} must stay 0");
-            assert_eq!(values.null_count(), 0, "{column} must not be null");
+            assert_first_u32(&df, column, Some(0));
         }
-        assert_eq!(
-            df.column("throttle_reasons_bitmask")
-                .unwrap()
-                .u64()
-                .unwrap()
-                .get(0),
-            Some(0)
-        );
-        assert_eq!(
-            df.column("memory_used_mb").unwrap().u64().unwrap().get(0),
-            Some(0)
-        );
-
+        assert_first_u64(&df, "throttle_reasons_bitmask", Some(0));
+        assert_first_u64(&df, "memory_used_mb", Some(0));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

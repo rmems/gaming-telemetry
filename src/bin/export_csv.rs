@@ -1,50 +1,66 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Export canonical 5-column CSV from Parquet for corinth-canal ingestion.
+//! Export the canonical CSV from a session's Parquet batches for corinth-canal.
 //!
-//! Canonical format: timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w
+//! Accepts either a whole session directory (every batch, in order, one header) or
+//! a single batch file. The column contract lives in `gaming_telemetry::export`.
+//!
+//! GPU and CPU sensor columns are nullable. A missing NVML/hwmon/RAPL read
+//! is an empty CSV cell, never a fabricated `0`. Do not treat empty as zero.
 
-use polars::prelude::*;
-use std::env;
+use anyhow::Result;
+use gaming_telemetry::export::{
+    CANONICAL_COLUMNS, canonical_frame, resolve_inputs, to_csv, write_csv_atomically,
+};
+use gaming_telemetry::privacy::redact_personal_path;
+use std::path::Path;
+use std::process::ExitCode;
 
-fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = env::args().collect();
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            // Last line of defence. `main() -> Result` would print the chain
+            // verbatim, and the layers underneath are not ours: polars and
+            // `std::io` embed absolute paths in their own messages, so redacting
+            // only the contexts we author is not enough to keep the operator's
+            // identity out of stderr.
+            eprintln!("Error: {}", redact_personal_path(&format!("{error:?}")));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: cargo run --bin export_csv <parquet_file> [output.csv]");
-        eprintln!("  Exports canonical 5-column CSV for corinth-canal ingestion.");
+        eprintln!("Usage: export_csv <session_dir | parquet_file> [output.csv]");
+        eprintln!();
+        eprintln!("  A directory exports every batch in it, in batch order, under a");
+        eprintln!("  single header. A file exports just that batch.");
+        eprintln!("  Output defaults to stdout (\"-\").");
+        eprintln!();
+        eprintln!("  Columns: {}", CANONICAL_COLUMNS.join(","));
         std::process::exit(1);
     }
 
-    let parquet_file = &args[1];
-    let output_file = args.get(2).map(|s| s.as_str()).unwrap_or("-");
+    let input = Path::new(&args[1]);
+    let output_file = args.get(2).map(String::as_str).unwrap_or("-");
 
-    // Read Parquet
-    let df = LazyFrame::scan_parquet(
-        PlRefPath::from(parquet_file.as_str()),
-        ScanArgsParquet::default(),
-    )?
-    .select(&[
-        col("timestamp_ms"),
-        col("temperature_c").alias("gpu_temp_c"),
-        (col("power_usage_mw") / lit(1000.0)).alias("gpu_power_w"),
-        col("cpu_tctl_c"),
-        col("cpu_package_power_w"),
-    ])
-    .collect()?;
-
-    // Write CSV
-    let mut csv_buffer = Vec::new();
-    CsvWriter::new(&mut csv_buffer)
-        .include_header(true)
-        .finish(&mut df.clone())?;
-
-    let csv_string = String::from_utf8(csv_buffer)?;
+    let inputs = resolve_inputs(input)?;
+    let mut df = canonical_frame(&inputs)?;
+    let csv = to_csv(&mut df)?;
 
     if output_file == "-" {
-        println!("{}", csv_string);
+        print!("{csv}");
     } else {
-        std::fs::write(output_file, csv_string)?;
-        println!("Exported {} rows to {}", df.height(), output_file);
+        write_csv_atomically(Path::new(output_file), &csv)?;
+        println!(
+            "Exported {} rows from {} batch(es) to {}",
+            df.height(),
+            inputs.len(),
+            output_file
+        );
     }
 
     Ok(())

@@ -8,6 +8,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Path redaction no longer fails open without `HOME`, and covers external
+  media.** `redact_home` returned text unchanged when `HOME` was unset — routine
+  for a systemd unit or a container — so a home-like path reached logs and error
+  reports unredacted. It also only stripped the literal `$HOME` prefix, so a
+  `SESSION_DIR` on external media (`/run/media/<user>/…`, `/media/<user>/…`)
+  carried the operator's username verbatim without ever passing through the home
+  directory. `redact_personal_path` now also replaces whole path *components*
+  equal to the login name with `$USER`, resolved from `USER`/`LOGNAME` or the last
+  component of `$HOME`. Component-wise, so a word that merely contains the name
+  (`alice` inside `/opt/alicent`) is untouched; `root` and names under three
+  characters are skipped as ambiguous.
+
+  Four gaps found in review, all now fixed: the structural `/home/<name>` pass
+  ran *after* a generic `$HOME` (e.g. `/home` exactly) had already been
+  literally substituted, hiding the very text it needed to match; the same pass
+  matched `home`/`media` anywhere in a path rather than only at its root, so
+  `/srv/home/captures/run1` misread `captures` as a username; a doubled path
+  separator (`/home//alice`) left an empty component where the username was
+  expected and the whole path went unredacted; and replacing a matched
+  component wholesale silently deleted any diagnostic text glued onto it, e.g.
+  `/home/alice: permission denied` lost the reason once `alice` was redacted.
+  Also added `empty` and `nonexistent` to the never-a-username list, alongside
+  `/tmp` and the rest — the placeholder home directories glibc and several
+  service managers actually assign.
 - **Stale manifest temporaries are reclaimed at startup.** In-process failures
   already clean up after themselves, but a `SIGKILL` (or power loss) between
   `create_new` and `rename` stranded the temporary permanently. A collector that

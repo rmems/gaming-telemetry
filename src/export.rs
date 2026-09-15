@@ -507,8 +507,12 @@ mod tests {
             !text.contains(home.to_str().unwrap()),
             "raw home path leaked into an error: {text}"
         );
+        // `redact_personal_path` runs its structural /home/<name> pass before the
+        // literal $HOME substitution (see privacy.rs), so a plain HOME path is
+        // redacted as `/home/$USER/...` rather than `$HOME/...` -- both markers
+        // mean "the operator's identity was stripped here."
         assert!(
-            text.contains("$HOME"),
+            text.contains("$USER") || text.contains("$HOME"),
             "expected a redacted marker in: {text}"
         );
     }

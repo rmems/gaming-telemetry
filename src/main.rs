@@ -43,6 +43,44 @@ const BUFFER_SIZE: usize = 2000; // ~10 seconds of data at default 5ms intervals
 /// Cap outstanding async Parquet writes so a slow disk cannot queue unbounded batches.
 const MAX_IN_FLIGHT_WRITES: usize = 2;
 
+#[cfg(unix)]
+struct ShutdownSignal(tokio::signal::unix::Signal);
+
+#[cfg(unix)]
+impl ShutdownSignal {
+    fn new() -> std::io::Result<Self> {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).map(Self)
+    }
+
+    async fn recv(&mut self) -> std::io::Result<()> {
+        self.0.recv().await.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "SIGINT signal stream closed",
+            )
+        })
+    }
+}
+
+#[cfg(windows)]
+struct ShutdownSignal(tokio::signal::windows::CtrlC);
+
+#[cfg(windows)]
+impl ShutdownSignal {
+    fn new() -> std::io::Result<Self> {
+        tokio::signal::windows::ctrl_c().map(Self)
+    }
+
+    async fn recv(&mut self) -> std::io::Result<()> {
+        self.0.recv().await.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Ctrl+C signal stream closed",
+            )
+        })
+    }
+}
+
 fn next_batch_id(batch_id: u32) -> Result<u32> {
     batch_id
         .checked_add(1)
@@ -198,21 +236,25 @@ fn record_write_result(res: Result<Result<()>, tokio::task::JoinError>, write_fa
 
 /// Reap finished writes; if still at capacity, await the next one to finish (backpressure).
 /// Returns `true` if Ctrl+C arrived while waiting so the outer loop can shut down.
-async fn reclaim_in_flight(in_flight: &mut JoinSet<Result<()>>, write_failures: &mut u32) -> bool {
+async fn reclaim_in_flight(
+    in_flight: &mut JoinSet<Result<()>>,
+    write_failures: &mut u32,
+    shutdown: &mut ShutdownSignal,
+) -> Result<bool> {
     while let Some(res) = in_flight.try_join_next() {
         record_write_result(res, write_failures);
     }
     if in_flight.len() < MAX_IN_FLIGHT_WRITES {
-        return false;
+        return Ok(false);
     }
     tokio::select! {
         res = in_flight.join_next() => {
             if let Some(res) = res {
                 record_write_result(res, write_failures);
             }
-            false
+            Ok(false)
         }
-        _ = tokio::signal::ctrl_c() => true,
+        signal = shutdown.recv() => signal.map(|()| true).map_err(Into::into),
     }
 }
 
@@ -382,6 +424,10 @@ async fn main() -> Result<()> {
     let mut interval = interval(Duration::from_millis(poll_interval_ms));
     // After write backpressure, do not burst-catch every missed 5ms tick.
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Keep one receiver alive for the entire collection loop. Tokio's process-wide
+    // handler remains installed after a temporary receiver is dropped, but a new
+    // receiver cannot recover a notification broadcast while none was registered.
+    let mut shutdown = ShutdownSignal::new()?;
     loop {
         tokio::select! {
             tick = interval.tick() => {
@@ -429,7 +475,13 @@ async fn main() -> Result<()> {
                 buffer.push(sample);
 
                 if buffer.len() >= BUFFER_SIZE {
-                    if reclaim_in_flight(&mut in_flight, &mut write_failures).await {
+                    if reclaim_in_flight(
+                        &mut in_flight,
+                        &mut write_failures,
+                        &mut shutdown,
+                    )
+                    .await?
+                    {
                         println!("\nShutdown signal received during write backpressure...");
                         perform_shutdown(
                             std::mem::take(&mut buffer),
@@ -473,7 +525,8 @@ async fn main() -> Result<()> {
                     );
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
+            signal = shutdown.recv() => {
+                signal?;
                 println!("\nShutdown signal received. Finalizing last batch...");
                 perform_shutdown(
                     buffer,
@@ -941,5 +994,84 @@ mod tests {
     fn next_batch_id_rejects_exhausted_namespace() {
         assert_eq!(next_batch_id(5).unwrap(), 6);
         assert!(next_batch_id(u32::MAX).is_err());
+    }
+
+    /// A SIGINT delivered after one backpressure wait returns must remain pending
+    /// for the next wait. Run the signal delivery in a child process so a broken
+    /// handler can fail only that child, never the parent test runner.
+    #[cfg(unix)]
+    #[test]
+    fn sigint_between_backpressure_waits_is_not_lost() {
+        const CHILD_ENV: &str = "GAMING_TELEMETRY_SIGNAL_TEST_CHILD";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::sigint_between_backpressure_waits_is_not_lost",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("spawn isolated signal-test child");
+            assert!(
+                output.status.success(),
+                "signal-test child failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut in_flight: JoinSet<Result<()>> = JoinSet::new();
+            let mut write_failures = 0;
+            let mut shutdown = ShutdownSignal::new().unwrap();
+
+            in_flight.spawn(async {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                Ok(())
+            });
+            in_flight.spawn(async {
+                std::future::pending::<()>().await;
+                Ok(())
+            });
+
+            assert!(
+                !reclaim_in_flight(&mut in_flight, &mut write_failures, &mut shutdown)
+                    .await
+                    .unwrap(),
+                "a completed write must win the first backpressure wait"
+            );
+
+            let status = std::process::Command::new("kill")
+                .args(["-INT", &std::process::id().to_string()])
+                .status()
+                .expect("send SIGINT to signal-test child");
+            assert!(status.success(), "kill command failed: {status}");
+
+            // Let Tokio dispatch SIGINT while no shutdown future is being
+            // awaited, matching a signal delivered during synchronous polling.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+
+            in_flight.spawn(async {
+                std::future::pending::<()>().await;
+                Ok(())
+            });
+            let observed = tokio::time::timeout(
+                Duration::from_millis(250),
+                reclaim_in_flight(&mut in_flight, &mut write_failures, &mut shutdown),
+            )
+            .await;
+            assert!(
+                observed.unwrap().unwrap(),
+                "SIGINT delivered between waits must trigger shutdown"
+            );
+            in_flight.abort_all();
+        });
     }
 }

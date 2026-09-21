@@ -14,29 +14,6 @@ fn format_celsius(value: Option<f32>) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_celsius_renders_available_and_missing_values() {
-        assert_eq!(format_celsius(Some(81.25)), " 81.2 C");
-        assert_eq!(format_celsius(None), "  n/a  ");
-    }
-
-    #[test]
-    fn render_optional_stat_distinguishes_unavailable_from_zero() {
-        assert_eq!(
-            render_optional_stat("Avg Power", Some(0.0), |mw| format!("{mw:.2} W")),
-            "Avg Power: 0.00 W"
-        );
-        assert_eq!(
-            render_optional_stat("Avg Power", None, |_| "unused".to_owned()),
-            "Avg Power: unavailable (sensor not readable during capture)"
-        );
-    }
-}
-
 fn render_optional_stat(
     label: &str,
     value: Option<f64>,
@@ -44,9 +21,7 @@ fn render_optional_stat(
 ) -> String {
     match value {
         Some(value) => format!("{label}: {}", formatted(value)),
-        None => format!(
-            "{label}: unavailable (sensor not readable during capture)"
-        ),
+        None => format!("{label}: unavailable (sensor not readable during capture)"),
     }
 }
 
@@ -273,4 +248,27 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_celsius_renders_available_and_missing_values() {
+        assert_eq!(format_celsius(Some(81.25)), " 81.2 C");
+        assert_eq!(format_celsius(None), "  n/a  ");
+    }
+
+    #[test]
+    fn render_optional_stat_distinguishes_unavailable_from_zero() {
+        assert_eq!(
+            render_optional_stat("Avg Power", Some(0.0), |mw| format!("{mw:.2} W")),
+            "Avg Power: 0.00 W"
+        );
+        assert_eq!(
+            render_optional_stat("Avg Power", None, |_| "unused".to_owned()),
+            "Avg Power: unavailable (sensor not readable during capture)"
+        );
+    }
 }

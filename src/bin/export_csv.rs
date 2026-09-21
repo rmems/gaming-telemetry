@@ -9,9 +9,7 @@
 //! is an empty CSV cell, never a fabricated `0`. Do not treat empty as zero.
 
 use anyhow::Result;
-use gaming_telemetry::export::{
-    canonical_frame, resolve_inputs, to_csv, write_csv_atomically,
-};
+use gaming_telemetry::export::{canonical_frame, resolve_inputs, to_csv, write_csv_atomically};
 use gaming_telemetry::privacy::redact_personal_path;
 use std::path::Path;
 use std::path::PathBuf;
@@ -30,9 +28,7 @@ where
     let mut args = args.into_iter();
     let _program = args.next();
     let Some(input) = args.next() else {
-        anyhow::bail!(
-            "Usage: export_csv <session_dir | parquet_file> [output.csv]\n\n  "
-        );
+        anyhow::bail!("Usage: export_csv <session_dir | parquet_file> [output.csv]\n\n  ");
     };
 
     Ok(ExportArgs {

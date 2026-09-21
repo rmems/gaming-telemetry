@@ -114,7 +114,9 @@ jobs:
       - name: Generate lcov.info
         run: |
           cargo install grcov
-          grcov . -s . --binary-path ./target/debug -t lcov --branch --ignore-not-existing -o lcov.info
+          grcov . -s . --binary-path ./target/debug -t lcov --branch --ignore-not-existing --ignore build.rs -o lcov.info
+          test -s lcov.info
+          ! grep -q 'build.rs' lcov.info
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@cd8b657745c0c7bb7f101e61a61c9ed5d74b8561 # v5.5.4
         with:

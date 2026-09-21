@@ -395,6 +395,13 @@ async fn main() -> Result<()> {
     // established identity instead of writing new batches with a conflicting tag.
     session_label = manifest.session_label.clone();
     let mut buffer = Vec::with_capacity(BUFFER_SIZE);
+    // Keep one receiver alive for the entire collection loop. Tokio's process-wide
+    // handler remains installed after a temporary receiver is dropped, but a new
+    // receiver cannot recover a notification broadcast while none was registered.
+    //
+    // Register before publishing the manifest so startup failure cannot leave a
+    // newly-written manifest in an unfinished state.
+    let mut shutdown = ShutdownSignal::new()?;
     // Publish only after the fallible resume scan succeeds, so an unreadable
     // existing directory cannot overwrite its prior completed manifest.
     manifest.write_atomic(&output_dir)?;
@@ -424,10 +431,6 @@ async fn main() -> Result<()> {
     let mut interval = interval(Duration::from_millis(poll_interval_ms));
     // After write backpressure, do not burst-catch every missed 5ms tick.
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    // Keep one receiver alive for the entire collection loop. Tokio's process-wide
-    // handler remains installed after a temporary receiver is dropped, but a new
-    // receiver cannot recover a notification broadcast while none was registered.
-    let mut shutdown = ShutdownSignal::new()?;
     loop {
         tokio::select! {
             tick = interval.tick() => {

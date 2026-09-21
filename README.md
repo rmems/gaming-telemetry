@@ -1,6 +1,10 @@
 # Gaming Telemetry: Neuromorphic Data Collector for SNN Training
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Maintainability](https://qlty.sh/gh/rmems/projects/gaming-telemetry/maintainability.svg)](https://qlty.sh/gh/rmems/projects/gaming-telemetry)
+[![Codacy Badge](https://app.codacy.com/project/badge/Grade/031c239db57b43f09e94f7361bb05080)](https://app.codacy.com/gh/rmems/gaming-telemetry/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
+[![codecov](https://codecov.io/gh/rmems/gaming-telemetry/graph/badge.svg)](https://codecov.io/gh/rmems/gaming-telemetry)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/rmems/gaming-telemetry)
 
 ## Overview
 

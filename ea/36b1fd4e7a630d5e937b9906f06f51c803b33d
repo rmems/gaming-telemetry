@@ -1,0 +1,21 @@
+src/bin/query.rs
+  s_4de11739ed6ac5::t_2aad4c1daf7c7f 17-22,24-39
+  s_4de11739ed6ac5::t_8781073eb3594d 23
+  s_4de11739ed6ac5::t_c2138a225c2fc9 40-44,46-49,53-54
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "ea36b1fd4e7a630d5e937b9906f06f51c803b33d",
+  "prompts": {},
+  "sessions": {
+    "s_4de11739ed6ac5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c352-21fb-7a62-b3f9-240a8c754249",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}

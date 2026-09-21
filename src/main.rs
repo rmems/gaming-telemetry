@@ -1023,6 +1023,11 @@ mod tests {
             return;
         }
 
+        check_pending_sigint_between_waits();
+    }
+
+    #[cfg(unix)]
+    fn check_pending_sigint_between_waits() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

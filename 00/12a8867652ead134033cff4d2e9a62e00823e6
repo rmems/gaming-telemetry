@@ -1,0 +1,23 @@
+codecov.yml
+  s_4de11739ed6ac5::t_01cdb17749b68a 1-12
+.github/workflows/ci.yml
+  s_4de11739ed6ac5::t_2658d8d2e734f1 117-119
+src/bin/query.rs
+  s_4de11739ed6ac5::t_0b5c3b9a0a3e55 24,252-273
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "0012a8867652ead134033cff4d2e9a62e00823e6",
+  "prompts": {},
+  "sessions": {
+    "s_4de11739ed6ac5": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c352-21fb-7a62-b3f9-240a8c754249",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Raul Cardenas Montoya <montoyaraul34@gmail.com>"
+    }
+  }
+}

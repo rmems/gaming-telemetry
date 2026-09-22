@@ -58,7 +58,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    let args = parse_args(std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()))?;
+    let args = parse_args(std::env::args())?;
     let input = Path::new(&args.input);
     let output_file = args.output.to_str().unwrap_or("-");
 

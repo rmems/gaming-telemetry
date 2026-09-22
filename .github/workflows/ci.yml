@@ -113,7 +113,7 @@ jobs:
           RUSTFLAGS: "-C instrument-coverage"
       - name: Generate lcov.info
         run: |
-          cargo install grcov
+          cargo install grcov --locked --force
           grcov . -s . --binary-path ./target/debug -t lcov --branch --ignore-not-existing --ignore build.rs -o lcov.info
           test -s lcov.info
           ! grep -q 'build.rs' lcov.info

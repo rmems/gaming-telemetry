@@ -31,9 +31,14 @@ where
         anyhow::bail!("Usage: export_csv <session_dir | parquet_file> [output.csv]\n\n  ");
     };
 
+    let output = args.next().unwrap_or_else(|| "-".to_owned());
+    if args.next().is_some() {
+        anyhow::bail!("Usage: export_csv <session_dir | parquet_file> [output.csv]");
+    }
+
     Ok(ExportArgs {
         input: PathBuf::from(input),
-        output: PathBuf::from(args.next().unwrap_or_else(|| "-".to_owned())),
+        output: PathBuf::from(output),
     })
 }
 
@@ -53,7 +58,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    let args = parse_args(std::env::args())?;
+    let args = parse_args(std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()))?;
     let input = Path::new(&args.input);
     let output_file = args.output.to_str().unwrap_or("-");
 
@@ -102,5 +107,17 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(args.output, PathBuf::from("out.csv"));
+    }
+
+    #[test]
+    fn parse_args_rejects_surplus_operands() {
+        let error = parse_args([
+            "export_csv".to_owned(),
+            "session".to_owned(),
+            "out.csv".to_owned(),
+            "unexpected".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("Usage: export_csv"));
     }
 }

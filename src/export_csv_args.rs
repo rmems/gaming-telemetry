@@ -3,7 +3,9 @@
 //! Argument parsing for the `export_csv` binary.
 //!
 //! Kept separate from [`crate::export`] so static analysis does not treat argv
-//! collection as part of the atomic CSV write path.
+//! collection as part of the atomic CSV write path. Uses [`std::env::args`]
+//! (UTF-8 argv) so paths flow through `PathBuf` without lossy conversions in
+//! the binary that performs the export.
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -14,13 +16,13 @@ pub struct ExportCsvArgs {
     pub output: PathBuf,
 }
 
-pub fn export_csv_argv() -> impl Iterator<Item = std::ffi::OsString> {
-    std::env::args_os()
+pub fn export_csv_argv() -> impl Iterator<Item = String> {
+    std::env::args()
 }
 
 pub fn parse_export_csv_args<I>(args: I) -> Result<ExportCsvArgs>
 where
-    I: IntoIterator<Item = std::ffi::OsString>,
+    I: IntoIterator<Item = String>,
 {
     let mut args = args.into_iter();
     let _program = args.next();
@@ -45,18 +47,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-
     #[test]
     fn parse_args_requires_an_input_path() {
-        let error = parse_export_csv_args([OsString::from("export_csv")]).unwrap_err();
+        let error = parse_export_csv_args(["export_csv".to_owned()]).unwrap_err();
         assert!(error.to_string().contains("Usage: export_csv"));
     }
 
     #[test]
     fn parse_args_defaults_output_to_stdout() {
-        let args = parse_export_csv_args([OsString::from("export_csv"), OsString::from("session")])
-            .unwrap();
+        let args = parse_export_csv_args(["export_csv".to_owned(), "session".to_owned()]).unwrap();
         assert_eq!(args.input, PathBuf::from("session"));
         assert_eq!(args.output, PathBuf::from("-"));
     }
@@ -64,9 +63,9 @@ mod tests {
     #[test]
     fn parse_args_preserves_explicit_output_path() {
         let args = parse_export_csv_args([
-            OsString::from("export_csv"),
-            OsString::from("session"),
-            OsString::from("out.csv"),
+            "export_csv".to_owned(),
+            "session".to_owned(),
+            "out.csv".to_owned(),
         ])
         .unwrap();
         assert_eq!(args.output, PathBuf::from("out.csv"));
@@ -75,10 +74,10 @@ mod tests {
     #[test]
     fn parse_args_rejects_surplus_operands() {
         let error = parse_export_csv_args([
-            OsString::from("export_csv"),
-            OsString::from("session"),
-            OsString::from("out.csv"),
-            OsString::from("unexpected"),
+            "export_csv".to_owned(),
+            "session".to_owned(),
+            "out.csv".to_owned(),
+            "unexpected".to_owned(),
         ])
         .unwrap_err();
         assert!(error.to_string().contains("Usage: export_csv"));

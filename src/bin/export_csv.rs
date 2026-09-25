@@ -10,43 +10,13 @@
 
 use anyhow::Result;
 use gaming_telemetry::export::{canonical_frame, resolve_inputs, to_csv, write_csv_atomically};
+use gaming_telemetry::export_csv_args::{ExportCsvArgs, export_csv_argv, parse_export_csv_args};
 use gaming_telemetry::privacy::redact_personal_path;
 use std::ffi::OsStr;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
-#[derive(Debug, PartialEq, Eq)]
-struct ExportArgs {
-    input: PathBuf,
-    output: PathBuf,
-}
-
-fn parse_args<I>(args: I) -> Result<ExportArgs>
-where
-    I: IntoIterator<Item = std::ffi::OsString>,
-{
-    let mut args = args.into_iter();
-    let _program = args.next();
-    let Some(input) = args.next() else {
-        anyhow::bail!("Usage: export_csv <session_dir | parquet_file> [output.csv]\n\n  ");
-    };
-
-    let output = args
-        .next()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("-"));
-    if args.next().is_some() {
-        anyhow::bail!("Usage: export_csv <session_dir | parquet_file> [output.csv]");
-    }
-
-    Ok(ExportArgs {
-        input: PathBuf::from(input),
-        output,
-    })
-}
-
 fn main() -> ExitCode {
-    let parsed = match parse_args(std::env::args_os()) {
+    let parsed = match parse_export_csv_args(export_csv_argv()) {
         Ok(args) => args,
         Err(error) => {
             eprintln!("Error: {}", redact_personal_path(&format!("{error:?}")));
@@ -68,7 +38,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: ExportArgs) -> Result<()> {
+fn run(args: ExportCsvArgs) -> Result<()> {
     let inputs = resolve_inputs(&args.input)?;
     let mut df = canonical_frame(&inputs)?;
     let csv = to_csv(&mut df)?;
@@ -86,46 +56,4 @@ fn run(args: ExportArgs) -> Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::ffi::OsString;
-
-    #[test]
-    fn parse_args_requires_an_input_path() {
-        let error = parse_args([OsString::from("export_csv")]).unwrap_err();
-        assert!(error.to_string().contains("Usage: export_csv"));
-    }
-
-    #[test]
-    fn parse_args_defaults_output_to_stdout() {
-        let args = parse_args([OsString::from("export_csv"), OsString::from("session")]).unwrap();
-        assert_eq!(args.input, PathBuf::from("session"));
-        assert_eq!(args.output, PathBuf::from("-"));
-    }
-
-    #[test]
-    fn parse_args_preserves_explicit_output_path() {
-        let args = parse_args([
-            OsString::from("export_csv"),
-            OsString::from("session"),
-            OsString::from("out.csv"),
-        ])
-        .unwrap();
-        assert_eq!(args.output, PathBuf::from("out.csv"));
-    }
-
-    #[test]
-    fn parse_args_rejects_surplus_operands() {
-        let error = parse_args([
-            OsString::from("export_csv"),
-            OsString::from("session"),
-            OsString::from("out.csv"),
-            OsString::from("unexpected"),
-        ])
-        .unwrap_err();
-        assert!(error.to_string().contains("Usage: export_csv"));
-    }
 }

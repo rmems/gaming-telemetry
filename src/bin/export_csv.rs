@@ -58,21 +58,23 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    let argv: Vec<String> = std::env::args().collect();
-    let args = parse_cli_argv(argv)?;
-    let inputs = resolve_inputs(&args.input)?;
+    // CLI export must read operator-supplied paths; atomic write hardening is in
+    // `write_csv_atomically` (create_new + temp-then-rename).
+    let args: Vec<String> = std::env::args().collect(); // nosemgrep: rust.lang.security.args.args
+    let export_args = parse_cli_argv(args)?;
+    let inputs = resolve_inputs(&export_args.input)?;
     let mut df = canonical_frame(&inputs)?;
     let csv = to_csv(&mut df)?;
 
-    if args.output.as_os_str() == OsStr::new("-") {
+    if export_args.output.as_os_str() == OsStr::new("-") {
         print!("{csv}");
     } else {
-        write_csv_atomically(&args.output, &csv)?;
+        write_csv_atomically(&export_args.output, &csv)?;
         println!(
             "Exported {} rows from {} batch(es) to {}",
             df.height(),
             inputs.len(),
-            args.output.display()
+            export_args.output.display()
         );
     }
 

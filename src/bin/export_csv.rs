@@ -11,7 +11,7 @@
 use anyhow::Result;
 use gaming_telemetry::export::{canonical_frame, resolve_inputs, to_csv, write_csv_atomically};
 use gaming_telemetry::privacy::redact_personal_path;
-use std::path::Path;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -23,7 +23,7 @@ struct ExportArgs {
 
 fn parse_args<I>(args: I) -> Result<ExportArgs>
 where
-    I: IntoIterator<Item = String>,
+    I: IntoIterator<Item = std::ffi::OsString>,
 {
     let mut args = args.into_iter();
     let _program = args.next();
@@ -31,19 +31,30 @@ where
         anyhow::bail!("Usage: export_csv <session_dir | parquet_file> [output.csv]\n\n  ");
     };
 
-    let output = args.next().unwrap_or_else(|| "-".to_owned());
+    let output = args
+        .next()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("-"));
     if args.next().is_some() {
         anyhow::bail!("Usage: export_csv <session_dir | parquet_file> [output.csv]");
     }
 
     Ok(ExportArgs {
         input: PathBuf::from(input),
-        output: PathBuf::from(output),
+        output,
     })
 }
 
 fn main() -> ExitCode {
-    match run() {
+    let parsed = match parse_args(std::env::args_os()) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("Error: {}", redact_personal_path(&format!("{error:?}")));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match run(parsed) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             // Last line of defence. `main() -> Result` would print the chain
@@ -57,24 +68,20 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<()> {
-    let args = parse_args(std::env::args())?;
-    let input = Path::new(&args.input);
-    let output_file = args.output.to_str().unwrap_or("-");
-
-    let inputs = resolve_inputs(input)?;
+fn run(args: ExportArgs) -> Result<()> {
+    let inputs = resolve_inputs(&args.input)?;
     let mut df = canonical_frame(&inputs)?;
     let csv = to_csv(&mut df)?;
 
-    if output_file == "-" {
+    if args.output.as_os_str() == OsStr::new("-") {
         print!("{csv}");
     } else {
-        write_csv_atomically(Path::new(output_file), &csv)?;
+        write_csv_atomically(&args.output, &csv)?;
         println!(
             "Exported {} rows from {} batch(es) to {}",
             df.height(),
             inputs.len(),
-            output_file
+            args.output.display()
         );
     }
 
@@ -84,16 +91,17 @@ fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
 
     #[test]
     fn parse_args_requires_an_input_path() {
-        let error = parse_args(["export_csv".to_owned()]).unwrap_err();
+        let error = parse_args([OsString::from("export_csv")]).unwrap_err();
         assert!(error.to_string().contains("Usage: export_csv"));
     }
 
     #[test]
     fn parse_args_defaults_output_to_stdout() {
-        let args = parse_args(["export_csv".to_owned(), "session".to_owned()]).unwrap();
+        let args = parse_args([OsString::from("export_csv"), OsString::from("session")]).unwrap();
         assert_eq!(args.input, PathBuf::from("session"));
         assert_eq!(args.output, PathBuf::from("-"));
     }
@@ -101,9 +109,9 @@ mod tests {
     #[test]
     fn parse_args_preserves_explicit_output_path() {
         let args = parse_args([
-            "export_csv".to_owned(),
-            "session".to_owned(),
-            "out.csv".to_owned(),
+            OsString::from("export_csv"),
+            OsString::from("session"),
+            OsString::from("out.csv"),
         ])
         .unwrap();
         assert_eq!(args.output, PathBuf::from("out.csv"));
@@ -112,10 +120,10 @@ mod tests {
     #[test]
     fn parse_args_rejects_surplus_operands() {
         let error = parse_args([
-            "export_csv".to_owned(),
-            "session".to_owned(),
-            "out.csv".to_owned(),
-            "unexpected".to_owned(),
+            OsString::from("export_csv"),
+            OsString::from("session"),
+            OsString::from("out.csv"),
+            OsString::from("unexpected"),
         ])
         .unwrap_err();
         assert!(error.to_string().contains("Usage: export_csv"));

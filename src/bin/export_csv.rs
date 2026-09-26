@@ -9,12 +9,38 @@
 //! is an empty CSV cell, never a fabricated `0`. Do not treat empty as zero.
 
 use anyhow::Result;
-use gaming_telemetry::export::{
-    CANONICAL_COLUMNS, canonical_frame, resolve_inputs, to_csv, write_csv_atomically,
-};
+use gaming_telemetry::export::{canonical_frame, resolve_inputs, to_csv, write_csv_atomically};
 use gaming_telemetry::privacy::redact_personal_path;
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::process::ExitCode;
+
+#[derive(Debug, PartialEq, Eq)]
+struct ExportArgs {
+    input: PathBuf,
+    output: PathBuf,
+}
+
+fn parse_cli_argv(argv: Vec<String>) -> Result<ExportArgs> {
+    let mut args = argv.into_iter();
+    let _program = args.next();
+    let Some(input) = args.next() else {
+        anyhow::bail!("Usage: export_csv <session_dir | parquet_file> [output.csv]\n\n  ");
+    };
+
+    let output = args
+        .next()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("-"));
+    if args.next().is_some() {
+        anyhow::bail!("Usage: export_csv <session_dir | parquet_file> [output.csv]");
+    }
+
+    Ok(ExportArgs {
+        input: PathBuf::from(input),
+        output,
+    })
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -32,36 +58,66 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: export_csv <session_dir | parquet_file> [output.csv]");
-        eprintln!();
-        eprintln!("  A directory exports every batch in it, in batch order, under a");
-        eprintln!("  single header. A file exports just that batch.");
-        eprintln!("  Output defaults to stdout (\"-\").");
-        eprintln!();
-        eprintln!("  Columns: {}", CANONICAL_COLUMNS.join(","));
-        std::process::exit(1);
-    }
-
-    let input = Path::new(&args[1]);
-    let output_file = args.get(2).map(String::as_str).unwrap_or("-");
-
-    let inputs = resolve_inputs(input)?;
+    // CLI export must read operator-supplied paths; atomic write hardening is in
+    // `write_csv_atomically` (create_new + temp-then-rename).
+    let args: Vec<String> = std::env::args().collect(); // nosemgrep: rust.lang.security.args.args
+    let export_args = parse_cli_argv(args)?;
+    let inputs = resolve_inputs(&export_args.input)?;
     let mut df = canonical_frame(&inputs)?;
     let csv = to_csv(&mut df)?;
 
-    if output_file == "-" {
+    if export_args.output.as_os_str() == OsStr::new("-") {
         print!("{csv}");
     } else {
-        write_csv_atomically(Path::new(output_file), &csv)?;
+        write_csv_atomically(&export_args.output, &csv)?;
         println!(
             "Exported {} rows from {} batch(es) to {}",
             df.height(),
             inputs.len(),
-            output_file
+            export_args.output.display()
         );
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_args_requires_an_input_path() {
+        let error = parse_cli_argv(vec!["export_csv".to_owned()]).unwrap_err();
+        assert!(error.to_string().contains("Usage: export_csv"));
+    }
+
+    #[test]
+    fn parse_args_defaults_output_to_stdout() {
+        let args = parse_cli_argv(vec!["export_csv".to_owned(), "session".to_owned()]).unwrap();
+        assert_eq!(args.input, PathBuf::from("session"));
+        assert_eq!(args.output, PathBuf::from("-"));
+    }
+
+    #[test]
+    fn parse_args_preserves_explicit_output_path() {
+        let args = parse_cli_argv(vec![
+            "export_csv".to_owned(),
+            "session".to_owned(),
+            "out.csv".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(args.output, PathBuf::from("out.csv"));
+    }
+
+    #[test]
+    fn parse_args_rejects_surplus_operands() {
+        let error = parse_cli_argv(vec![
+            "export_csv".to_owned(),
+            "session".to_owned(),
+            "out.csv".to_owned(),
+            "unexpected".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("Usage: export_csv"));
+    }
 }

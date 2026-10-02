@@ -26,8 +26,9 @@ Steam/Proton discovery or mod scanner, and graphics settings are an operator che
 - Feature `query` (off by default) compiles bundled DuckDB from C++ source, which is the dominant
   build time and RAM cost.
 - **GPU:** `nvml-wrapper` loads NVML at runtime, so it builds and tests without a GPU (CI runs on
-  hosted runners with no GPU). Real NVML readings need an NVIDIA GPU and driver. Without one,
-  sensor columns are null.
+  hosted runners with no GPU). Running the collector needs an NVIDIA GPU and driver: without them
+  it exits at startup (`Nvml::init()?` in `src/main.rs`). Columns are null only when an individual
+  sensor read fails.
 
 ## Commands (from `.github/workflows/ci.yml`)
 
@@ -47,7 +48,7 @@ Run the collector: `SESSION_LABEL=<label> cargo run --release --bin gaming-telem
 
 ## Conventions visible in the repo
 
-- A sensor column that wasn't measured is **null**, never `0`. Don't record fabricated zeros
+- A sensor column that wasn't measured is **null**, not `0`. Don't record fabricated zeros
   (README "Missing measurements"). `session_label` and `timestamp_ms` stay required.
 - Rust sources carry SPDX license identifier headers.
 - `CHANGELOG.md` is maintained. Commit subjects follow Conventional Commits with scopes

@@ -1,5 +1,5 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
-# Draft CodeRabbit config for rmems/gaming-telemetry (generated locally, not pushed).
+# CodeRabbit config for rmems/gaming-telemetry.
 language: en-US
 reviews:
   profile: chill

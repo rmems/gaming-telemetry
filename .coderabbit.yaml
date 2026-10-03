@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit config for rmems/gaming-telemetry.
+language: en-US
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  fail_commit_status: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+  - '!**/target/**'
+  path_instructions:
+  - path: '**/*.rs'
+    instructions: 'Rust edition 2024; `rust-version = "1.98.0"` and `rust-toolchain.toml` pins 1.98.0 (CI asserts they are equal). Do not suggest downgrading the edition or using std/language APIs newer than the pinned toolchain/MSRV. CI gate: `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --locked [--all-features]`, `cargo build --locked --release`. Flag anything that would fail `cargo fmt --check` or clippy `-D warnings`. NVML is loaded at runtime through nvml-wrapper and CI has no GPU: missing NVML/driver must be a handled error, never a panic, and tests must not require a GPU.'
+  - path: '**/Cargo.toml'
+    instructions: Cargo manifest. Call out new dependencies and feature changes, and keep `rust-version` / `edition` consistent with CI. `rust-version` must stay equal to the `rust-toolchain.toml` channel; CI checks this.
+  - path: build.rs
+    instructions: Build script must not probe for a GPU or NVIDIA driver.
+  - path: .github/workflows/**
+    instructions: GitHub Actions workflows. Keep `permissions:` least-privilege and job commands in sync with the local gates documented in the repo. Every `uses:` is pinned to a full commit SHA today; new or bumped actions must be too.
+  tools:
+    clippy:
+      enabled: true
+    actionlint:
+      enabled: true
+    yamllint:
+      enabled: true
+    markdownlint:
+      enabled: true

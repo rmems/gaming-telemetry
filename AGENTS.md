@@ -43,13 +43,14 @@ cargo build --locked --release
 cargo build --locked --all-features --bin gaming-telemetry --bin export_csv --bin query
 ```
 
-Run the collector: `SESSION_LABEL=<label> cargo run --release --bin gaming-telemetry`
+Run the collector: `SESSION_LABEL=my-session cargo run --release --bin gaming-telemetry`
 (`SESSION_DIR` optionally sets the output directory).
 
 ## Conventions visible in the repo
 
 - A sensor column that wasn't measured is **null**, not `0`. Don't record fabricated zeros
   (README "Missing measurements"). `session_label` and `timestamp_ms` stay required.
-- Rust sources carry SPDX license identifier headers.
-- `CHANGELOG.md` is maintained. Commit subjects follow Conventional Commits with scopes
-  (`fix(privacy):`, `feat(export):`) and the PR number.
+- Most Rust sources carry SPDX license identifier headers; `build.rs` and
+  `src/manifest_failure_tests.rs` currently do not.
+- `CHANGELOG.md` is maintained. Commit subjects follow Conventional Commits; scopes
+  (`fix(privacy):`, `feat(export):`) and PR numbers are optional.

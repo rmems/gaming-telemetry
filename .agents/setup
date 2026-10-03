@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Amp orb setup for gaming-telemetry.
+#
+# Amp runs this from the repository root when it builds a project orb snapshot
+# (Debian 12, CPU only: orbs have no GPU). It must finish within 20 minutes and
+# be safe to run more than once. See https://ampcode.com/docs/orbs/customizing
+#
+# Installs only what this repo's CI and manifests need:
+#   - apt: build-essential, pkg-config, cmake, curl, ca-certificates
+#   - Rust 1.98.0 (+rustfmt, clippy) [default]
+#   - cargo fetch --locked
+#   - tool directories exposed to later shells (/etc/profile.d + /usr/local/bin links)
+#
+# It ends with a dependency fetch/prebuild, not a test run.
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+SUDO="env"
+if [ "$(id -u)" -ne 0 ]; then
+  SUDO="sudo"
+fi
+
+# Install Debian packages that are not already present.
+apt_install() {
+  local missing=() pkg
+  for pkg in "$@"; do
+    if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+      missing+=("$pkg")
+    fi
+  done
+  if [ "${#missing[@]}" -gt 0 ]; then
+    if ! "$SUDO" apt-get -o Acquire::Retries=5 update -qq; then
+      echo "apt-get update failed; cannot install: ${missing[*]}" >&2
+      return 1
+    fi
+    "$SUDO" env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends "${missing[@]}"
+  fi
+}
+
+# --- System packages (C/C++ toolchain for bundled DuckDB; curl for rustup) ---
+apt_install build-essential pkg-config cmake curl ca-certificates
+
+# --- Rust (rustup) ---
+export PATH="$HOME/.cargo/bin:$PATH"
+if ! command -v rustup >/dev/null 2>&1; then
+  RUSTUP_INIT_VERSION="1.28.2"
+  RUSTUP_INIT_SHA256="20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c"
+  rustup_init_dir="$(mktemp -d)"
+  rustup_init="$rustup_init_dir/rustup-init"
+  trap 'rm -rf "$rustup_init_dir"' EXIT
+  curl --proto '=https' --tlsv1.2 --fail --location --show-error \
+    "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/x86_64-unknown-linux-gnu/rustup-init" \
+    --output "$rustup_init"
+  echo "${RUSTUP_INIT_SHA256}  ${rustup_init}" | sha256sum --check --status || {
+    echo "rustup-init checksum verification failed" >&2
+    exit 1
+  }
+  chmod +x "$rustup_init"
+  "$rustup_init" -y --default-toolchain none --profile minimal
+fi
+# rust-toolchain.toml and every ci.yml job pin 1.98.0.
+RUST_TOOLCHAIN="1.98.0"
+rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+rustup default "$RUST_TOOLCHAIN"
+
+# --- Prefetch crates (no build, no tests) ---
+cargo fetch --locked
+
+# --- Expose the tools to later shells ---
+# The PATH exports above last only for this script; Amp starts the agent's shell
+# separately. Login shells get these directories from /etc/profile.d, and every other
+# shell finds the entry points through symlinks in /usr/local/bin (on the default PATH).
+tool_dirs=("$HOME/.cargo/bin")
+# shellcheck disable=SC2016 # $PATH must expand when the profile is sourced, not now.
+printf 'export PATH="%s:$PATH"\n' "$(IFS=:; echo "${tool_dirs[*]}")" |
+  "$SUDO" tee /etc/profile.d/amp-orb-gaming-telemetry.sh >/dev/null
+for name in cargo rustc rustup rustfmt cargo-clippy clippy-driver; do
+  tool="$HOME/.cargo/bin/$name"
+  if [ -f "$tool" ] && [ -x "$tool" ]; then
+    "$SUDO" ln -sfn "$tool" "/usr/local/bin/$name"
+  fi
+done
+
+echo "Amp orb setup for gaming-telemetry finished."

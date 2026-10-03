@@ -20,11 +20,11 @@ jobs:
           components: rustfmt
           toolchain: "1.98.0"
       - name: MSRV pin matches Cargo.toml
-        # The toolchain version lives in Cargo.toml, rust-toolchain.toml and every
-        # job below. Parse the workflow as YAML rather than pattern-matching it: a
-        # regex keyed to one quoting style silently skips `toolchain: stable` or
-        # `toolchain: 'stable'`, and the guard then passes on the entries it did
-        # match -- failing open exactly when a job has drifted.
+        # The toolchain version lives in Cargo.toml, rust-toolchain.toml, the Amp
+        # setup script, and every job below. Parse the workflow as YAML rather than
+        # pattern-matching it: a regex keyed to one quoting style silently skips
+        # `toolchain: stable` or `toolchain: 'stable'`, and the guard then passes on
+        # the entries it did match -- failing open exactly when a job has drifted.
         run: |
           set -euo pipefail
           python3 - <<'GUARD'
@@ -43,9 +43,13 @@ jobs:
 
           declared = scalar("Cargo.toml", r'^rust-version\s*=\s*"([^"]+)"')
           pinned = scalar("rust-toolchain.toml", r'^channel\s*=\s*"([^"]+)"')
-          print(f"Cargo.toml rust-version={declared}  rust-toolchain.toml channel={pinned}")
-          if declared != pinned:
-              sys.exit(f"::error::MSRV drift: Cargo.toml {declared}, rust-toolchain.toml {pinned}")
+          setup = scalar(".agents/setup", r'^RUST_TOOLCHAIN="([^"]+)"')
+          print(f"Cargo.toml rust-version={declared}  rust-toolchain.toml channel={pinned}  .agents/setup={setup}")
+          if len({declared, pinned, setup}) != 1:
+              sys.exit(
+                  f"::error::MSRV drift: Cargo.toml {declared}, "
+                  f"rust-toolchain.toml {pinned}, .agents/setup {setup}"
+              )
 
           workflow = yaml.safe_load(open(".github/workflows/ci.yml", encoding="utf-8"))
           pins = [

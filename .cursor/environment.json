@@ -1,0 +1,4 @@
+{
+  "name": "gaming-telemetry",
+  "install": "bash .cursor/install.sh"
+}

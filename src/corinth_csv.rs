@@ -20,8 +20,14 @@
 //!   counted per column in [`ExportReport`].
 //! - Anything that indicates corrupt or mis-specified input is a hard error:
 //!   a missing source column, a source column with the wrong type (and therefore
-//!   possibly the wrong unit), a non-finite reading, a negative timestamp,
-//!   timestamps that are not strictly increasing, or zero usable rows.
+//!   possibly the wrong unit), a non-finite reading, a null or negative
+//!   timestamp, a timestamp that steps *backward*, or zero usable rows.
+//! - A timestamp *equal* to the previous one (two polls inside one wall-clock
+//!   millisecond, e.g. after a late tick or at `POLL_INTERVAL_MS=1`) is not
+//!   corruption: the later row is excluded and counted in
+//!   [`ExportReport::excluded_duplicate_timestamp`], never shifted.
+//!   The upstream contract itself has no ordering rule; these two rules are
+//!   producer-side so the published series is strictly increasing.
 //! - The rendered CSV is re-parsed with [`parse_csv`] (the upstream reader
 //!   semantics) and must round-trip with zero skipped rows before it is
 //!   returned.
@@ -131,6 +137,8 @@ pub struct ExportReport {
     pub source_rows: usize,
     pub rows_written: usize,
     pub excluded_unmeasured: ExcludedRows,
+    /// Rows dropped because their timestamp equalled the previous row's.
+    pub excluded_duplicate_timestamp: usize,
 }
 
 /// A rendered, self-validated corinth CSV plus its report.
@@ -204,17 +212,92 @@ fn finite(value: Option<f32>, column: &str, path: &Path, row: usize) -> Result<O
     }
 }
 
-/// Build the corinth CSV from Parquet batches, already in batch order.
-pub fn export(paths: &[PathBuf]) -> Result<CorinthExport> {
-    anyhow::ensure!(!paths.is_empty(), "no Parquet batches to export");
+/// The four sensor readings of one source row; `None` means not measured.
+type Readings = (Option<f32>, Option<f32>, Option<f32>, Option<f32>);
 
-    let mut rows: Vec<CorinthRow> = Vec::new();
-    let mut excluded = ExcludedRows::default();
-    let mut source_rows = 0usize;
-    let mut previous: Option<i64> = None;
+/// Accumulates contract rows across batches, enforcing the per-row gates.
+#[derive(Default)]
+struct Collector {
+    rows: Vec<CorinthRow>,
+    excluded: ExcludedRows,
+    duplicate_timestamps: usize,
+    source_rows: usize,
+    batches: usize,
+    /// Last accepted timestamp: every non-duplicate row with a valid timestamp,
+    /// including rows later excluded for an unmeasured sensor, so a backward
+    /// step cannot hide behind an excluded row.
+    previous: Option<i64>,
+}
 
-    for path in paths {
+/// How a valid timestamp relates to the previous accepted one.
+enum Order {
+    Next(u64),
+    Duplicate,
+}
+
+impl Collector {
+    /// Validate one timestamp and advance the ordering cursor.
+    ///
+    /// Order matters: null and negative are rejected *before* the ordering
+    /// check, so a negative value is always reported as negative (not as a
+    /// backward step) and never becomes the cursor. A tie is a duplicate (row
+    /// excluded); a backward step is a broken timeline (hard error). Neither
+    /// error names a path.
+    fn timestamp(&mut self, value: Option<i64>, row: usize) -> Result<Order> {
+        let at = format!(
+            "row {} (batch #{}, row {row})",
+            self.source_rows, self.batches
+        );
+        let Some(timestamp) = value else {
+            anyhow::bail!("{at}: timestamp_ms is null; it is required on every row");
+        };
+        let timestamp_ms = u64::try_from(timestamp).map_err(|_| {
+            anyhow::anyhow!(
+                "{at}: timestamp_ms {timestamp} is negative and not a valid u64 \
+                 epoch-millisecond value"
+            )
+        })?;
+        match self.previous {
+            Some(previous) if timestamp == previous => return Ok(Order::Duplicate),
+            Some(previous) if timestamp < previous => anyhow::bail!(
+                "{at}: timestamp_ms {timestamp} steps backward by {} ms from the previous \
+                 {previous}; the timeline is broken, usually by an NTP or wall-clock step \
+                 during capture. Split the session at this point before exporting",
+                previous - timestamp
+            ),
+            _ => {}
+        }
+        self.previous = Some(timestamp);
+        Ok(Order::Next(timestamp_ms))
+    }
+
+    /// Keep a fully measured row; count a partially measured one per column.
+    fn record(&mut self, timestamp_ms: u64, readings: Readings) {
+        match readings {
+            (Some(gpu_temp_c), Some(gpu_power_w), Some(cpu_tctl_c), Some(cpu_package_power_w)) => {
+                self.rows.push(CorinthRow {
+                    timestamp_ms,
+                    gpu_temp_c,
+                    gpu_power_w,
+                    cpu_tctl_c,
+                    cpu_package_power_w,
+                });
+            }
+            (a, b, c, d) => {
+                let excluded = &mut self.excluded;
+                excluded.rows += 1;
+                excluded.gpu_temp_c += usize::from(a.is_none());
+                excluded.gpu_power_w += usize::from(b.is_none());
+                excluded.cpu_tctl_c += usize::from(c.is_none());
+                excluded.cpu_package_power_w += usize::from(d.is_none());
+            }
+        }
+    }
+
+    /// Read one batch and feed every row through the gates.
+    fn batch(&mut self, path: &Path) -> Result<()> {
         let frame = read_batch(path)?;
+        self.batches += 1;
         let column = |name: &str| frame.column(name).map_err(redacted);
         let timestamps = column("timestamp_ms")?.i64().map_err(redacted)?;
         let temps = column("temperature_c")?.u32().map_err(redacted)?;
@@ -223,77 +306,63 @@ pub fn export(paths: &[PathBuf]) -> Result<CorinthExport> {
         let package = column("cpu_package_power_w")?.f32().map_err(redacted)?;
 
         for row in 0..frame.height() {
-            source_rows += 1;
-
-            let Some(timestamp) = timestamps.get(row) else {
-                anyhow::bail!(
-                    "batch {} row {row}: timestamp_ms is null; it is required on every row",
-                    redact(path)
-                );
+            let order = self.timestamp(timestamps.get(row), row)?;
+            self.source_rows += 1;
+            let Order::Next(timestamp_ms) = order else {
+                self.duplicate_timestamps += 1;
+                continue;
             };
-            let timestamp_ms = u64::try_from(timestamp).map_err(|_| {
-                anyhow::anyhow!(
-                    "batch {} row {row}: timestamp_ms {timestamp} is negative and not a valid \
-                     u64 epoch-millisecond value",
-                    redact(path)
-                )
-            })?;
-            if let Some(previous) = previous {
-                anyhow::ensure!(
-                    timestamp > previous,
-                    "batch {} row {row}: timestamp_ms {timestamp} does not follow the previous \
-                     {previous}; timestamps must be strictly increasing across the export",
-                    redact(path)
-                );
-            }
-            previous = Some(timestamp);
-
-            // u32 -> f32 is exact below 2^24, far above any die temperature.
-            let gpu_temp_c = temps.get(row).map(|t| t as f32);
-            // The only unit conversion: integer milliwatts to watts, in f64
-            // before narrowing so the f32 is the nearest one to the exact value.
-            let gpu_power_w = power_mw.get(row).map(|mw| (f64::from(mw) / 1000.0) as f32);
-            let cpu_tctl_c = finite(tctl.get(row), "cpu_tctl_c", path, row)?;
-            let cpu_package_power_w = finite(package.get(row), "cpu_package_power_w", path, row)?;
-
-            match (gpu_temp_c, gpu_power_w, cpu_tctl_c, cpu_package_power_w) {
-                (
-                    Some(gpu_temp_c),
-                    Some(gpu_power_w),
-                    Some(cpu_tctl_c),
-                    Some(cpu_package_power_w),
-                ) => {
-                    rows.push(CorinthRow {
-                        timestamp_ms,
-                        gpu_temp_c,
-                        gpu_power_w,
-                        cpu_tctl_c,
-                        cpu_package_power_w,
-                    });
-                }
-                (a, b, c, d) => {
-                    excluded.rows += 1;
-                    excluded.gpu_temp_c += usize::from(a.is_none());
-                    excluded.gpu_power_w += usize::from(b.is_none());
-                    excluded.cpu_tctl_c += usize::from(c.is_none());
-                    excluded.cpu_package_power_w += usize::from(d.is_none());
-                }
-            }
+            let readings = (
+                // u32 -> f32 is exact below 2^24, far above any die temperature.
+                temps.get(row).map(|t| t as f32),
+                // The only unit conversion: integer milliwatts to watts, in f64
+                // before narrowing so the f32 is the nearest one to the exact value.
+                power_mw.get(row).map(|mw| (f64::from(mw) / 1000.0) as f32),
+                finite(tctl.get(row), "cpu_tctl_c", path, row)?,
+                finite(package.get(row), "cpu_package_power_w", path, row)?,
+            );
+            self.record(timestamp_ms, readings);
         }
+        Ok(())
     }
 
-    anyhow::ensure!(
-        !rows.is_empty(),
-        "no usable rows: all {source_rows} source row(s) have at least one unmeasured sensor \
-         (nulls: gpu_temp_c={}, gpu_power_w={}, cpu_tctl_c={}, cpu_package_power_w={}); the \
-         corinth contract requires every field and missing readings are never zero-filled",
-        excluded.gpu_temp_c,
-        excluded.gpu_power_w,
-        excluded.cpu_tctl_c,
-        excluded.cpu_package_power_w
-    );
+    /// Refuse an export in which every row was excluded.
+    fn ensure_usable(&self) -> Result<()> {
+        let excluded = &self.excluded;
+        anyhow::ensure!(
+            !self.rows.is_empty(),
+            "no usable rows: all {} source row(s) were excluded (duplicate timestamps={}; \
+             nulls: gpu_temp_c={}, gpu_power_w={}, cpu_tctl_c={}, cpu_package_power_w={}); \
+             the corinth contract requires every field and missing readings are never \
+             zero-filled",
+            self.source_rows,
+            self.duplicate_timestamps,
+            excluded.gpu_temp_c,
+            excluded.gpu_power_w,
+            excluded.cpu_tctl_c,
+            excluded.cpu_package_power_w
+        );
+        Ok(())
+    }
 
-    let csv = format_csv(&rows);
+    fn report(self, batches: usize) -> ExportReport {
+        ExportReport {
+            contract_source: CONTRACT_SOURCE,
+            contract_revision: CONTRACT_REVISION,
+            validator: VALIDATOR_VERSION,
+            header: HEADER,
+            batches,
+            source_rows: self.source_rows,
+            rows_written: self.rows.len(),
+            excluded_unmeasured: self.excluded,
+            excluded_duplicate_timestamp: self.duplicate_timestamps,
+        }
+    }
+}
+
+/// Render rows and prove the result round-trips through the contract reader.
+fn render_verified(rows: &[CorinthRow]) -> Result<String> {
+    let csv = format_csv(rows);
     let parsed = parse_csv(&csv).context("self-check: rendered CSV failed the contract header")?;
     anyhow::ensure!(
         parsed.skipped == 0 && parsed.rows == rows,
@@ -303,19 +372,28 @@ pub fn export(paths: &[PathBuf]) -> Result<CorinthExport> {
         rows.len(),
         parsed.skipped
     );
+    anyhow::ensure!(
+        parsed
+            .rows
+            .windows(2)
+            .all(|pair| pair[0].timestamp_ms < pair[1].timestamp_ms),
+        "self-check: rendered CSV timestamps are not strictly increasing"
+    );
+    Ok(csv)
+}
 
+/// Build the corinth CSV from Parquet batches, already in batch order.
+pub fn export(paths: &[PathBuf]) -> Result<CorinthExport> {
+    anyhow::ensure!(!paths.is_empty(), "no Parquet batches to export");
+    let mut collector = Collector::default();
+    for path in paths {
+        collector.batch(path)?;
+    }
+    collector.ensure_usable()?;
+    let csv = render_verified(&collector.rows)?;
     Ok(CorinthExport {
         csv,
-        report: ExportReport {
-            contract_source: CONTRACT_SOURCE,
-            contract_revision: CONTRACT_REVISION,
-            validator: VALIDATOR_VERSION,
-            header: HEADER,
-            batches: paths.len(),
-            source_rows,
-            rows_written: rows.len(),
-            excluded_unmeasured: excluded,
-        },
+        report: collector.report(paths.len()),
     })
 }
 

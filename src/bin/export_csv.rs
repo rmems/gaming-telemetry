@@ -7,8 +7,10 @@
 //! - **default: corinth ingest** — the frozen five-column vahtisiru telemetry
 //!   CSV contract (`gaming_telemetry::corinth_csv`). Rows with an unmeasured
 //!   sensor are excluded and counted (never zero-filled); corrupt input fails the
-//!   export. A contract report (source, revision, row counts) is printed to
-//!   stderr and, for a file output, written beside it as `<output>.contract.json`.
+//!   export with a non-zero exit before anything is printed, on stdout or file
+//!   output alike. For a file output, a contract report (source, revision, row
+//!   counts) is written beside it as `<output>.contract.json` and echoed to
+//!   stderr; stdout output carries the CSV only.
 //! - **`--labelled`** — the six-column session-labelled CSV for multi-title
 //!   datasets. Unmeasured sensors are empty cells. Not corinth-ingestible.
 //!
@@ -115,8 +117,8 @@ fn run() -> Result<()> {
                     inputs.len(),
                     shown()
                 );
+                eprintln!("{report}");
             }
-            eprintln!("{report}");
         }
         Artifact::Labelled => {
             let mut df = labelled_frame(&inputs)?;

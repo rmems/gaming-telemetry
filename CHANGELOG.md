@@ -16,7 +16,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`,
   excludes and counts rows with any unmeasured sensor (never zero-fills), and
   fails the export on a missing or retyped source column, `NaN`/`inf`, a null or
-  negative timestamp, non-increasing timestamps, or zero usable rows. Every
+  negative timestamp, a backward timestamp step (usually an NTP/clock step), or
+  zero usable rows. An equal-millisecond tie is excluded and counted
+  (`excluded_duplicate_timestamp`), not fatal. Every
   export is round-tripped through the contract reader before it is returned, and
   a `<output>.contract.json` report records the contract source, pinned upstream
   revision, and exclusion counts.

@@ -222,16 +222,33 @@ missing reading is never zero-filled, so a row with any unmeasured sensor is
 **excluded** and counted per column in the export report. Expect at least one
 excluded row per collector run (the first RAPL poll has no power delta).
 
-The export **fails** — no file is written — on: a batch missing a source column,
-a source column with a different type (the type pins the unit), `NaN`/`inf`
-readings, a null or negative timestamp, timestamps that are not strictly
-increasing across the whole export, or zero usable rows (for example, a session
-where RAPL was unreadable throughout). Before returning, the rendered CSV is
-re-parsed with the contract reader and must round-trip with zero skipped rows.
+The export **fails** with a non-zero exit, writing nothing (to a file or
+stdout), on: a batch missing a source column, a source column with a different
+type (the type pins the unit), `NaN`/`inf` readings, a null or negative
+timestamp, a timestamp that steps **backward**, or zero usable rows (for
+example, a session where RAPL was unreadable throughout).
 
-The export report (contract source, revision, row and exclusion counts; no paths
-or labels) is printed to stderr and, for a file output, written beside it as
-`<output>.contract.json`.
+Timestamps are wall-clock milliseconds, and two producer-side ordering rules
+apply across the whole export. The upstream contract itself has no ordering
+rule, and corinth replay rewrites `timestamp_ms` per tick:
+
+- **Equal millisecond** (a row whose timestamp equals the previous row's): the
+  later row is excluded and counted as `excluded_duplicate_timestamp`. It is
+  never shifted. This is normal: two polls can land in one millisecond after a
+  late tick, or with `POLL_INTERVAL_MS=1`.
+- **Backward step** (`timestamp_ms` lower than the previous row's): a hard
+  error that names the row and the step size. The timeline is broken, which is
+  usually an NTP or wall-clock step during a long capture. Split the session at
+  that point before exporting.
+
+Before returning, the rendered CSV is re-parsed with the contract reader. It
+must round-trip exactly, with zero skipped rows and strictly increasing
+timestamps.
+
+For a file output, the export report (contract source, revision, row and
+exclusion counts; no paths or labels) is written beside the CSV as
+`<output>.contract.json` and echoed to stderr. Stdout output (`-`) carries the
+CSV only.
 
 #### Session-labelled CSV (`--labelled`)
 

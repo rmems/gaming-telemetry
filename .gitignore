@@ -50,3 +50,5 @@ remotes.txt
 # Generated telemetry batches (collector writes to CWD by default)
 *.parquet
 *.csv
+# Contract fixtures are source, not generated output.
+!tests/fixtures/**/*.csv

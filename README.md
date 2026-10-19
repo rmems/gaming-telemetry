@@ -165,10 +165,18 @@ collection stopped, before any remaining batch writes are drained.
 The manifest deliberately records no usernames, home paths, Steam identifiers, or machine
 inventory — only hardware model names.
 
-### 2. Export canonical CSV for `corinth-canal`
+### 2. Export CSV
 
-Point it at the **session directory** to export every batch, in batch order, under
-a single header:
+`export_csv` produces one of two **different** artifacts. Only the default one is
+corinth-ingestible.
+
+| Artifact | Command | Header | Unmeasured sensor | For |
+|---|---|---|---|---|
+| **corinth ingest** (default) | `export_csv <in> [out.csv]` | frozen 5 columns | row excluded and counted | `corinth-canal` replay |
+| session-labelled | `export_csv --labelled <in> [out.csv]` | 5 columns + `session_label` | empty cell | multi-title datasets |
+
+Point either at the **session directory** to export every batch, in batch order,
+under a single header:
 
 ```bash
 cargo run --bin export_csv -- "$SESSION_DIR" canonical.csv
@@ -185,18 +193,55 @@ A single batch file still works, for spot checks:
 cargo run --bin export_csv -- "$SESSION_DIR/gpu_telemetry_v2_batch_1.parquet" -
 ```
 
-Header:
+Batches are ordered numerically, so `batch_10` follows `batch_2`. A shell glob
+would order them lexically and silently scramble the time series.
+
+#### corinth-ingest CSV (default)
+
+Conforms to the frozen hardware-telemetry CSV contract hosted in
+[`rmems/vahtisiru` `docs/telemetry_csv.md`](https://github.com/rmems/vahtisiru/blob/main/docs/telemetry_csv.md)
+(RM-629). There is no Cargo dependency on vahtisiru; the semantics are copied
+into `src/corinth_csv.rs` and pinned by upstream commit
+(`corinth_csv::CONTRACT_REVISION`) and vendored conformance fixtures in
+`tests/fixtures/vahtisiru_telemetry_csv/`.
+
+Header, exactly — no sixth column:
+
+`timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`
+
+| Column | Type | Source batch column |
+|---|---|---|
+| `timestamp_ms` | `u64`, Unix-epoch ms | `timestamp_ms` (`i64`) |
+| `gpu_temp_c` | finite `f32`, °C | `temperature_c` (`u32`) |
+| `gpu_power_w` | finite `f32`, W | `power_usage_mw` (`u32`) / 1000 — the only unit conversion |
+| `cpu_tctl_c` | finite `f32`, °C | `cpu_tctl_c` (`f32`) |
+| `cpu_package_power_w` | finite `f32`, W | `cpu_package_power_w` (`f32`) |
+
+Every field is required. The contract cannot represent "not measured", and a
+missing reading is never zero-filled, so a row with any unmeasured sensor is
+**excluded** and counted per column in the export report. Expect at least one
+excluded row per collector run (the first RAPL poll has no power delta).
+
+The export **fails** — no file is written — on: a batch missing a source column,
+a source column with a different type (the type pins the unit), `NaN`/`inf`
+readings, a null or negative timestamp, timestamps that are not strictly
+increasing across the whole export, or zero usable rows (for example, a session
+where RAPL was unreadable throughout). Before returning, the rendered CSV is
+re-parsed with the contract reader and must round-trip with zero skipped rows.
+
+The export report (contract source, revision, row and exclusion counts; no paths
+or labels) is printed to stderr and, for a file output, written beside it as
+`<output>.contract.json`.
+
+#### Session-labelled CSV (`--labelled`)
 
 `timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w,session_label`
 
-- `gpu_power_w` is `power_usage_mw / 1000.0` — the only unit conversion.
-- `session_label` is appended **last**, so a consumer reading the original five
-  columns positionally keeps working while multi-title captures become separable.
+- **Not corinth-ingestible**: the trailing `session_label` is a header mismatch
+  under the frozen contract, and the vahtisiru reader rejects the file.
 - `gpu_temp_c`, `gpu_power_w`, `cpu_tctl_c`, and `cpu_package_power_w` are empty
   when no valid measurement was obtained for that sample — see
   [Missing measurements](#missing-measurements-null-vs-0).
-- Batches are ordered numerically, so `batch_10` follows `batch_2`. A shell glob
-  would order them lexically and silently scramble the time series.
 
 ## Missing measurements (null vs 0)
 
@@ -286,7 +331,7 @@ cargo run --features query --bin query -- "$SESSION_DIR/gpu_telemetry_v2_batch_1
 ## Replay contract
 
 ```text
-collector -> neuromorphic_data/<session>/gpu_telemetry_v2_batch_N.parquet -> export_csv -> canonical.csv -> corinth-canal/examples/csv_replay
+collector -> neuromorphic_data/<session>/gpu_telemetry_v2_batch_N.parquet -> export_csv (corinth default) -> canonical.csv -> corinth-canal/examples/csv_replay
 ```
 
 ```bash
@@ -294,7 +339,12 @@ collector -> neuromorphic_data/<session>/gpu_telemetry_v2_batch_N.parquet -> exp
 cargo run --example csv_replay --manifest-path path/to/corinth-canal/Cargo.toml -- canonical.csv
 ```
 
-For multi-title training mixes, group by Parquet `session_label` (or by folder under `neuromorphic_data/`).
+Producers can also check the file with the upstream standalone validator,
+`vahtisiru-telemetry-csv canonical.csv` (exit 0 = contract-valid with at least
+one usable row).
+
+For multi-title training mixes, group by Parquet `session_label` (or by folder
+under `neuromorphic_data/`), or use `export_csv --labelled`.
 
 ## Operator checklist (not code)
 

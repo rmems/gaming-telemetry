@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Canonical CSV projection over a session's Parquet batches.
+//! Session-labelled CSV projection over a session's Parquet batches, plus the
+//! batch discovery and atomic-write helpers both CSV artifacts share.
 //!
-//! This is the contract with downstream replay (`corinth-canal`). It lives in the
-//! library rather than inside `bin/export_csv.rs` so the column set and the batch
-//! ordering are testable, instead of only being exercised by running the binary.
+//! The six-column labelled projection here is **not** the corinth-ingest
+//! contract: its trailing `session_label` column is a header mismatch under the
+//! frozen vahtisiru telemetry CSV schema, and it writes unmeasured sensors as
+//! empty cells, which that reader skips. Use [`crate::corinth_csv`] for corinth.
+//! This artifact exists for multi-title datasets that need the label per row.
 
 use anyhow::{Context, Result};
 // Imported by name, not by glob: `polars::prelude::*` brings its own `Context`
@@ -21,12 +24,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::privacy::redact_personal_path;
 use crate::session::{BATCH_PREFIX, BATCH_SUFFIX};
 
-/// Columns emitted by the canonical export, in order.
+/// Columns emitted by the session-labelled export, in order.
 ///
-/// `session_label` is appended last so a consumer reading the original five
-/// positionally keeps working, while multi-title captures become separable — the
-/// whole point of recording the label in the first place.
-pub const CANONICAL_COLUMNS: [&str; 6] = [
+/// `session_label` is appended last so multi-title captures stay separable.
+/// This is not the corinth header — see [`crate::corinth_csv::HEADER`].
+pub const LABELLED_COLUMNS: [&str; 6] = [
     "timestamp_ms",
     "gpu_temp_c",
     "gpu_power_w",
@@ -118,8 +120,8 @@ pub fn resolve_inputs(path: &Path) -> Result<Vec<PathBuf>> {
     }
 }
 
-/// The canonical projection applied to one already-scanned batch.
-fn canonical_projection(frame: LazyFrame) -> LazyFrame {
+/// The labelled projection applied to one already-scanned batch.
+fn labelled_projection(frame: LazyFrame) -> LazyFrame {
     frame.select(&[
         col("timestamp_ms"),
         col("temperature_c").alias("gpu_temp_c"),
@@ -131,7 +133,7 @@ fn canonical_projection(frame: LazyFrame) -> LazyFrame {
     ])
 }
 
-/// Scan one batch and apply the canonical projection, with the path named in
+/// Scan one batch and apply the labelled projection, with the path named in
 /// every error this step can raise.
 fn scan_and_project(path: &Path) -> Result<LazyFrame> {
     let scanned = LazyFrame::scan_parquet(
@@ -150,11 +152,11 @@ fn scan_and_project(path: &Path) -> Result<LazyFrame> {
             redact_personal_path(&path.display().to_string())
         )
     })?;
-    Ok(canonical_projection(scanned))
+    Ok(labelled_projection(scanned))
 }
 
 /// Redacted, comma-joined batch paths, for schema-shaped failures that polars
-/// itself cannot attribute to a specific batch (see `canonical_frame`).
+/// itself cannot attribute to a specific batch (see `labelled_frame`).
 fn redacted_batch_list(paths: &[PathBuf]) -> String {
     paths
         .iter()
@@ -163,7 +165,7 @@ fn redacted_batch_list(paths: &[PathBuf]) -> String {
         .join(", ")
 }
 
-/// Build the canonical frame for a whole session, in batch order.
+/// Build the session-labelled frame for a whole session, in batch order.
 ///
 /// Concatenating projected frames (rather than projecting a concatenation) keeps
 /// each batch's own schema local, so an IO-shaped failure (missing file,
@@ -173,7 +175,7 @@ fn redacted_batch_list(paths: &[PathBuf]) -> String {
 /// lazily at `concat`/`collect` instead, where polars names no path or column;
 /// the batch count and list are attached here so directory-mode failures are
 /// still attributable to *a* batch, even when polars itself cannot say which one.
-pub fn canonical_frame(paths: &[PathBuf]) -> Result<DataFrame> {
+pub fn labelled_frame(paths: &[PathBuf]) -> Result<DataFrame> {
     anyhow::ensure!(!paths.is_empty(), "no Parquet batches to export");
 
     let mut frames: Vec<LazyFrame> = Vec::with_capacity(paths.len());
@@ -198,7 +200,7 @@ pub fn canonical_frame(paths: &[PathBuf]) -> Result<DataFrame> {
 
     combined.collect().map_err(redacted).with_context(|| {
         format!(
-            "failed to build the canonical export frame from [{}]",
+            "failed to build the labelled export frame from [{}]",
             redacted_batch_list(paths)
         )
     })
@@ -286,7 +288,7 @@ fn redacted(error: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!(redact_personal_path(&error.to_string()))
 }
 
-/// Render the canonical frame as CSV with a single header row.
+/// Render the labelled frame as CSV with a single header row.
 pub fn to_csv(frame: &mut DataFrame) -> Result<String> {
     let mut buffer = Vec::new();
     CsvWriter::new(&mut buffer)
@@ -352,21 +354,21 @@ mod tests {
     }
 
     #[test]
-    fn canonical_columns_include_the_session_label_last() {
+    fn labelled_columns_include_the_session_label_last() {
         let dir = fixture_dir("columns");
         write_batch(&dir, 1, &[10, 20], "kcd2");
 
-        let mut df = canonical_frame(&batch_files_in(&dir).unwrap()).unwrap();
+        let mut df = labelled_frame(&batch_files_in(&dir).unwrap()).unwrap();
         let names: Vec<String> = df
             .get_column_names()
             .iter()
             .map(|n| n.to_string())
             .collect();
-        assert_eq!(names, CANONICAL_COLUMNS);
+        assert_eq!(names, LABELLED_COLUMNS);
 
         let csv = to_csv(&mut df).unwrap();
         let header = csv.lines().next().unwrap();
-        assert_eq!(header, CANONICAL_COLUMNS.join(","));
+        assert_eq!(header, LABELLED_COLUMNS.join(","));
         assert!(csv.contains("kcd2"), "the label must reach the CSV");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -395,7 +397,7 @@ mod tests {
             ]
         );
 
-        let df = canonical_frame(&files).unwrap();
+        let df = labelled_frame(&files).unwrap();
         let stamps: Vec<Option<i64>> = df
             .column("timestamp_ms")
             .unwrap()
@@ -415,7 +417,7 @@ mod tests {
         write_batch(&dir, 1, &[1, 2], "re2r");
         write_batch(&dir, 2, &[3, 4], "re2r");
 
-        let mut df = canonical_frame(&resolve_inputs(&dir).unwrap()).unwrap();
+        let mut df = labelled_frame(&resolve_inputs(&dir).unwrap()).unwrap();
         let csv = to_csv(&mut df).unwrap();
         assert_eq!(
             csv.lines()
@@ -437,7 +439,7 @@ mod tests {
         let dir = fixture_dir("power_units");
         write_batch(&dir, 1, &[1], "kcd2");
 
-        let mut df = canonical_frame(&batch_files_in(&dir).unwrap()).unwrap();
+        let mut df = labelled_frame(&batch_files_in(&dir).unwrap()).unwrap();
         let csv = to_csv(&mut df).unwrap();
         let row = csv.lines().nth(1).unwrap();
         let power_w: f64 = row.split(',').nth(2).unwrap().parse().unwrap();
@@ -452,7 +454,7 @@ mod tests {
         let dir = fixture_dir("nulls");
         write_batch(&dir, 1, &[1], "kcd2");
 
-        let mut df = canonical_frame(&batch_files_in(&dir).unwrap()).unwrap();
+        let mut df = labelled_frame(&batch_files_in(&dir).unwrap()).unwrap();
         let csv = to_csv(&mut df).unwrap();
         let row = csv.lines().nth(1).unwrap();
         let power = row.split(',').nth(4).unwrap();
@@ -472,7 +474,7 @@ mod tests {
         let dir = fixture_dir("trailing_newline");
         write_batch(&dir, 1, &[10, 20], "kcd2");
 
-        let mut df = canonical_frame(&batch_files_in(&dir).unwrap()).unwrap();
+        let mut df = labelled_frame(&batch_files_in(&dir).unwrap()).unwrap();
         let csv = to_csv(&mut df).unwrap();
         assert!(
             csv.ends_with('\n'),
@@ -500,7 +502,7 @@ mod tests {
             .join("absent.parquet");
 
         let error =
-            canonical_frame(std::slice::from_ref(&missing)).expect_err("missing file must fail");
+            labelled_frame(std::slice::from_ref(&missing)).expect_err("missing file must fail");
         let text = format!("{error:?}");
 
         assert!(
@@ -567,7 +569,7 @@ mod tests {
 
         let inputs = resolve_inputs(&path).unwrap();
         assert_eq!(inputs, vec![path.clone()]);
-        assert_eq!(canonical_frame(&inputs).unwrap().height(), 1);
+        assert_eq!(labelled_frame(&inputs).unwrap().height(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

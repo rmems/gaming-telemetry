@@ -18,7 +18,7 @@ here (no space left on device), so only Rust 1.99.0 was available and no build w
 | `cargo clippy --locked --all-targets --all-features -- -D warnings` | not run (disk full; `--all-features` compiles bundled DuckDB) |
 | `cargo check --locked`, `cargo test --locked` | not run (disk full; Polars and Tokio tree is large) |
 | `cargo test --locked --all-features`, `cargo build --locked --all-features --bin gaming-telemetry --bin export_csv --bin query` | not run (disk full; builds DuckDB from C++ source) |
-| `cargo run --release --bin gaming-telemetry` | not run (needs an NVIDIA GPU and driver; it must not run against real gaming sessions) |
+| `SESSION_LABEL=my-session cargo run --release --bin gaming-telemetry` | not run (needs an NVIDIA GPU and driver; it must not run against real gaming sessions) |
 
 Run fmt and clippy before committing; CI fails on either. The MSRV guard in `ci.yml` also fails if
 `Cargo.toml`, `rust-toolchain.toml`, `.agents/setup`, and every CI job pin drift apart.

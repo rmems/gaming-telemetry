@@ -199,7 +199,7 @@ would order them lexically and silently scramble the time series.
 #### corinth-ingest CSV (default)
 
 Conforms to the frozen hardware-telemetry CSV contract hosted in
-[`rmems/vahtisiru` `docs/telemetry_csv.md`](https://github.com/rmems/vahtisiru/blob/main/docs/telemetry_csv.md)
+[`rmems/vahtisiru` `docs/telemetry_csv.md`](https://github.com/rmems/vahtisiru/blob/4feb196b53509461ceb9b1e7f9a6dd35e67db280/docs/telemetry_csv.md)
 (RM-629). There is no Cargo dependency on vahtisiru; the semantics are copied
 into `src/corinth_csv.rs` and pinned by upstream commit
 (`corinth_csv::CONTRACT_REVISION`) and vendored conformance fixtures in

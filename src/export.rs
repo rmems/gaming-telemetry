@@ -37,6 +37,13 @@ pub const LABELLED_COLUMNS: [&str; 6] = [
     "session_label",
 ];
 
+/// Former name of [`LABELLED_COLUMNS`], kept so existing callers still build.
+#[deprecated(
+    since = "0.2.0",
+    note = "renamed to LABELLED_COLUMNS; the corinth contract export is corinth_csv"
+)]
+pub const CANONICAL_COLUMNS: [&str; 6] = LABELLED_COLUMNS;
+
 /// Every batch file in a session directory, ordered by batch number.
 ///
 /// Ordering is numeric, not lexical: `batch_10` sorts after `batch_2`, which a
@@ -206,6 +213,15 @@ pub fn labelled_frame(paths: &[PathBuf]) -> Result<DataFrame> {
     })
 }
 
+/// Former name of [`labelled_frame`], kept so existing callers still build.
+#[deprecated(
+    since = "0.2.0",
+    note = "renamed to labelled_frame; the corinth contract export is corinth_csv"
+)]
+pub fn canonical_frame(paths: &[PathBuf]) -> Result<DataFrame> {
+    labelled_frame(paths)
+}
+
 /// Temp-file names get a pid/nanos/sequence suffix, not just a pid, so two calls
 /// in the same process (or a process whose pid was reused) never share a path.
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -276,6 +292,64 @@ pub fn write_csv_atomically(path: &Path, csv: &str) -> Result<()> {
 
     write_temp_export(&temporary, csv, redacted)?;
     publish_temp_export(&temporary, path, redacted)
+}
+
+/// Delete `path` if it exists. Absent is success; any other failure is an error.
+pub fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to remove stale {}",
+                redact_personal_path(&path.display().to_string())
+            )
+        }),
+    }
+}
+
+/// Publish `primary` and its `sidecar` so that a failure never leaves a sidecar
+/// that describes some *other* `primary`.
+///
+/// 1. Both temporaries are written and fsynced first. A write failure (disk
+///    full, permissions) changes nothing at either destination.
+/// 2. Any existing sidecar is removed. If that fails, the export stops before
+///    `primary` is touched.
+/// 3. `primary` is renamed into place, then the sidecar.
+///
+/// The remaining failure window is a rename failing in step 3. That leaves
+/// either the old `primary` or the new one, never a mismatched sidecar, and the
+/// error is returned. A missing sidecar means "unverified", never "wrong".
+pub fn write_pair_atomically(primary: (&Path, &str), sidecar: (&Path, &str)) -> Result<()> {
+    let staged = [primary, sidecar].map(|(path, contents)| {
+        let temporary = temp_export_path(path);
+        let redacted = || redact_personal_path(&path.display().to_string());
+        write_temp_export(&temporary, contents, redacted).map(|()| (temporary, path))
+    });
+    let cleanup = |staged: &[Result<(PathBuf, &Path)>]| {
+        for (temporary, _) in staged.iter().flatten() {
+            let _ = std::fs::remove_file(temporary);
+        }
+    };
+    if let Some(error) = staged.iter().find_map(|s| s.as_ref().err()) {
+        let error = anyhow::anyhow!("{error:#}");
+        cleanup(&staged);
+        return Err(error);
+    }
+    if let Err(error) = remove_if_present(sidecar.0) {
+        cleanup(&staged);
+        return Err(error);
+    }
+    let [primary_staged, sidecar_staged] = staged;
+    let (sidecar_temp, _) = sidecar_staged?;
+    for (temporary, path) in [primary_staged?, (sidecar_temp.clone(), sidecar.0)] {
+        let redacted = || redact_personal_path(&path.display().to_string());
+        if let Err(error) = publish_temp_export(&temporary, path, redacted) {
+            let _ = std::fs::remove_file(&sidecar_temp);
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 /// Wrap a foreign error with its operator path stripped.
@@ -558,6 +632,70 @@ mod tests {
             "a successful write leaves no temporary behind"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn deprecated_aliases_match_the_new_names() {
+        assert_eq!(CANONICAL_COLUMNS, LABELLED_COLUMNS);
+        let dir = fixture_dir("deprecated");
+        write_batch(&dir, 1, &[1, 2], "kcd2");
+        let inputs = batch_files_in(&dir).unwrap();
+        assert!(
+            canonical_frame(&inputs)
+                .unwrap()
+                .equals_missing(&labelled_frame(&inputs).unwrap())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn leftover_temporaries(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect()
+    }
+
+    #[test]
+    fn pair_write_publishes_both_and_replaces_a_stale_sidecar() {
+        let dir = fixture_dir("pair");
+        let (csv, side) = (dir.join("out.csv"), dir.join("out.csv.contract.json"));
+        std::fs::write(&side, "stale").unwrap();
+        write_pair_atomically((&csv, "a\n"), (&side, "{}\n")).unwrap();
+        assert_eq!(
+            (
+                std::fs::read_to_string(&csv).unwrap(),
+                std::fs::read_to_string(&side).unwrap()
+            ),
+            ("a\n".to_owned(), "{}\n".to_owned())
+        );
+        assert!(leftover_temporaries(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sidecar that cannot be replaced (here: a directory squats on its
+    /// path) must stop the export before the CSV changes.
+    #[test]
+    fn pair_write_leaves_the_old_csv_when_the_sidecar_cannot_be_replaced() {
+        let dir = fixture_dir("pair_fail");
+        let (csv, side) = (dir.join("out.csv"), dir.join("out.csv.contract.json"));
+        std::fs::write(&csv, "old\n").unwrap();
+        std::fs::create_dir(&side).unwrap();
+        assert!(write_pair_atomically((&csv, "new\n"), (&side, "{}\n")).is_err());
+        assert_eq!(std::fs::read_to_string(&csv).unwrap(), "old\n");
+        assert!(leftover_temporaries(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_if_present_tolerates_absence_but_reports_other_errors() {
+        let dir = fixture_dir("remove");
+        remove_if_present(&dir.join("absent")).unwrap();
+        std::fs::create_dir(dir.join("a_dir")).unwrap();
+        assert!(remove_if_present(&dir.join("a_dir")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

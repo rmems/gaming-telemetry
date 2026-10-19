@@ -451,6 +451,54 @@ fn backward_step_after_an_excluded_row_is_still_rejected() {
     assert_rejected("backwards_null", &[&rows], "steps backward by 200 ms");
 }
 
+/// A complete row sharing a millisecond with an *excluded* row is a valid
+/// measurement and must be kept; only a tie with a *kept* row is a duplicate.
+#[test]
+fn complete_row_tied_with_an_excluded_row_is_kept() {
+    let dir = scratch("tie_with_excluded");
+    let unmeasured = Src {
+        package_w: None,
+        ..Src::at(1000)
+    };
+    write_batch(&dir, 1, &[Src::at(999), unmeasured, Src::at(1000)]);
+    let export = export_ok(&dir);
+    assert_eq!(timestamps(&export.csv), vec![999, 1000]);
+    assert_eq!(
+        (
+            export.report.excluded_duplicate_timestamp,
+            export.report.excluded_unmeasured.rows,
+            export.report.rows_written,
+        ),
+        (0, 1, 2)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The kept-row cursor must not weaken backward-step detection: a tie with an
+/// excluded row, then a step back, still fails.
+#[test]
+fn backward_step_after_a_tie_with_an_excluded_row_is_still_rejected() {
+    let unmeasured = Src {
+        tctl_c: None,
+        ..Src::at(1000)
+    };
+    let rows = [Src::at(1000), unmeasured, Src::at(990)];
+    assert_rejected("tie_then_back", &[&rows], "steps backward by 10 ms");
+}
+
+/// Finiteness is checked before any exclusion: a NaN in a row that would be
+/// dropped (as a tie, or as unmeasured) still fails the export.
+#[test]
+fn nan_in_a_row_that_would_be_excluded_still_fails() {
+    let duplicate_nan = [Src::at(1000), Src::at(1000).cpu(f32::NAN, 120.0)];
+    assert_rejected("dup_nan", &[&duplicate_nan], "cpu_tctl_c is NaN");
+    let unmeasured_nan = [Src {
+        temp_c: None,
+        ..Src::at(1).cpu(70.0, f32::INFINITY)
+    }];
+    assert_rejected("null_inf", &[&unmeasured_nan], "cpu_package_power_w is inf");
+}
+
 /// Null and negative are validated before ordering: a negative timestamp after
 /// a positive one must be reported as negative, not as a backward step.
 #[test]
@@ -593,5 +641,63 @@ fn cli_stdout_output_is_the_csv_alone() {
     assert_eq!(std::fs::read_to_string(&target).unwrap(), GOLDEN);
     let report = std::fs::read_to_string(dir.join("canonical.csv.contract.json")).unwrap();
     assert!(report.contains(CONTRACT_REVISION), "{report}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--labelled` to a path that held a corinth export must not leave the corinth
+/// report behind describing a five-column file that is gone.
+#[test]
+fn cli_labelled_over_a_corinth_export_removes_the_stale_report() {
+    let dir = scratch("cli_sidecar");
+    write_batch(&dir, 1, &[Src::at(1)]);
+    let target = dir.join("out.csv");
+    let sidecar = dir.join("out.csv.contract.json");
+
+    assert!(
+        run_cli(&[dir.as_os_str(), target.as_os_str()])
+            .status
+            .success()
+    );
+    assert!(sidecar.is_file(), "corinth export writes its report");
+
+    let out = run_cli(&["--labelled".as_ref(), dir.as_os_str(), target.as_os_str()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !sidecar.exists(),
+        "stale corinth report survived --labelled"
+    );
+    assert!(
+        std::fs::read_to_string(&target)
+            .unwrap()
+            .starts_with(&format!("{HEADER},session_label\n"))
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A report path that cannot be replaced (a directory squats on it) is a
+/// refused write for both artifacts: non-zero exit, and the existing CSV is
+/// left exactly as it was.
+#[test]
+fn cli_refuses_to_write_when_the_report_path_cannot_be_replaced() {
+    let dir = scratch("cli_refused");
+    write_batch(&dir, 1, &[Src::at(1)]);
+    let target = dir.join("out.csv");
+    std::fs::write(&target, "old\n").unwrap();
+    std::fs::create_dir(dir.join("out.csv.contract.json")).unwrap();
+
+    for args in [
+        vec![dir.as_os_str(), target.as_os_str()],
+        vec!["--labelled".as_ref(), dir.as_os_str(), target.as_os_str()],
+    ] {
+        let out = run_cli(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?} must fail");
+        assert!(stderr.contains("failed to remove stale"), "{stderr}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old\n");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

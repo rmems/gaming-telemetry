@@ -22,15 +22,19 @@
 //!   a missing source column, a source column with the wrong type (and therefore
 //!   possibly the wrong unit), a non-finite reading, a null or negative
 //!   timestamp, a timestamp that steps *backward*, or zero usable rows.
-//! - A timestamp *equal* to the previous one (two polls inside one wall-clock
-//!   millisecond, e.g. after a late tick or at `POLL_INTERVAL_MS=1`) is not
-//!   corruption: the later row is excluded and counted in
-//!   [`ExportReport::excluded_duplicate_timestamp`], never shifted.
-//!   The upstream contract itself has no ordering rule; these two rules are
-//!   producer-side so the published series is strictly increasing.
-//! - The rendered CSV is re-parsed with [`parse_csv`] (the upstream reader
-//!   semantics) and must round-trip with zero skipped rows before it is
-//!   returned.
+//! - A complete row whose timestamp *equals* the last written row's (two polls
+//!   inside one wall-clock millisecond, e.g. after a late tick or at
+//!   `POLL_INTERVAL_MS=1`) is not corruption: it is excluded and counted in
+//!   [`ExportReport::excluded_duplicate_timestamp`], never shifted. A tie with
+//!   a row that was itself excluded does not count, so no valid row is lost.
+//!   The upstream contract itself has no ordering rule; the backward-step and
+//!   tie rules are producer-side so the published series is strictly
+//!   increasing.
+//! - Every reading is checked for finiteness before any row is excluded, so a
+//!   NaN anywhere in the source fails the export.
+//! - The rendered CSV is re-parsed line by line with the [`parse_csv`] rules
+//!   (the upstream reader semantics) and must round-trip exactly, with zero
+//!   skipped rows and strictly increasing timestamps, before it is returned.
 //!
 //! The session-labelled six-column export in [`crate::export`] is a different
 //! artifact and is **not** corinth-ingestible: the trailing `session_label`
@@ -137,7 +141,8 @@ pub struct ExportReport {
     pub source_rows: usize,
     pub rows_written: usize,
     pub excluded_unmeasured: ExcludedRows,
-    /// Rows dropped because their timestamp equalled the previous row's.
+    /// Complete rows dropped because their timestamp equalled the last
+    /// written row's.
     pub excluded_duplicate_timestamp: usize,
 }
 
@@ -216,6 +221,20 @@ fn finite(value: Option<f32>, column: &str, path: &Path, row: usize) -> Result<O
 type Readings = (Option<f32>, Option<f32>, Option<f32>, Option<f32>);
 
 /// Accumulates contract rows across batches, enforcing the per-row gates.
+///
+/// Per row, in this order: the timestamp is present and non-negative; every
+/// reading is finite (so a NaN fails the export whatever would happen to the
+/// row next); there is no backward step against `last_seen`; then the
+/// keep/exclude decision. Two cursors keep the two ordering rules independent:
+///
+/// - `last_seen` — every row with a valid timestamp, kept or not, so a backward
+///   step cannot hide behind an excluded row.
+/// - `last_kept` — only rows actually written, so a complete row that shares a
+///   millisecond with an *excluded* row is still kept, while one that ties a
+///   *kept* row is dropped as a duplicate and the output stays strictly
+///   increasing.
+///
+/// A row that is both unmeasured and tied is counted as unmeasured.
 #[derive(Default)]
 struct Collector {
     rows: Vec<CorinthRow>,
@@ -223,31 +242,27 @@ struct Collector {
     duplicate_timestamps: usize,
     source_rows: usize,
     batches: usize,
-    /// Last accepted timestamp: every non-duplicate row with a valid timestamp,
-    /// including rows later excluded for an unmeasured sensor, so a backward
-    /// step cannot hide behind an excluded row.
-    previous: Option<i64>,
-}
-
-/// How a valid timestamp relates to the previous accepted one.
-enum Order {
-    Next(u64),
-    Duplicate,
+    last_seen: Option<i64>,
+    last_kept: Option<u64>,
 }
 
 impl Collector {
-    /// Validate one timestamp and advance the ordering cursor.
-    ///
-    /// Order matters: null and negative are rejected *before* the ordering
-    /// check, so a negative value is always reported as negative (not as a
-    /// backward step) and never becomes the cursor. A tie is a duplicate (row
-    /// excluded); a backward step is a broken timeline (hard error). Neither
-    /// error names a path.
-    fn timestamp(&mut self, value: Option<i64>, row: usize) -> Result<Order> {
-        let at = format!(
+    /// Where the current row is, without any path: `row N (batch #B, row R)`.
+    fn locate(&self, row: usize) -> String {
+        format!(
             "row {} (batch #{}, row {row})",
             self.source_rows, self.batches
-        );
+        )
+    }
+
+    /// Reject null and negative timestamps, then a backward step against
+    /// `last_seen`, then advance `last_seen`.
+    ///
+    /// Null and negative are checked *before* ordering, so a negative value is
+    /// always reported as negative (not as a backward step) and never becomes
+    /// the cursor. Neither error names a path.
+    fn timestamp(&mut self, value: Option<i64>, row: usize) -> Result<u64> {
+        let at = self.locate(row);
         let Some(timestamp) = value else {
             anyhow::bail!("{at}: timestamp_ms is null; it is required on every row");
         };
@@ -257,24 +272,28 @@ impl Collector {
                  epoch-millisecond value"
             )
         })?;
-        match self.previous {
-            Some(previous) if timestamp == previous => return Ok(Order::Duplicate),
-            Some(previous) if timestamp < previous => anyhow::bail!(
+        if let Some(previous) = self.last_seen {
+            anyhow::ensure!(
+                timestamp >= previous,
                 "{at}: timestamp_ms {timestamp} steps backward by {} ms from the previous \
                  {previous}; the timeline is broken, usually by an NTP or wall-clock step \
                  during capture. Split the session at this point before exporting",
                 previous - timestamp
-            ),
-            _ => {}
+            );
         }
-        self.previous = Some(timestamp);
-        Ok(Order::Next(timestamp_ms))
+        self.last_seen = Some(timestamp);
+        Ok(timestamp_ms)
     }
 
-    /// Keep a fully measured row; count a partially measured one per column.
+    /// Keep a fully measured row unless it ties the last kept one; count a
+    /// partially measured one per column.
     fn record(&mut self, timestamp_ms: u64, readings: Readings) {
         match readings {
+            (Some(_), Some(_), Some(_), Some(_)) if self.last_kept == Some(timestamp_ms) => {
+                self.duplicate_timestamps += 1;
+            }
             (Some(gpu_temp_c), Some(gpu_power_w), Some(cpu_tctl_c), Some(cpu_package_power_w)) => {
+                self.last_kept = Some(timestamp_ms);
                 self.rows.push(CorinthRow {
                     timestamp_ms,
                     gpu_temp_c,
@@ -306,12 +325,9 @@ impl Collector {
         let package = column("cpu_package_power_w")?.f32().map_err(redacted)?;
 
         for row in 0..frame.height() {
-            let order = self.timestamp(timestamps.get(row), row)?;
+            let timestamp_ms = self.timestamp(timestamps.get(row), row)?;
             self.source_rows += 1;
-            let Order::Next(timestamp_ms) = order else {
-                self.duplicate_timestamps += 1;
-                continue;
-            };
+            // Every reading is validated before any exclusion decision.
             let readings = (
                 // u32 -> f32 is exact below 2^24, far above any die temperature.
                 temps.get(row).map(|t| t as f32),
@@ -361,25 +377,46 @@ impl Collector {
 }
 
 /// Render rows and prove the result round-trips through the contract reader.
+///
+/// Verification streams: each rendered line is parsed with the contract
+/// reader's line rules and compared with the row it came from, so no second
+/// row vector is held next to `rows` and the CSV string.
 fn render_verified(rows: &[CorinthRow]) -> Result<String> {
     let csv = format_csv(rows);
-    let parsed = parse_csv(&csv).context("self-check: rendered CSV failed the contract header")?;
-    anyhow::ensure!(
-        parsed.skipped == 0 && parsed.rows == rows,
-        "self-check: rendered CSV does not round-trip through the contract reader \
-         ({} of {} rows parsed back, {} skipped)",
-        parsed.rows.len(),
-        rows.len(),
-        parsed.skipped
-    );
-    anyhow::ensure!(
-        parsed
-            .rows
-            .windows(2)
-            .all(|pair| pair[0].timestamp_ms < pair[1].timestamp_ms),
-        "self-check: rendered CSV timestamps are not strictly increasing"
-    );
+    verify_round_trip(&csv, rows)?;
     Ok(csv)
+}
+
+/// Check that `csv` parses back, line for line, to exactly `rows`, with no
+/// skipped line and strictly increasing timestamps.
+fn verify_round_trip(csv: &str, rows: &[CorinthRow]) -> Result<()> {
+    let mut lines = csv.lines();
+    anyhow::ensure!(
+        lines.next().map(str::trim) == Some(HEADER),
+        "self-check: rendered CSV failed the contract header"
+    );
+    let mut expected = rows.iter();
+    let mut previous: Option<u64> = None;
+    for (index, line) in lines.map(str::trim).filter(|l| !l.is_empty()).enumerate() {
+        let parsed = parse_data_line(line);
+        anyhow::ensure!(
+            parsed.is_some() && parsed.as_ref() == expected.next(),
+            "self-check: rendered data line {index} does not round-trip through the \
+             contract reader"
+        );
+        let timestamp = parsed.map(|r| r.timestamp_ms);
+        anyhow::ensure!(
+            previous < timestamp,
+            "self-check: rendered CSV timestamps are not strictly increasing at data line \
+             {index}"
+        );
+        previous = timestamp;
+    }
+    anyhow::ensure!(
+        expected.next().is_none(),
+        "self-check: rendered CSV has fewer rows than were collected"
+    );
+    Ok(())
 }
 
 /// Build the corinth CSV from Parquet batches, already in batch order.
@@ -467,6 +504,44 @@ fn parse_data_line(line: &str) -> Option<CorinthRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(timestamp_ms: u64) -> CorinthRow {
+        CorinthRow {
+            timestamp_ms,
+            gpu_temp_c: 60.0,
+            gpu_power_w: 250.0,
+            cpu_tctl_c: 70.0,
+            cpu_package_power_w: 120.0,
+        }
+    }
+
+    /// The streaming verifier must catch everything the collect-and-compare
+    /// version did: tampered values, missing/extra rows, malformed lines,
+    /// header drift, and non-increasing order.
+    #[test]
+    fn streaming_verifier_rejects_every_kind_of_divergence() {
+        let rows = [row(1), row(2)];
+        let good = format_csv(&rows);
+        verify_round_trip(&good, &rows).unwrap();
+
+        let cases = [
+            ("tampered", good.replace("2,60.0", "2,61.0"), &rows[..]),
+            ("missing row", format_csv(&rows[..1]), &rows[..]),
+            ("extra row", good.clone(), &rows[..1]),
+            (
+                "malformed",
+                format!("{good}3,60.0,,70.0,120.0\n"),
+                &rows[..],
+            ),
+            ("header", good.replacen("timestamp_ms", "ts", 1), &rows[..]),
+        ];
+        for (name, csv, expected) in cases {
+            assert!(verify_round_trip(&csv, expected).is_err(), "{name}");
+        }
+        let tied = [row(2), row(2)];
+        let error = verify_round_trip(&format_csv(&tied), &tied).unwrap_err();
+        assert!(error.to_string().contains("strictly increasing"), "{error}");
+    }
 
     #[test]
     fn header_and_columns_agree() {

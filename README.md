@@ -232,23 +232,33 @@ Timestamps are wall-clock milliseconds, and two producer-side ordering rules
 apply across the whole export. The upstream contract itself has no ordering
 rule, and corinth replay rewrites `timestamp_ms` per tick:
 
-- **Equal millisecond** (a row whose timestamp equals the previous row's): the
-  later row is excluded and counted as `excluded_duplicate_timestamp`. It is
-  never shifted. This is normal: two polls can land in one millisecond after a
-  late tick, or with `POLL_INTERVAL_MS=1`.
-- **Backward step** (`timestamp_ms` lower than the previous row's): a hard
-  error that names the row and the step size. The timeline is broken, which is
+- **Equal millisecond** (a complete row whose timestamp equals the last
+  *written* row's): the later row is excluded and counted as
+  `excluded_duplicate_timestamp`. It is never shifted. This is normal: two polls
+  can land in one millisecond after a late tick, or with `POLL_INTERVAL_MS=1`.
+  A tie with a row that was itself excluded for a missing sensor does not
+  count, so the complete row is kept.
+- **Backward step** (`timestamp_ms` lower than any earlier row's, including
+  excluded rows): a hard error that names the row and the step size. The timeline is broken, which is
   usually an NTP or wall-clock step during a long capture. Split the session at
   that point before exporting.
 
-Before returning, the rendered CSV is re-parsed with the contract reader. It
+Every reading is checked for `NaN`/`inf` before any row is excluded, so a
+non-finite value fails the export even in a row that would have been dropped.
+
+Before returning, the rendered CSV is re-parsed line by line with the contract
+reader rules. It
 must round-trip exactly, with zero skipped rows and strictly increasing
 timestamps.
 
 For a file output, the export report (contract source, revision, row and
 exclusion counts; no paths or labels) is written beside the CSV as
 `<output>.contract.json` and echoed to stderr. Stdout output (`-`) carries the
-CSV only.
+CSV only. The CSV and report are published as a pair: both are fully written
+first, any old report is removed, and then each is renamed into place. A failed
+export can leave a CSV without a report, but never a report that describes a
+different CSV. Writing `--labelled` to a file removes any corinth report left
+at that path.
 
 #### Session-labelled CSV (`--labelled`)
 

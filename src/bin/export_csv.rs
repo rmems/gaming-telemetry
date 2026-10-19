@@ -10,16 +10,21 @@
 //!   export with a non-zero exit before anything is printed, on stdout or file
 //!   output alike. For a file output, a contract report (source, revision, row
 //!   counts) is written beside it as `<output>.contract.json` and echoed to
-//!   stderr; stdout output carries the CSV only.
+//!   stderr; stdout output carries the CSV only. The CSV and its report are
+//!   published as a pair (`write_pair_atomically`).
 //! - **`--labelled`** — the six-column session-labelled CSV for multi-title
 //!   datasets. Unmeasured sensors are empty cells. Not corinth-ingestible.
+//!   Writing it to a file removes any stale corinth report for that path.
 //!
 //! Accepts either a whole session directory (every batch, in order, one header) or
 //! a single batch file.
 
 use anyhow::Result;
 use gaming_telemetry::corinth_csv;
-use gaming_telemetry::export::{labelled_frame, resolve_inputs, to_csv, write_csv_atomically};
+use gaming_telemetry::export::{
+    labelled_frame, remove_if_present, resolve_inputs, to_csv, write_csv_atomically,
+    write_pair_atomically,
+};
 use gaming_telemetry::privacy::redact_personal_path;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -109,8 +114,11 @@ fn run() -> Result<()> {
             if to_stdout {
                 print!("{}", export.csv);
             } else {
-                write_csv_atomically(&export_args.output, &export.csv)?;
-                write_csv_atomically(&report_path(&export_args.output), &format!("{report}\n"))?;
+                let sidecar = format!("{report}\n");
+                write_pair_atomically(
+                    (&export_args.output, &export.csv),
+                    (&report_path(&export_args.output), &sidecar),
+                )?;
                 println!(
                     "Exported {} corinth row(s) from {} batch(es) to {}",
                     export.report.rows_written,
@@ -126,6 +134,9 @@ fn run() -> Result<()> {
             if to_stdout {
                 print!("{csv}");
             } else {
+                // A corinth sidecar left from an earlier export to this path
+                // would describe a five-column file that is no longer there.
+                remove_if_present(&report_path(&export_args.output))?;
                 write_csv_atomically(&export_args.output, &csv)?;
                 println!(
                     "Exported {} labelled row(s) from {} batch(es) to {} (not corinth-ingestible)",

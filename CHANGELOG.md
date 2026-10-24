@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`export_csv` now emits the frozen vahtisiru corinth CSV contract by default
+  (#50, RM-629).** The previous "canonical" export appended `session_label` as a
+  sixth column and wrote unmeasured sensors as empty cells; the corinth reader
+  rejects the first as a header mismatch and skips the second. The default
+  artifact (`gaming_telemetry::corinth_csv`) now writes exactly
+  `timestamp_ms,gpu_temp_c,gpu_power_w,cpu_tctl_c,cpu_package_power_w`,
+  excludes and counts rows with any unmeasured sensor (never zero-fills), and
+  fails the export on a missing or retyped source column, `NaN`/`inf`, a null or
+  negative timestamp, a backward timestamp step (usually an NTP/clock step), or
+  zero usable rows. A complete row tying the last written row's millisecond is
+  excluded and counted (`excluded_duplicate_timestamp`), not fatal. Every
+  reading is checked for finiteness before any exclusion, and the CSV and its
+  report are published as a consistent pair. Every
+  export is round-tripped through the contract reader before it is returned, and
+  a `<output>.contract.json` report records the contract source, pinned upstream
+  revision, and exclusion counts.
+
+  **Breaking for CLI consumers of the six-column file:** it is now
+  `export_csv --labelled`.
+
+### Deprecated
+
+- `export::canonical_frame` and `export::CANONICAL_COLUMNS` are renamed
+  `labelled_frame` / `LABELLED_COLUMNS` so they cannot be mistaken for the
+  corinth contract. The old names remain as deprecated aliases (since 0.2.0)
+  and still compile.
+
 ### Fixed
 
 - **Path redaction no longer fails open without `HOME`, and covers external

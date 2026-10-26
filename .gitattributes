@@ -1,0 +1,3 @@
+# Contract fixtures are compared byte-for-byte (vendored from rmems/vahtisiru);
+# never let core.autocrlf rewrite their line endings on checkout.
+tests/fixtures/** -text

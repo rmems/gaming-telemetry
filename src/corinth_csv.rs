@@ -41,7 +41,10 @@
 //! column is a header mismatch under this contract.
 
 use anyhow::{Context, Result};
-use polars::prelude::{DataFrame, DataType, LazyFrame, PlRefPath, ScanArgsParquet, col};
+use polars::prelude::{
+    DataFrame, DataType, Expr, Float32Chunked, Int64Chunked, LazyFrame, PlRefPath, ScanArgsParquet,
+    UInt32Chunked, col,
+};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -164,6 +167,13 @@ fn redacted(error: impl std::fmt::Display) -> anyhow::Error {
 
 /// Read one batch's source columns, refusing any column with the wrong type.
 fn read_batch(path: &Path) -> Result<DataFrame> {
+    let frame = select_source_columns(path)?;
+    check_source_types(&frame, path)?;
+    Ok(frame)
+}
+
+/// Scan `path` and keep only the columns the contract reads.
+fn select_source_columns(path: &Path) -> Result<DataFrame> {
     let scanned = LazyFrame::scan_parquet(
         PlRefPath::try_from_path(path)
             .with_context(|| format!("not a usable Parquet path: {}", redact(path)))?,
@@ -172,37 +182,69 @@ fn read_batch(path: &Path) -> Result<DataFrame> {
     .map_err(redacted)
     .with_context(|| format!("failed to scan {}", redact(path)))?;
 
-    let frame = scanned
-        .select(
-            SOURCE_COLUMNS
-                .iter()
-                .map(|(name, _)| col(*name))
-                .collect::<Vec<_>>(),
-        )
+    let wanted: Vec<Expr> = SOURCE_COLUMNS.iter().map(|(name, _)| col(*name)).collect();
+    scanned
+        .select(wanted)
         .collect()
         .map_err(redacted)
         .with_context(|| {
+            let names: Vec<&str> = SOURCE_COLUMNS.iter().map(|(name, _)| *name).collect();
             format!(
                 "batch {} is missing a column the corinth contract needs (one of {})",
                 redact(path),
-                SOURCE_COLUMNS
-                    .iter()
-                    .map(|(name, _)| *name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                names.join(", ")
             )
-        })?;
+        })
+}
 
+/// Refuse any source column whose dtype differs from the pinned one.
+fn check_source_types(frame: &DataFrame, path: &Path) -> Result<()> {
     for (name, expected) in &SOURCE_COLUMNS {
         let actual = frame.column(name).map_err(redacted)?.dtype();
         anyhow::ensure!(
             actual == expected,
-            "batch {}: column {name} has type {actual}, expected {expected}; refusing to \
-             reinterpret it (the type pins the unit)",
+            "batch {}: column {name} has type {actual}, expected {expected}; refusing to              reinterpret it (the type pins the unit)",
             redact(path)
         );
     }
-    Ok(frame)
+    Ok(())
+}
+
+/// The typed source columns of one validated batch.
+struct Columns<'a> {
+    timestamps: &'a Int64Chunked,
+    temps: &'a UInt32Chunked,
+    power_mw: &'a UInt32Chunked,
+    tctl: &'a Float32Chunked,
+    package: &'a Float32Chunked,
+}
+
+impl<'a> Columns<'a> {
+    fn new(frame: &'a DataFrame) -> Result<Self> {
+        let column = |name: &str| frame.column(name).map_err(redacted);
+        Ok(Self {
+            timestamps: column("timestamp_ms")?.i64().map_err(redacted)?,
+            temps: column("temperature_c")?.u32().map_err(redacted)?,
+            power_mw: column("power_usage_mw")?.u32().map_err(redacted)?,
+            tctl: column("cpu_tctl_c")?.f32().map_err(redacted)?,
+            package: column("cpu_package_power_w")?.f32().map_err(redacted)?,
+        })
+    }
+
+    /// The four sensor readings of `row`; NaN / ±inf is a hard error.
+    fn readings(&self, row: usize, path: &Path) -> Result<Readings> {
+        Ok((
+            // u32 -> f32 is exact below 2^24, far above any die temperature.
+            self.temps.get(row).map(|t| t as f32),
+            // The only unit conversion: integer milliwatts to watts, in f64
+            // before narrowing so the f32 is the nearest one to the exact value.
+            self.power_mw
+                .get(row)
+                .map(|mw| (f64::from(mw) / 1000.0) as f32),
+            finite(self.tctl.get(row), "cpu_tctl_c", path, row)?,
+            finite(self.package.get(row), "cpu_package_power_w", path, row)?,
+        ))
+    }
 }
 
 /// A finite reading, a null (`Ok(None)`), or a hard error for NaN / ±inf.
@@ -317,26 +359,12 @@ impl Collector {
     fn batch(&mut self, path: &Path) -> Result<()> {
         let frame = read_batch(path)?;
         self.batches += 1;
-        let column = |name: &str| frame.column(name).map_err(redacted);
-        let timestamps = column("timestamp_ms")?.i64().map_err(redacted)?;
-        let temps = column("temperature_c")?.u32().map_err(redacted)?;
-        let power_mw = column("power_usage_mw")?.u32().map_err(redacted)?;
-        let tctl = column("cpu_tctl_c")?.f32().map_err(redacted)?;
-        let package = column("cpu_package_power_w")?.f32().map_err(redacted)?;
-
+        let columns = Columns::new(&frame)?;
         for row in 0..frame.height() {
-            let timestamp_ms = self.timestamp(timestamps.get(row), row)?;
+            let timestamp_ms = self.timestamp(columns.timestamps.get(row), row)?;
             self.source_rows += 1;
             // Every reading is validated before any exclusion decision.
-            let readings = (
-                // u32 -> f32 is exact below 2^24, far above any die temperature.
-                temps.get(row).map(|t| t as f32),
-                // The only unit conversion: integer milliwatts to watts, in f64
-                // before narrowing so the f32 is the nearest one to the exact value.
-                power_mw.get(row).map(|mw| (f64::from(mw) / 1000.0) as f32),
-                finite(tctl.get(row), "cpu_tctl_c", path, row)?,
-                finite(package.get(row), "cpu_package_power_w", path, row)?,
-            );
+            let readings = columns.readings(row, path)?;
             self.record(timestamp_ms, readings);
         }
         Ok(())

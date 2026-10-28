@@ -321,28 +321,15 @@ pub fn remove_if_present(path: &Path) -> Result<()> {
 /// either the old `primary` or the new one, never a mismatched sidecar, and the
 /// error is returned. A missing sidecar means "unverified", never "wrong".
 pub fn write_pair_atomically(primary: (&Path, &str), sidecar: (&Path, &str)) -> Result<()> {
-    let staged = [primary, sidecar].map(|(path, contents)| {
-        let temporary = temp_export_path(path);
-        let redacted = || redact_personal_path(&path.display().to_string());
-        write_temp_export(&temporary, contents, redacted).map(|()| (temporary, path))
-    });
-    let cleanup = |staged: &[Result<(PathBuf, &Path)>]| {
-        for (temporary, _) in staged.iter().flatten() {
+    let [primary_staged, sidecar_staged] = stage_pair(primary, sidecar)?;
+    if let Err(error) = remove_if_present(sidecar.0) {
+        for (temporary, _) in [&primary_staged, &sidecar_staged] {
             let _ = std::fs::remove_file(temporary);
         }
-    };
-    if let Some(error) = staged.iter().find_map(|s| s.as_ref().err()) {
-        let error = anyhow::anyhow!("{error:#}");
-        cleanup(&staged);
         return Err(error);
     }
-    if let Err(error) = remove_if_present(sidecar.0) {
-        cleanup(&staged);
-        return Err(error);
-    }
-    let [primary_staged, sidecar_staged] = staged;
-    let (sidecar_temp, _) = sidecar_staged?;
-    for (temporary, path) in [primary_staged?, (sidecar_temp.clone(), sidecar.0)] {
+    let sidecar_temp = sidecar_staged.0.clone();
+    for (temporary, path) in [primary_staged, sidecar_staged] {
         let redacted = || redact_personal_path(&path.display().to_string());
         if let Err(error) = publish_temp_export(&temporary, path, redacted) {
             let _ = std::fs::remove_file(&sidecar_temp);
@@ -350,6 +337,29 @@ pub fn write_pair_atomically(primary: (&Path, &str), sidecar: (&Path, &str)) -> 
         }
     }
     Ok(())
+}
+
+/// Write and fsync a temporary beside each destination. If either write fails,
+/// the temporary that did get created is removed and the first error returned,
+/// so nothing at either destination has changed.
+fn stage_pair<'a>(
+    primary: (&'a Path, &str),
+    sidecar: (&'a Path, &str),
+) -> Result<[(PathBuf, &'a Path); 2]> {
+    let [first, second] = [primary, sidecar].map(|(path, contents)| {
+        let temporary = temp_export_path(path);
+        let redacted = || redact_personal_path(&path.display().to_string());
+        write_temp_export(&temporary, contents, redacted).map(|()| (temporary, path))
+    });
+    match (first, second) {
+        (Ok(first), Ok(second)) => Ok([first, second]),
+        (Err(error), other) | (other, Err(error)) => {
+            if let Ok((temporary, _)) = other {
+                let _ = std::fs::remove_file(temporary);
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Wrap a foreign error with its operator path stripped.

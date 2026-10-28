@@ -174,27 +174,42 @@ fn read_batch(path: &Path) -> Result<DataFrame> {
 
 /// Scan `path` and keep only the columns the contract reads.
 fn select_source_columns(path: &Path) -> Result<DataFrame> {
-    let scanned = LazyFrame::scan_parquet(
+    let mut scanned = LazyFrame::scan_parquet(
         PlRefPath::try_from_path(path)
             .with_context(|| format!("not a usable Parquet path: {}", redact(path)))?,
         ScanArgsParquet::default(),
     )
     .map_err(redacted)
     .with_context(|| format!("failed to scan {}", redact(path)))?;
+    require_source_columns(&mut scanned, path)?;
 
     let wanted: Vec<Expr> = SOURCE_COLUMNS.iter().map(|(name, _)| col(*name)).collect();
     scanned
         .select(wanted)
         .collect()
         .map_err(redacted)
-        .with_context(|| {
-            let names: Vec<&str> = SOURCE_COLUMNS.iter().map(|(name, _)| *name).collect();
-            format!(
-                "batch {} is missing a column the corinth contract needs (one of {})",
-                redact(path),
-                names.join(", ")
-            )
-        })
+        .with_context(|| format!("failed to read the contract columns of {}", redact(path)))
+}
+
+/// Name the missing columns from the file's schema, so a corrupt or unreadable
+/// file is never reported as a schema gap (and vice versa).
+fn require_source_columns(scanned: &mut LazyFrame, path: &Path) -> Result<()> {
+    let schema = scanned
+        .collect_schema()
+        .map_err(redacted)
+        .with_context(|| format!("failed to read the schema of {}", redact(path)))?;
+    let missing: Vec<&str> = SOURCE_COLUMNS
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| !schema.contains(name))
+        .collect();
+    anyhow::ensure!(
+        missing.is_empty(),
+        "batch {} is missing a column the corinth contract needs: {}",
+        redact(path),
+        missing.join(", ")
+    );
+    Ok(())
 }
 
 /// Refuse any source column whose dtype differs from the pinned one.

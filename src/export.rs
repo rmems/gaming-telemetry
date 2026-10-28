@@ -321,22 +321,29 @@ pub fn remove_if_present(path: &Path) -> Result<()> {
 /// either the old `primary` or the new one, never a mismatched sidecar, and the
 /// error is returned. A missing sidecar means "unverified", never "wrong".
 pub fn write_pair_atomically(primary: (&Path, &str), sidecar: (&Path, &str)) -> Result<()> {
-    let [primary_staged, sidecar_staged] = stage_pair(primary, sidecar)?;
+    let staged = stage_pair(primary, sidecar)?;
     if let Err(error) = remove_if_present(sidecar.0) {
-        for (temporary, _) in [&primary_staged, &sidecar_staged] {
-            let _ = std::fs::remove_file(temporary);
-        }
+        discard_staged(&staged);
         return Err(error);
     }
-    let sidecar_temp = sidecar_staged.0.clone();
-    for (temporary, path) in [primary_staged, sidecar_staged] {
-        let redacted = || redact_personal_path(&path.display().to_string());
-        if let Err(error) = publish_temp_export(&temporary, path, redacted) {
+    let sidecar_temp = staged[1].0.clone();
+    staged
+        .into_iter()
+        .try_for_each(|(temporary, path)| {
+            let redacted = || redact_personal_path(&path.display().to_string());
+            publish_temp_export(&temporary, path, redacted)
+        })
+        // After a failed primary rename the sidecar temporary is still staged.
+        .inspect_err(|_| {
             let _ = std::fs::remove_file(&sidecar_temp);
-            return Err(error);
-        }
+        })
+}
+
+/// Best-effort removal of staged temporaries that will not be published.
+fn discard_staged(staged: &[(PathBuf, &Path)]) {
+    for (temporary, _) in staged {
+        let _ = std::fs::remove_file(temporary);
     }
-    Ok(())
 }
 
 /// Write and fsync a temporary beside each destination. If either write fails,

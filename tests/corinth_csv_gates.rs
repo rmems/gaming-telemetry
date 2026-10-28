@@ -11,6 +11,18 @@ mod common;
 
 use common::*;
 
+/// Export one row whose `column` is replaced, and return the export error.
+fn export_err_with_column(name: &str, column: Column) -> String {
+    let dir = scratch(name);
+    let mut df = frame(&[Src::at(1)]);
+    let column_name = column.name().to_string();
+    df.replace(&column_name, column).unwrap();
+    write_frame(&dir, 1, df);
+    let error = export_err(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    error
+}
+
 // ------------------------------------------------------- fail-loud gates
 
 #[test]
@@ -19,25 +31,34 @@ fn rejects_a_batch_missing_a_contract_column() {
     let df = frame(&[Src::at(1)]).drop("cpu_tctl_c").unwrap();
     write_frame(&dir, 1, df);
     let error = export_err(&dir);
-    assert!(error.contains("missing a column"), "{error}");
+    assert!(
+        error.contains("missing a column the corinth contract needs: cpu_tctl_c"),
+        "{error}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A damaged batch must fail loud, but not as a schema gap: the operator
+/// would go looking for a column that is not missing.
+#[test]
+fn a_corrupt_batch_is_not_reported_as_a_missing_column() {
+    let dir = scratch("corrupt_batch");
+    let path = write_batch(&dir, 1, &[Src::at(1)]);
+    std::fs::write(&path, b"not a parquet file").unwrap();
+    let error = export_err(&dir);
+    assert!(!error.contains("missing a column"), "{error}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A float `power_usage_mw` may already be watts. Refuse rather than divide.
 #[test]
 fn rejects_a_source_column_with_the_wrong_type_or_unit() {
-    let dir = scratch("wrong_unit");
-    let mut df = frame(&[Src::at(1)]);
-    df.replace(
-        "power_usage_mw",
+    let error = export_err_with_column(
+        "wrong_unit",
         Column::new("power_usage_mw".into(), vec![250.0f64]),
-    )
-    .unwrap();
-    write_frame(&dir, 1, df);
-    let error = export_err(&dir);
+    );
     assert!(error.contains("power_usage_mw has type"), "{error}");
     assert!(error.contains("refusing to reinterpret it"), "{error}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -176,17 +197,11 @@ fn rejects_negative_timestamps() {
 
 #[test]
 fn rejects_null_timestamps() {
-    let dir = scratch("null_ts");
-    let mut df = frame(&[Src::at(1)]);
-    df.replace(
-        "timestamp_ms",
+    let error = export_err_with_column(
+        "null_ts",
         Column::new("timestamp_ms".into(), vec![None::<i64>]),
-    )
-    .unwrap();
-    write_frame(&dir, 1, df);
-    let error = export_err(&dir);
+    );
     assert!(error.contains("timestamp_ms is null"), "{error}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// RAPL is root-only on most machines, so a whole session can lack package

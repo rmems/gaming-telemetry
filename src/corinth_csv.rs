@@ -42,8 +42,8 @@
 
 use anyhow::{Context, Result};
 use polars::prelude::{
-    DataFrame, DataType, Expr, Float32Chunked, Int64Chunked, LazyFrame, PlRefPath, ScanArgsParquet,
-    UInt32Chunked, col,
+    Column, DataFrame, DataType, Expr, Float32Chunked, Int64Chunked, LazyFrame, PlRefPath,
+    PolarsResult, ScanArgsParquet, UInt32Chunked, col,
 };
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -226,6 +226,15 @@ fn check_source_types(frame: &DataFrame, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Column `name` of `frame` as the chunked array `cast` selects.
+fn typed<'a, T>(
+    frame: &'a DataFrame,
+    name: &str,
+    cast: impl FnOnce(&'a Column) -> PolarsResult<&'a T>,
+) -> Result<&'a T> {
+    cast(frame.column(name).map_err(redacted)?).map_err(redacted)
+}
+
 /// The typed source columns of one validated batch.
 struct Columns<'a> {
     timestamps: &'a Int64Chunked,
@@ -237,13 +246,12 @@ struct Columns<'a> {
 
 impl<'a> Columns<'a> {
     fn new(frame: &'a DataFrame) -> Result<Self> {
-        let column = |name: &str| frame.column(name).map_err(redacted);
         Ok(Self {
-            timestamps: column("timestamp_ms")?.i64().map_err(redacted)?,
-            temps: column("temperature_c")?.u32().map_err(redacted)?,
-            power_mw: column("power_usage_mw")?.u32().map_err(redacted)?,
-            tctl: column("cpu_tctl_c")?.f32().map_err(redacted)?,
-            package: column("cpu_package_power_w")?.f32().map_err(redacted)?,
+            timestamps: typed(frame, "timestamp_ms", Column::i64)?,
+            temps: typed(frame, "temperature_c", Column::u32)?,
+            power_mw: typed(frame, "power_usage_mw", Column::u32)?,
+            tctl: typed(frame, "cpu_tctl_c", Column::f32)?,
+            package: typed(frame, "cpu_package_power_w", Column::f32)?,
         })
     }
 

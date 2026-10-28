@@ -36,6 +36,7 @@ fn rejects_a_source_column_with_the_wrong_type_or_unit() {
     write_frame(&dir, 1, df);
     let error = export_err(&dir);
     assert!(error.contains("power_usage_mw has type"), "{error}");
+    assert!(error.contains("refusing to reinterpret it"), "{error}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

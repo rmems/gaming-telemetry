@@ -203,7 +203,8 @@ fn check_source_types(frame: &DataFrame, path: &Path) -> Result<()> {
         let actual = frame.column(name).map_err(redacted)?.dtype();
         anyhow::ensure!(
             actual == expected,
-            "batch {}: column {name} has type {actual}, expected {expected}; refusing to              reinterpret it (the type pins the unit)",
+            "batch {}: column {name} has type {actual}, expected {expected}; refusing to \
+             reinterpret it (the type pins the unit)",
             redact(path)
         );
     }

@@ -7,6 +7,7 @@
 //! into every binary that wanted it.
 
 pub mod build_info;
+pub mod corinth_csv;
 pub mod cpu;
 pub mod export;
 pub mod manifest;

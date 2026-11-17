@@ -255,8 +255,8 @@ fn write_temp_export(temporary: &Path, csv: &str, redacted: impl Fn() -> String)
     Ok(())
 }
 
-/// Rename `temporary` into place and fsync its parent directory, cleaning up
-/// the temporary on a failed rename.
+/// Rename `temporary` into place and fsync its parent directory — Unix only,
+/// see below — cleaning up the temporary on a failed rename.
 fn publish_temp_export(temporary: &Path, path: &Path, redacted: impl Fn() -> String) -> Result<()> {
     if let Err(error) = std::fs::rename(temporary, path) {
         let _ = std::fs::remove_file(temporary);
@@ -264,7 +264,13 @@ fn publish_temp_export(temporary: &Path, path: &Path, redacted: impl Fn() -> Str
     }
 
     // Windows cannot open a directory as a plain file handle, so `sync_all` on
-    // it fails with "Access is denied"; NTFS journals the rename itself.
+    // it fails with "Access is denied" and the directory sync is skipped
+    // there. NTFS journals the rename's *metadata* so the volume stays
+    // consistent, but that does NOT make the rename durable: a power loss
+    // before the journal checkpoints can roll it back to the previous file
+    // even though publish already returned Ok. If that trade-off becomes
+    // unacceptable, `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` is the Windows
+    // durability equivalent — nothing in `std` reaches it.
     #[cfg(unix)]
     {
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty());

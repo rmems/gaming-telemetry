@@ -447,7 +447,13 @@ fn publish_manifest(tmp: &Path, dir: &Path) -> Result<()> {
         });
     }
     // Windows cannot open a directory as a plain file handle, so `sync_all` on
-    // it fails with "Access is denied"; NTFS journals the rename itself.
+    // it fails with "Access is denied" and the directory sync is skipped
+    // there. NTFS journals the rename's *metadata* so the volume stays
+    // consistent, but that does NOT make the rename durable: a power loss
+    // before the journal checkpoints can roll it back to the previous file
+    // even though publish already returned Ok. If that trade-off becomes
+    // unacceptable, `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` is the Windows
+    // durability equivalent — nothing in `std` reaches it.
     #[cfg(unix)]
     File::open(dir)
         .and_then(|directory| directory.sync_all())

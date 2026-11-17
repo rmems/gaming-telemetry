@@ -185,7 +185,13 @@ fn write_to_parquet(samples: Vec<GpuSample>, batch_id: u32, output_dir: &Path) -
         return Err(error.into());
     }
     // Windows cannot open a directory as a plain file handle, so `sync_all` on
-    // it fails with "Access is denied"; NTFS journals the rename itself.
+    // it fails with "Access is denied" and the directory sync is skipped
+    // there. NTFS journals the rename's *metadata* so the volume stays
+    // consistent, but that does NOT make the rename durable: a power loss
+    // before the journal checkpoints can roll it back to the previous file
+    // even though publish already returned Ok. If that trade-off becomes
+    // unacceptable, `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` is the Windows
+    // durability equivalent — nothing in `std` reaches it.
     #[cfg(unix)]
     File::open(output_dir)?.sync_all()?;
 

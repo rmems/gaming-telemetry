@@ -12,7 +12,9 @@ use crate::timing::TimingSummary;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -444,6 +446,9 @@ fn publish_manifest(tmp: &Path, dir: &Path) -> Result<()> {
             )
         });
     }
+    // Windows cannot open a directory as a plain file handle, so `sync_all` on
+    // it fails with "Access is denied"; NTFS journals the rename itself.
+    #[cfg(unix)]
     File::open(dir)
         .and_then(|directory| directory.sync_all())
         .with_context(|| {
@@ -451,7 +456,8 @@ fn publish_manifest(tmp: &Path, dir: &Path) -> Result<()> {
                 "failed to persist manifest rename in {}",
                 crate::privacy::redact_personal_path(&dir.display().to_string())
             )
-        })
+        })?;
+    Ok(())
 }
 
 impl From<&SessionManifest> for PriorRun {

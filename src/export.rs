@@ -16,7 +16,9 @@ use polars::prelude::{
     CsvWriter, DataFrame, LazyFrame, PlRefPath, ScanArgsParquet, SerWriter, UnionArgs, col, concat,
     lit,
 };
-use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -261,16 +263,22 @@ fn publish_temp_export(temporary: &Path, path: &Path, redacted: impl Fn() -> Str
         return Err(error).with_context(|| format!("failed to publish {}", redacted()));
     }
 
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-    let parent = parent.unwrap_or_else(|| Path::new("."));
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .with_context(|| {
-            format!(
-                "failed to persist export rename in {}",
-                redact_personal_path(&parent.display().to_string())
-            )
-        })
+    // Windows cannot open a directory as a plain file handle, so `sync_all` on
+    // it fails with "Access is denied"; NTFS journals the rename itself.
+    #[cfg(unix)]
+    {
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+        let parent = parent.unwrap_or_else(|| Path::new("."));
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| {
+                format!(
+                    "failed to persist export rename in {}",
+                    redact_personal_path(&parent.display().to_string())
+                )
+            })?;
+    }
+    Ok(())
 }
 
 /// Write CSV to `path` without truncating an existing export on failure.
@@ -281,8 +289,9 @@ fn publish_temp_export(temporary: &Path, path: &Path, redacted: impl Fn() -> Str
 /// replacement atomic. Mirrors `manifest.rs`'s `write_temp_manifest`/
 /// `publish_manifest`: `create_new` refuses to write through a pre-planted
 /// symlink at the temp path (CWE-59/377), the file is `sync_all`'d before the
-/// rename, cleanup runs on any failure (not just a failed rename), and the
-/// directory is fsynced after so the rename itself survives a crash.
+/// rename, cleanup runs on any failure (not just a failed rename), and on Unix
+/// the directory is fsynced after so the rename itself survives a crash
+/// (Windows cannot fsync a directory; NTFS journals the rename itself).
 ///
 /// (This is the third temp-then-rename site in the tree, after `manifest.rs` and
 /// the Parquet writer in `main.rs`; consolidating them is tracked separately.)

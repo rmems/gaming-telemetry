@@ -184,6 +184,9 @@ fn write_to_parquet(samples: Vec<GpuSample>, batch_id: u32, output_dir: &Path) -
         let _ = remove_file(&temporary);
         return Err(error.into());
     }
+    // Windows cannot open a directory as a plain file handle, so `sync_all` on
+    // it fails with "Access is denied"; NTFS journals the rename itself.
+    #[cfg(unix)]
     File::open(output_dir)?.sync_all()?;
 
     println!(

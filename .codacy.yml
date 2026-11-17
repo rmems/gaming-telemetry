@@ -1,3 +1,11 @@
 ---
+# The unsafe-usage audit rule fires on every `unsafe {}` block; the Win32
+# mapping/mutex FFI in hwinfo.rs is unsafe-by-contract (each block carries a
+# SAFETY comment), so the file is excluded from semgrep only — every other
+# engine still analyzes it.
+engines:
+  semgrep:
+    exclude_paths:
+      - "src/cpu/hwinfo.rs"
 exclude_paths:
   - "CLAUDE.md"

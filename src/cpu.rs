@@ -503,11 +503,13 @@ mod tests {
     /// Restores permissions and removes the fixture directory on drop, including
     /// on an unwinding panic — a failed assertion must not leave a `0o000` file
     /// behind for a later test run to inherit if the OS reuses this PID.
+    #[cfg(unix)]
     struct UnreadableFixtureGuard {
         dir: std::path::PathBuf,
         unreadable: std::path::PathBuf,
     }
 
+    #[cfg(unix)]
     impl Drop for UnreadableFixtureGuard {
         fn drop(&mut self) {
             use std::os::unix::fs::PermissionsExt;
@@ -519,6 +521,7 @@ mod tests {
 
     /// The core claim of the RAPL fix: prefer a counter that can be *read*, not
     /// merely one that exists.
+    #[cfg(unix)]
     #[test]
     fn discovery_skips_an_unreadable_candidate_for_a_readable_one() {
         use std::os::unix::fs::PermissionsExt;

@@ -366,17 +366,26 @@ mod tests {
         assert_eq!(parse_and_select(&body).tctl_c, None);
     }
 
-    /// When the feed carries timestamps, a sample line missing one counts as
-    /// truncated — a severed `142.5` must not come back as a valid `14`.
+    /// Rejected inputs all map to `None`, never a fabricated value:
+    /// implausible magnitudes, negative power, and — when the feed carries
+    /// timestamps — a sample line missing its own (a severed `142.5` must
+    /// not come back as a valid `14`).
     #[test]
-    fn a_timestamped_feed_rejects_lines_missing_theirs() {
-        let body = body(&[
+    fn rejected_readings_stay_none() {
+        let sample = parse_and_select(&body(&[
+            &format!(
+                "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\"}} 9999.0 {NOW}"
+            ),
+            &format!("lhm_cpu_power_watts {{\"sensorName\"=\"Package\"}} -5.0 {NOW}"),
+        ]));
+        assert_eq!(sample, CpuSample::EMPTY);
+
+        let sample = parse_and_select(&body(&[
             &format!(
                 "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\"}} 61.5 {NOW}"
             ),
             "lhm_cpu_power_watts {\"sensorName\"=\"Package\"} 14",
-        ]);
-        let sample = parse_and_select(&body);
+        ]));
         assert_eq!(sample.tctl_c, Some(61.5));
         assert_eq!(sample.package_power_w, None);
     }
@@ -388,19 +397,6 @@ mod tests {
         let body =
             body(&["lhm_cpu_temperature_celsius {\"sensorName\"=\"Core (Tctl/Tdie)\"} 61.5"]);
         assert_eq!(parse_and_select(&body).tctl_c, Some(61.5));
-    }
-
-    #[test]
-    fn implausible_values_become_none() {
-        let body = body(&[
-            &format!(
-                "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\"}} 9999.0 {NOW}"
-            ),
-            &format!("lhm_cpu_power_watts {{\"sensorName\"=\"Package\"}} -5.0 {NOW}"),
-        ]);
-        let sample = parse_and_select(&body);
-        assert_eq!(sample.tctl_c, None);
-        assert_eq!(sample.package_power_w, None);
     }
 
     #[test]

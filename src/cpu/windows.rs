@@ -261,8 +261,19 @@ impl HwinfoSource {
     /// `Some` with this tick's sample while the feed advances, `None` once it
     /// has been frozen longer than [`HWINFO_STALE`].
     fn poll(&mut self, now: Instant) -> Option<CpuSample> {
-        let buf = self.shm.snapshot()?;
-        let scan = hwinfo::scan(&buf)?;
+        // A snapshot or scan failure — mutex held, mapping gone, corrupt
+        // layout — is "no trustworthy sample this tick". It counts toward the
+        // frozen clock the same way an unchanged stamp does, so a
+        // persistently unreadable feed still gets abandoned rather than
+        // re-polled forever.
+        let Some(buf) = self.shm.snapshot() else {
+            self.frozen_since.get_or_insert(now);
+            return None;
+        };
+        let Some(scan) = hwinfo::scan(&buf) else {
+            self.frozen_since.get_or_insert(now);
+            return None;
+        };
         if scan.stamp != self.stamp {
             self.stamp = scan.stamp;
             self.advanced_at = now;

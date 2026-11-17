@@ -250,10 +250,11 @@ mod imp {
     const MAPPING_NAME: &str = "Global\\HWiNFO_SENS_SM2";
     const MUTEX_NAME: &str = "Global\\HWiNFO_SM2_MUTEX";
 
-    /// HWiNFO holds its sensor mutex only for the span of a write, so the
-    /// wait is uncontended in practice; the bound exists for a wedged lock —
-    /// this tick reports nothing rather than copy a mid-update region.
-    const MUTEX_WAIT_MS: u32 = 50;
+    /// Zero: snapshots run inside a 5 ms capture tick, so the mutex is
+    /// *polled*, never waited on. HWiNFO holds it only for the span of a
+    /// write, so a timeout is rare — and means "no trustworthy sample this
+    /// tick" rather than "block the tick for the producer".
+    const MUTEX_WAIT_MS: u32 = 0;
 
     /// A read-only view of HWiNFO's shared sensor region.
     ///
@@ -312,11 +313,12 @@ mod imp {
 
         /// Copy the mapped region out for parsing, under the producer mutex.
         /// Copying rather than holding a borrow keeps every later bounds
-        /// check against a stable buffer, and holding the mutex for the copy
+        /// check against a stable buffer, and polling the mutex for the copy
         /// keeps a mid-update region — torn `f64`s and all — out of the
-        /// telemetry columns. `None` when the mutex is absent (producer gone)
-        /// or cannot be taken in time (wedged) — both mean "no trustworthy
-        /// sample this tick", which is what `None` is for.
+        /// telemetry columns. `None` when the mutex is absent (producer
+        /// gone), held (collided with HWiNFO's own write, or wedged), or the
+        /// wait otherwise fails — all mean "no trustworthy sample this tick",
+        /// which is what `None` is for.
         pub fn snapshot(&self) -> Option<Vec<u8>> {
             if self.len < HEADER_SIZE {
                 return None;

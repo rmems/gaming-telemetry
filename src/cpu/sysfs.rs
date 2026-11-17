@@ -517,12 +517,17 @@ mod tests {
         std::fs::write(&readable, "222\n").unwrap();
         std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-        // Running as root would defeat the point: 0o000 stays readable there.
-        if super::read_u64_file(&unreadable).is_none() {
-            let picked =
-                CpuMonitor::first_readable([unreadable.as_path(), readable.as_path()].into_iter());
-            assert_eq!(picked.as_deref(), Some(readable.as_path()));
-        }
+        // Running as root reads 0o000 files anyway, so the expectation differs
+        // per case — but a real result is asserted either way rather than the
+        // test silently passing under a privileged run.
+        let picked =
+            CpuMonitor::first_readable([unreadable.as_path(), readable.as_path()].into_iter());
+        let expected = if super::read_u64_file(&unreadable).is_none() {
+            readable.as_path()
+        } else {
+            unreadable.as_path()
+        };
+        assert_eq!(picked.as_deref(), Some(expected));
     }
 
     #[test]

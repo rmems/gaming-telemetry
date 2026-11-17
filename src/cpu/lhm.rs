@@ -59,9 +59,11 @@ pub struct Reading {
 pub fn fetch(addr: &str) -> Option<String> {
     let raw = http_get(addr)?;
     let (headers, body) = split_response(&raw)?;
-    if !headers.starts_with("HTTP/")
-        || !headers[..headers.find('\r').unwrap_or(20).min(headers.len())].contains(" 200")
-    {
+    // Parse the status code rather than substring-matching the reason phrase:
+    // a byte-length slice can split a multibyte char, and " 200" also matches
+    // a non-200 status whose reason text contains it.
+    let mut status = headers.lines().next().unwrap_or("").split_whitespace();
+    if !status.next().is_some_and(|v| v.starts_with("HTTP/")) || status.next() != Some("200") {
         return None;
     }
     let declared_len = content_length(headers);

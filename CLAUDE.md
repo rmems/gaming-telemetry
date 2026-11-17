@@ -26,7 +26,7 @@ Run fmt and clippy before committing; CI fails on either. The MSRV guard in `ci.
 ## Architecture map
 
 - `src/main.rs`: `gaming-telemetry` collector (NVML poll, buffer, Parquet batches). `src/lib.rs` is the shared library.
-- `src/session.rs`, `src/manifest.rs`, `src/timing.rs`, `src/cpu.rs`: session labels and directories, manifest, timing, hwmon/RAPL sensors.
+- `src/session.rs`, `src/manifest.rs`, `src/timing.rs`, `src/cpu/`: session labels and directories, manifest, timing, CPU sensors (`sysfs.rs` = Linux hwmon/RAPL; `windows.rs`/`hwinfo.rs`/`lhm.rs` = Windows HWiNFO shared memory → LibreHardwareMonitor `/metrics`).
 - `src/export.rs` + `src/bin/export_csv.rs`: canonical CSV export for `corinth-canal`. `src/bin/query.rs`: DuckDB query tool (feature `query`).
 - `src/privacy.rs`: path redaction for anything printed or recorded. `src/build_info.rs` + `build.rs`: git SHA build info.
 - `src/manifest_failure_tests.rs`: manifest failure-path tests. There is no `tests/` directory.

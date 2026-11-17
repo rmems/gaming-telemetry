@@ -1,24 +1,12 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! CPU telemetry via Linux k10temp (hwmon) and powercap RAPL energy counters.
-//!
-//! Every reading is an `Option`. A sensor that is absent, unreadable, or not yet
-//! primed yields `None` — never `0.0`. A fabricated zero is indistinguishable
-//! from a genuinely idle CPU once it reaches a training set, and silently
-//! teaches a model that CPU power is constant.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// One tick of CPU telemetry. `None` means "not measured", never "zero".
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CpuSample {
-    pub tctl_c: Option<f32>,
-    pub ccd1_c: Option<f32>,
-    pub ccd2_c: Option<f32>,
-    pub package_power_w: Option<f32>,
-}
+use super::{CpuSample, MAX_PLAUSIBLE_PACKAGE_POWER_W};
 
 /// Tracks the energy counter between ticks so package power can be differentiated.
 pub struct CpuMonitor {
@@ -42,14 +30,6 @@ pub struct CpuMonitor {
 /// otherwise differentiate to a plausible 0 W — the very failure this module
 /// exists to prevent.
 const STUCK_COUNTER_TICKS: u32 = 200;
-
-/// No RAPL-metered CPU package draws anywhere close to this much power. A delta
-/// implying more means the counter didn't wrap, it *reset* — S3/S4 resume, driver
-/// reload — and got misread as one: `energy_delta_uj` cannot tell a genuine wrap
-/// (previous reading near the ceiling) from a reset to an arbitrary low value
-/// using the two counter readings alone, so implausible results are caught here
-/// instead, where the elapsed time makes an implied wattage available to check.
-const MAX_PLAUSIBLE_PACKAGE_POWER_W: f64 = 1000.0;
 
 impl Default for CpuMonitor {
     fn default() -> Self {

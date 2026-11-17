@@ -189,9 +189,10 @@ fn write_to_parquet(samples: Vec<GpuSample>, batch_id: u32, output_dir: &Path) -
     // there. NTFS journals the rename's *metadata* so the volume stays
     // consistent, but that does NOT make the rename durable: a power loss
     // before the journal checkpoints can roll it back to the previous file
-    // even though publish already returned Ok. If that trade-off becomes
-    // unacceptable, `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` is the Windows
-    // durability equivalent — nothing in `std` reaches it.
+    // even though publish already returned Ok. Windows offers no equivalent:
+    // `MoveFileExW`'s `MOVEFILE_WRITE_THROUGH` only flushes the
+    // copy-and-delete path, not a same-volume rename, so the directory-fsync
+    // guarantee Unix gives here is one Windows simply lacks.
     #[cfg(unix)]
     File::open(output_dir)?.sync_all()?;
 

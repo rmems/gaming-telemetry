@@ -268,9 +268,10 @@ fn publish_temp_export(temporary: &Path, path: &Path, redacted: impl Fn() -> Str
     // there. NTFS journals the rename's *metadata* so the volume stays
     // consistent, but that does NOT make the rename durable: a power loss
     // before the journal checkpoints can roll it back to the previous file
-    // even though publish already returned Ok. If that trade-off becomes
-    // unacceptable, `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` is the Windows
-    // durability equivalent — nothing in `std` reaches it.
+    // even though publish already returned Ok. Windows offers no equivalent:
+    // `MoveFileExW`'s `MOVEFILE_WRITE_THROUGH` only flushes the
+    // copy-and-delete path, not a same-volume rename, so the directory-fsync
+    // guarantee Unix gives here is one Windows simply lacks.
     #[cfg(unix)]
     {
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
@@ -297,7 +298,8 @@ fn publish_temp_export(temporary: &Path, path: &Path, redacted: impl Fn() -> Str
 /// symlink at the temp path (CWE-59/377), the file is `sync_all`'d before the
 /// rename, cleanup runs on any failure (not just a failed rename), and on Unix
 /// the directory is fsynced after so the rename itself survives a crash
-/// (Windows cannot fsync a directory; NTFS journals the rename itself).
+/// (Windows cannot fsync a directory, so the rename is not durable there —
+/// see `publish_temp_export` for the full trade-off).
 ///
 /// (This is the third temp-then-rename site in the tree, after `manifest.rs` and
 /// the Parquet writer in `main.rs`; consolidating them is tracked separately.)

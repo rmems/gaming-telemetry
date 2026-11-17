@@ -37,7 +37,8 @@ MangoHud (or any overlay) is **not** recorded. You may still run it yourself for
 
 ## Prerequisites
 
-- **OS**: Linux (developed on Fedora)
+- **OS**: Linux (developed on Fedora) or Windows 10/11 — see
+  [CPU sensors on Windows](#cpu-sensors-on-windows) for its extra prerequisites
 - **GPU**: NVIDIA with NVML (RTX 50-series preferred)
 - **Build**: Rust 1.98+ / Cargo
 
@@ -340,6 +341,34 @@ CPU package power unavailable: no readable RAPL energy counter. ...
 
 To record CPU power, run the collector as root, or grant read access to the
 counter for your user.
+
+#### CPU sensors on Windows
+
+Windows has no hwmon or RAPL sysfs, so the collector reads a sensor host you run
+alongside it. Probe order:
+
+1. **HWiNFO64 shared memory** — enable "Shared Memory Support" under
+   Settings → General/User Interface and keep HWiNFO running (sensors-only mode
+   is enough). Readings are memory-mapped, fast enough for the highest poll
+   rates. The free edition freezes the shared region after 12 hours of
+   continuous use; the collector detects the freeze and the columns go null
+   rather than repeating stale numbers.
+2. **LibreHardwareMonitor `/metrics`** — enable the remote web server under
+   Options → Remote Web Server → Run (default port 8085) and keep LHM running
+   as administrator. The collector polls `http://127.0.0.1:8085/metrics` at
+   most every 500 ms — a loopback read of sensor data only, and the only
+   network traffic the collector ever makes. LHM's WMI namespace was removed in
+   0.9.5, so the web server is required even on versions that still publish
+   WMI.
+3. **Neither present** — all four `cpu_*` columns stay null, and the collector
+   keeps re-probing every 30 s so a sensor host started mid-session is picked
+   up.
+
+On Ryzen, `cpu_tctl_c` maps to `CPU (Tctl/Tdie)` / `Core (Tctl/Tdie)` and the
+CCD columns to `CCD1 (Tdie)` / `CCD2 (Tdie)`; on Intel the package temperature
+maps to `CPU Package`. Whatever the host actually reports is what lands in the
+columns — a single-CCD part leaves `cpu_ccd2_c` null, and a feed that freezes
+or dies is reported as null, never as a repeated or zeroed value.
 
 **Consumers must handle nulls.** Treating a null as `0` or `0.0` reintroduces
 exactly the bug this avoids: a model trained on zero-filled power, clocks, or

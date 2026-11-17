@@ -15,6 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: rustfmt
@@ -75,6 +77,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: clippy,llvm-tools-preview
@@ -88,6 +92,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.98.0"
@@ -97,6 +103,32 @@ jobs:
       - name: Cargo check (strict -D warnings, all features)
         run: RUSTFLAGS="-D warnings" cargo check --locked --all-features
 
+  # The Windows CPU backend (windows-sys file mapping, mutex, probe dispatch)
+  # is `#[cfg(windows)]` — Linux jobs never compile it. This job exists so the
+  # Windows-only path is built and tested on every PR, not just the portable
+  # parsers that run under cfg(test) on Linux. Default features only: the
+  # `query` feature's bundled-DuckDB C++ build would dominate the job.
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.7.3
+      - name: Cargo check (default features)
+        run: cargo check --locked
+      - name: clippy (default features)
+        # The Linux clippy job never compiles `#[cfg(windows)]` code.
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test (default features)
+        run: cargo test --locked
+
   test:
     runs-on: ubuntu-latest
     permissions:
@@ -104,6 +136,8 @@ jobs:
       id-token: write # Qlty coverage upload (OIDC)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: llvm-tools-preview
@@ -143,6 +177,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.98.0"

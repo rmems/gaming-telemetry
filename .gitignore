@@ -12,6 +12,7 @@
 .codex/
 .grok/
 .opencode/
+.firecrawl/
 docs/superpowers/
 
 # Compiled output

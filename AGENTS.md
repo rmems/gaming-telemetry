@@ -17,7 +17,8 @@ Steam/Proton discovery or mod scanner, and graphics settings are an operator che
 | `src/bin/export_csv.rs` | `export_csv`: corinth-ingest CSV (default) or `--labelled` six-column CSV |
 | `src/bin/query.rs` | `query` binary (needs the `query` feature, which builds bundled DuckDB) |
 | `src/corinth_csv.rs` | Frozen vahtisiru telemetry CSV contract: writer, reader mirror, fail-loud gates |
-| `src/session.rs`, `src/manifest.rs`, `src/export.rs`, `src/privacy.rs`, `src/cpu.rs`, `src/timing.rs` | Session/manifest handling, export, redaction, CPU sensors, timing |
+| `src/session.rs`, `src/manifest.rs`, `src/export.rs`, `src/privacy.rs`, `src/timing.rs` | Session/manifest handling, export, redaction, timing |
+| `src/cpu/` | `CpuMonitor` facade (`mod.rs`): `sysfs.rs` (Linux k10temp/RAPL), `windows.rs` (probe + dispatch), `hwinfo.rs` (HWiNFO64 shared memory), `lhm.rs` (LibreHardwareMonitor `/metrics`) |
 | `build.rs`, `src/build_info.rs` | Embeds the git SHA (`AGENTOS_GIT_SHA` override) as build info |
 
 ## Toolchain
@@ -55,3 +56,8 @@ Run the collector: `SESSION_LABEL=my-session cargo run --release --bin gaming-te
   `src/manifest_failure_tests.rs` currently do not.
 - `CHANGELOG.md` is maintained. Commit subjects follow Conventional Commits; scopes
   (`fix(privacy):`, `feat(export):`) and PR numbers are optional.
+- PRs for this repo go on the **Theseus Machine Physiology** board
+  (`github.com/users/rmems/projects/7`): add each new PR with
+  `gh project item-add 7 --owner rmems --url <pr>` and set its status (`In review`
+  while open). Apply the usual metadata too — assignee `rmems`, existing labels
+  only, milestone only when one already exists.

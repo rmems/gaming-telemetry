@@ -1,0 +1,476 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! LibreHardwareMonitor `/metrics` sensor feed.
+//!
+//! LibreHardwareMonitor 0.9.5 removed the `ROOT\LibreHardwareMonitor` WMI
+//! namespace; its built-in web server is the only out-of-process interface on
+//! current releases. The server is off by default — the operator turns it on
+//! under Options → Remote Web Server, and it listens on port 8085.
+//!
+//! The `/metrics` endpoint speaks Prometheus text format, one line per sensor
+//! sample:
+//!
+//! ```text
+//! lhm_cpu_temperature_celsius {"sensorName"="Core (Tctl/Tdie)", "sensorId"="/temperature/2", "hardwareId"="/amdcpu/0", ...} 65.5 1763340000000
+//! ```
+//!
+//! `?timestamps=1` is requested so each line carries a millisecond epoch,
+//! giving the caller a staleness check that survives a frozen feed. The fetch
+//! is a loopback `TcpStream` — a deliberate exception to the collector's
+//! no-network rule, kept to exactly one hardcoded loopback address carrying
+//! only sensor data the operator chose to publish.
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
+
+use super::{CpuSample, MAX_PLAUSIBLE_PACKAGE_POWER_W, contains_token};
+
+/// LHM's default listener. Only loopback is ever contacted.
+#[cfg(windows)]
+pub const DEFAULT_ADDR: &str = "127.0.0.1:8085";
+const METRICS_PATH: &str = "/metrics?timestamps=1";
+
+/// A refused loopback connect returns fast; a blackholed one must not stall a
+/// telemetry tick, so both timeouts stay well under a second.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
+const IO_TIMEOUT: Duration = Duration::from_millis(800);
+/// A drip-feeding server could satisfy the per-read timeout indefinitely;
+/// bound the whole request instead.
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
+/// A real response is tens of kilobytes; anything far larger is not LHM.
+const MAX_RESPONSE: usize = 1 << 20;
+
+const METRIC_TEMPERATURE: &str = "lhm_cpu_temperature_celsius";
+const METRIC_POWER: &str = "lhm_cpu_power_watts";
+
+/// One parsed sample line.
+#[derive(Debug)]
+pub struct Reading {
+    pub metric: String,
+    pub sensor_name: String,
+    pub value: f64,
+    /// Millisecond epoch when LHM sampled the value, when the server sent one.
+    pub ts_ms: Option<i64>,
+}
+
+/// `GET` the metrics endpoint and return the response body. `None` when the
+/// server is unreachable, replies with a non-200 status, or sends too much.
+pub fn fetch(addr: &str) -> Option<String> {
+    let raw = http_get(addr)?;
+    let (headers, body) = split_response(&raw)?;
+    // Parse the status code rather than substring-matching the reason phrase:
+    // a byte-length slice can split a multibyte char, and " 200" also matches
+    // a non-200 status whose reason text contains it.
+    let mut status = headers.lines().next().unwrap_or("").split_whitespace();
+    if !status.next().is_some_and(|v| v.starts_with("HTTP/")) || status.next() != Some("200") {
+        return None;
+    }
+    let declared_len = content_length(headers);
+    let body = if headers
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        dechunk(body)?
+    } else {
+        body.to_vec()
+    };
+    // A connection cut mid-response leaves a short body; a truncated final
+    // sample line could otherwise parse as a valid, different value.
+    if declared_len.is_some_and(|n| body.len() < n) {
+        return None;
+    }
+    String::from_utf8(body).ok()
+}
+
+/// The response's declared `Content-Length`, if any.
+fn content_length(headers: &str) -> Option<usize> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())?
+    })
+}
+
+fn http_get(addr: &str) -> Option<Vec<u8>> {
+    let mut stream = TcpStream::connect_timeout(&addr.parse().ok()?, CONNECT_TIMEOUT).ok()?;
+    stream.set_read_timeout(Some(IO_TIMEOUT)).ok()?;
+    stream.set_write_timeout(Some(IO_TIMEOUT)).ok()?;
+    stream
+        .write_all(
+            format!("GET {METRICS_PATH} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .ok()?;
+    read_response(&mut stream)
+}
+
+/// Read a response body to EOF, the per-read timeout, or the total deadline —
+/// whichever comes first.
+fn read_response(stream: &mut TcpStream) -> Option<Vec<u8>> {
+    let start = std::time::Instant::now();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        if start.elapsed() > TOTAL_TIMEOUT {
+            return None;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) if buf.len() + n > MAX_RESPONSE => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // WouldBlock/TimedOut: the server stalled mid-body. Keep what
+            // arrived — the caller rejects bodies short of Content-Length,
+            // and the parser skips malformed lines.
+            Err(_) => break,
+        }
+    }
+    Some(buf)
+}
+
+/// Split a raw HTTP response into (header section, body).
+fn split_response(raw: &[u8]) -> Option<(&str, &[u8])> {
+    let pos = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let headers = std::str::from_utf8(&raw[..pos]).ok()?;
+    Some((headers, &raw[pos + 4..]))
+}
+
+/// Decode `Transfer-Encoding: chunked`. `None` on malformed framing.
+fn dechunk(body: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    loop {
+        let line_end = rest.windows(2).position(|w| w == b"\r\n")?;
+        let size_text = std::str::from_utf8(&rest[..line_end]).ok()?;
+        let size = usize::from_str_radix(size_text.trim().split(';').next()?, 16).ok()?;
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            return Some(out);
+        }
+        let crlf_end = size.checked_add(2)?;
+        if rest.len() < crlf_end {
+            return None;
+        }
+        out.extend_from_slice(&rest[..size]);
+        rest = &rest[crlf_end..]; // skip trailing CRLF
+    }
+}
+
+/// Parse every well-formed sample line. Comment (`#`) and malformed lines are
+/// skipped; where a sensor appears more than once (archived history), only the
+/// newest timestamp survives.
+pub fn parse(body: &str) -> Vec<Reading> {
+    let mut out: Vec<Reading> = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(reading) = parse_line(line) {
+            upsert(&mut out, reading);
+        }
+    }
+    out
+}
+
+/// Keep the newest sample per `(metric, sensor_name)` — LHM 0.9.5 lists
+/// archived history per sensor, newest timestamp wins.
+fn upsert(out: &mut Vec<Reading>, reading: Reading) {
+    match out
+        .iter_mut()
+        .find(|r| r.metric == reading.metric && r.sensor_name == reading.sensor_name)
+    {
+        Some(existing) if reading.ts_ms > existing.ts_ms => *existing = reading,
+        Some(_) => {}
+        None => out.push(reading),
+    }
+}
+
+fn parse_line(line: &str) -> Option<Reading> {
+    let (head, rest) = line.split_once('{')?;
+    let (labels, rest) = rest.split_once('}')?;
+    let metric = head.trim().to_string();
+    if !metric.starts_with("lhm_") {
+        return None;
+    }
+    let mut fields = rest.split_whitespace();
+    let value: f64 = fields.next()?.parse().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
+    let ts_ms = fields.next().and_then(|t| t.parse::<i64>().ok());
+    Some(Reading {
+        metric,
+        sensor_name: sensor_name(labels),
+        value,
+        ts_ms,
+    })
+}
+
+/// The `sensorName` label of a `{ "k"="v", ... }` list, or empty.
+fn sensor_name(labels: &str) -> String {
+    let mut rest = labels;
+    while let Some((_, after_quote)) = rest.split_once('"') {
+        let Some((key, after_key)) = after_quote.split_once('"') else {
+            break;
+        };
+        let Some((_, value_part)) = after_key.split_once('"') else {
+            break;
+        };
+        let Some((val, remaining)) = value_part.split_once('"') else {
+            break;
+        };
+        if key == "sensorName" {
+            return val.to_string();
+        }
+        rest = remaining;
+    }
+    String::new()
+}
+
+/// Pick the four telemetry columns. `now_ms` gates freshness: a reading whose
+/// timestamp is further than `stale_ms` from `now_ms` in *either* direction
+/// counts as not measured — a far-future stamp pins a column just as a stale
+/// one does.
+pub fn select(readings: &[Reading], now_ms: i64, stale_ms: i64) -> CpuSample {
+    // Timestamps are requested via `?timestamps=1`. When the response carries
+    // them, a sample without one — or with one far from `now_ms` in *either*
+    // direction — counts as not measured: a far-future stamp pins a column
+    // just as a stale one does, and a missing stamp usually means the line
+    // was truncated mid-write. A server that emits no timestamps at all is
+    // trusted as fresh.
+    let any_ts = readings.iter().any(|r| r.ts_ms.is_some());
+    let fresh: Vec<&Reading> = readings
+        .iter()
+        .filter(|r| {
+            // `abs_diff`: a corrupt extreme timestamp must not overflow the
+            // subtraction and wrap back into the window.
+            !any_ts
+                || r.ts_ms
+                    .is_some_and(|ts| now_ms.abs_diff(ts) <= stale_ms.max(0) as u64)
+        })
+        .collect();
+    CpuSample {
+        tctl_c: pick(&fresh, &Spec::temp(&["tctl", "package"])),
+        ccd1_c: pick(&fresh, &Spec::temp(&["ccd1"])),
+        ccd2_c: pick(&fresh, &Spec::temp(&["ccd2"])),
+        package_power_w: pick(&fresh, &Spec::power(&["package"])),
+    }
+}
+
+/// Which metric a column reads and which sensor-name tokens select it.
+struct Spec<'a> {
+    metric: &'a str,
+    needles: &'a [&'a str],
+    is_temp: bool,
+}
+
+impl<'a> Spec<'a> {
+    fn temp(needles: &'a [&'a str]) -> Self {
+        Self {
+            metric: METRIC_TEMPERATURE,
+            needles,
+            is_temp: true,
+        }
+    }
+
+    fn power(needles: &'a [&'a str]) -> Self {
+        Self {
+            metric: METRIC_POWER,
+            needles,
+            is_temp: false,
+        }
+    }
+}
+
+fn pick(readings: &[&Reading], spec: &Spec) -> Option<f32> {
+    for needle in spec.needles {
+        if let Some(r) = readings
+            .iter()
+            .find(|r| r.metric == spec.metric && contains_token(&r.sensor_name, needle))
+        {
+            return plausible(r.value, spec.is_temp);
+        }
+    }
+    None
+}
+
+fn plausible(v: f64, is_temp: bool) -> Option<f32> {
+    if is_temp {
+        (v.is_finite() && (-50.0..=200.0).contains(&v)).then_some(v as f32)
+    } else {
+        (v.is_finite() && (0.0..=MAX_PLAUSIBLE_PACKAGE_POWER_W).contains(&v)).then_some(v as f32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_763_340_000_000;
+    const STALE: i64 = 10_000;
+
+    fn body(lines: &[&str]) -> String {
+        lines.join("\n")
+    }
+
+    fn parse_and_select(body: &str) -> CpuSample {
+        select(&parse(body), NOW, STALE)
+    }
+
+    #[test]
+    fn a_full_ryzen_metrics_page_yields_all_four_columns() {
+        let body = body(&[
+            "# TYPE lhm_cpu_temperature_celsius gauge",
+            &format!(
+                "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\", \"sensorId\"=\"/temperature/2\", \"hardwareId\"=\"/amdcpu/0\"}} 61.5 {NOW}"
+            ),
+            &format!(
+                "lhm_cpu_temperature_celsius {{\"sensorName\"=\"CCD1 (Tdie)\", \"sensorId\"=\"/temperature/3\", \"hardwareId\"=\"/amdcpu/0\"}} 68.0 {NOW}"
+            ),
+            &format!(
+                "lhm_cpu_temperature_celsius {{\"sensorName\"=\"CCD2 (Tdie)\", \"sensorId\"=\"/temperature/4\", \"hardwareId\"=\"/amdcpu/0\"}} 55.0 {NOW}"
+            ),
+            "# TYPE lhm_cpu_power_watts gauge",
+            &format!(
+                "lhm_cpu_power_watts {{\"sensorName\"=\"Package\", \"sensorId\"=\"/power/0\", \"hardwareId\"=\"/amdcpu/0\"}} 142.5 {NOW}"
+            ),
+        ]);
+        let sample = parse_and_select(&body);
+        assert_eq!(sample.tctl_c, Some(61.5));
+        assert_eq!(sample.ccd1_c, Some(68.0));
+        assert_eq!(sample.ccd2_c, Some(55.0));
+        assert_eq!(sample.package_power_w, Some(142.5));
+    }
+
+    #[test]
+    fn intel_package_names_also_resolve() {
+        let body = body(&[
+            &format!(
+                "lhm_cpu_temperature_celsius {{\"sensorName\"=\"CPU Package\", \"hardwareId\"=\"/intelcpu/0\"}} 72.0 {NOW}"
+            ),
+            &format!(
+                "lhm_cpu_power_watts {{\"sensorName\"=\"CPU Package\", \"hardwareId\"=\"/intelcpu/0\"}} 95.0 {NOW}"
+            ),
+        ]);
+        let sample = parse_and_select(&body);
+        assert_eq!(sample.tctl_c, Some(72.0));
+        assert_eq!(sample.package_power_w, Some(95.0));
+    }
+
+    #[test]
+    fn missing_sensors_stay_none() {
+        let body = body(&[&format!(
+            "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\"}} 61.5 {NOW}"
+        )]);
+        let sample = parse_and_select(&body);
+        assert_eq!(sample.ccd1_c, None);
+        assert_eq!(sample.package_power_w, None);
+    }
+
+    /// LHM 0.9.5 emits archived history per sensor; the newest timestamp wins.
+    #[test]
+    fn archived_samples_keep_the_newest() {
+        let body = body(&[
+            &format!(
+                "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\"}} 99.0 {}",
+                NOW - 3000
+            ),
+            &format!(
+                "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\"}} 61.5 {NOW}"
+            ),
+        ]);
+        assert_eq!(parse_and_select(&body).tctl_c, Some(61.5));
+    }
+
+    #[test]
+    fn stale_timestamps_count_as_unmeasured() {
+        let body = body(&[&format!(
+            "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\"}} 61.5 {}",
+            NOW - STALE - 1
+        )]);
+        assert_eq!(parse_and_select(&body).tctl_c, None);
+    }
+
+    /// Rejected inputs all map to `None`, never a fabricated value:
+    /// implausible magnitudes, negative power, and — when the feed carries
+    /// timestamps — a sample line missing its own (a severed `142.5` must
+    /// not come back as a valid `14`).
+    #[test]
+    fn rejected_readings_stay_none() {
+        let sample = parse_and_select(&body(&[
+            &format!(
+                "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\"}} 9999.0 {NOW}"
+            ),
+            &format!("lhm_cpu_power_watts {{\"sensorName\"=\"Package\"}} -5.0 {NOW}"),
+        ]));
+        assert_eq!(sample, CpuSample::EMPTY);
+
+        let sample = parse_and_select(&body(&[
+            &format!(
+                "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\"}} 61.5 {NOW}"
+            ),
+            "lhm_cpu_power_watts {\"sensorName\"=\"Package\"} 14",
+        ]));
+        assert_eq!(sample.tctl_c, Some(61.5));
+        assert_eq!(sample.package_power_w, None);
+    }
+
+    /// A feed without any timestamps (an LHM build ignoring `?timestamps=1`)
+    /// is trusted as fresh rather than left unmeasurable.
+    #[test]
+    fn a_feed_without_timestamps_is_fresh() {
+        let body =
+            body(&["lhm_cpu_temperature_celsius {\"sensorName\"=\"Core (Tctl/Tdie)\"} 61.5"]);
+        assert_eq!(parse_and_select(&body).tctl_c, Some(61.5));
+    }
+
+    #[test]
+    fn chunked_bodies_decode() {
+        let chunked = b"20\r\nlhm_cpu_temperature_celsius 61.5\r\n0\r\n\r\n";
+        assert_eq!(
+            dechunk(chunked).unwrap(),
+            b"lhm_cpu_temperature_celsius 61.5"
+        );
+        assert!(dechunk(b"zz\r\nx\r\n").is_none());
+    }
+
+    /// Serve `page` once on an ephemeral loopback port; returns its address.
+    fn serve_once(page: &'static str) -> String {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut req = [0u8; 1024];
+            let _ = conn.read(&mut req);
+            conn.write_all(page.as_bytes()).unwrap();
+        });
+        addr
+    }
+
+    /// The loopback fetch against a real listener: the whole request/response
+    /// path, not just the parser.
+    #[test]
+    fn fetch_reads_a_live_loopback_server() {
+        let addr = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 36\r\n\r\nlhm_cpu_temperature_celsius {} 61.5\n",
+        );
+        let body = fetch(&addr).expect("server answered");
+        assert!(body.contains("lhm_cpu_temperature_celsius"));
+    }
+
+    /// A connection cut mid-body must not yield the partial response — a
+    /// truncated final sample could otherwise parse as a valid value.
+    #[test]
+    fn fetch_rejects_a_body_short_of_content_length() {
+        // Declares 100 bytes, sends 36, closes.
+        let addr = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nlhm_cpu_temperature_celsius {} 61.5\n",
+        );
+        assert!(fetch(&addr).is_none());
+    }
+}

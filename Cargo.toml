@@ -38,3 +38,14 @@ anyhow = "1.0.104"
 # `Connection`/`row.get`, so the crate's Arrow<->Polars bridge is not needed.
 duckdb = { version = "1.10505.0", features = ["bundled"], optional = true }
 fs2 = "0.4.3"
+
+# CPU telemetry on Windows reads a running sensor host: HWiNFO64's shared
+# memory mapping (OpenFileMapping/MapViewOfFile) or LibreHardwareMonitor's
+# loopback /metrics server. Windows-only so the Linux build's dependency tree
+# is unchanged.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }

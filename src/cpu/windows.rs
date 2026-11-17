@@ -330,24 +330,27 @@ impl Drop for LhmSource {
 /// *outside* the lock and off the capture tick.
 fn fetch_loop(shared: Arc<Mutex<LhmShared>>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Relaxed) {
-        let result = fetch_sample();
-        if let Ok(mut shared) = shared.lock() {
-            match result {
-                Some(sample) => {
-                    // An answered request that yields nothing is not liveness:
-                    // a server whose readings all go stale must still fall out
-                    // of use so the monitor can re-probe another source.
-                    if sample != CpuSample::EMPTY {
-                        shared.succeeded_at = Instant::now();
-                    }
-                    shared.sample = sample;
-                }
-                // A failed fetch is not a stale value to keep serving — the
-                // columns go null until the server answers again.
-                None => shared.sample = CpuSample::EMPTY,
-            }
-        }
+        publish(shared.as_ref(), fetch_sample());
         thread::sleep(LHM_REFRESH);
+    }
+}
+
+/// Store one fetch result. An answered request that yields nothing is not
+/// liveness — a server whose readings all go stale must still fall out of use
+/// so the monitor can re-probe another source. A failed fetch is not a stale
+/// value to keep serving either: the columns go null until it answers again.
+fn publish(shared: &Mutex<LhmShared>, result: Option<CpuSample>) {
+    let Ok(mut shared) = shared.lock() else {
+        return;
+    };
+    match result {
+        Some(sample) => {
+            if sample != CpuSample::EMPTY {
+                shared.succeeded_at = Instant::now();
+            }
+            shared.sample = sample;
+        }
+        None => shared.sample = CpuSample::EMPTY,
     }
 }
 

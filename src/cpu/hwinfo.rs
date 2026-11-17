@@ -83,13 +83,16 @@ fn parse_layout(buf: &[u8]) -> Option<Layout> {
     if buf.len() < HEADER_SIZE || u32_at(buf, 0)? != MAGIC {
         return None;
     }
-    // One collect() applies the `?` to all six fields at once — a corrupt
-    // header yields None without six early-return branches.
-    let fields: Option<Vec<usize>> = [0x14, 0x18, 0x1C, 0x20, 0x24, 0x28]
-        .iter()
-        .map(|&off| u32_at(buf, off).map(|v| v as usize))
-        .collect();
-    let f = fields?;
+    // One pass applies `?` to all six fields at once — a corrupt header
+    // yields None without six early-return branches, and a fixed array keeps
+    // the per-tick scan allocation-free.
+    let mut f = [0usize; 6];
+    for (slot, &off) in f
+        .iter_mut()
+        .zip([0x14, 0x18, 0x1C, 0x20, 0x24, 0x28].iter())
+    {
+        *slot = u32_at(buf, off)? as usize;
+    }
     Layout {
         stamp: i64_at(buf, 0x0C)?,
         sensor_off: f[0],
@@ -340,10 +343,16 @@ mod imp {
                     return None;
                 }
                 let waited = WaitForSingleObject(mutex, MUTEX_WAIT_MS);
-                let buf = (waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED).then(|| {
+                // WAIT_ABANDONED means the previous owner died mid-write: the
+                // mutex is acquired (and must be released), but its contents
+                // may be torn, so the region is not copied this tick. The
+                // abandoned state clears once ownership changes hands, so the
+                // next tick parses whatever remains — which a frozen stamp or
+                // a dead producer then catches.
+                let buf = (waited == WAIT_OBJECT_0).then(|| {
                     std::slice::from_raw_parts(self.view.Value as *const u8, self.len).to_vec()
                 });
-                if buf.is_some() {
+                if waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED {
                     ReleaseMutex(mutex);
                 }
                 CloseHandle(mutex);

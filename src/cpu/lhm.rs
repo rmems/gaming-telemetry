@@ -57,7 +57,7 @@ pub struct Reading {
 /// `GET` the metrics endpoint and return the response body. `None` when the
 /// server is unreachable, replies with a non-200 status, or sends too much.
 pub fn fetch(addr: &str) -> Option<String> {
-    let raw = http_get(addr, METRICS_PATH)?;
+    let raw = http_get(addr)?;
     let (headers, body) = split_response(&raw)?;
     if !headers.starts_with("HTTP/")
         || !headers[..headers.find('\r').unwrap_or(20).min(headers.len())].contains(" 200")
@@ -91,13 +91,14 @@ fn content_length(headers: &str) -> Option<usize> {
     })
 }
 
-fn http_get(addr: &str, path: &str) -> Option<Vec<u8>> {
+fn http_get(addr: &str) -> Option<Vec<u8>> {
     let mut stream = TcpStream::connect_timeout(&addr.parse().ok()?, CONNECT_TIMEOUT).ok()?;
     stream.set_read_timeout(Some(IO_TIMEOUT)).ok()?;
     stream.set_write_timeout(Some(IO_TIMEOUT)).ok()?;
     stream
         .write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+            format!("GET {METRICS_PATH} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
         )
         .ok()?;
     read_response(&mut stream)
@@ -250,20 +251,45 @@ pub fn select(readings: &[Reading], now_ms: i64, stale_ms: i64) -> CpuSample {
         })
         .collect();
     CpuSample {
-        tctl_c: pick(&fresh, METRIC_TEMPERATURE, &["tctl", "package"]),
-        ccd1_c: pick(&fresh, METRIC_TEMPERATURE, &["ccd1"]),
-        ccd2_c: pick(&fresh, METRIC_TEMPERATURE, &["ccd2"]),
-        package_power_w: pick(&fresh, METRIC_POWER, &["package"]),
+        tctl_c: pick(&fresh, &Spec::temp(&["tctl", "package"])),
+        ccd1_c: pick(&fresh, &Spec::temp(&["ccd1"])),
+        ccd2_c: pick(&fresh, &Spec::temp(&["ccd2"])),
+        package_power_w: pick(&fresh, &Spec::power(&["package"])),
     }
 }
 
-fn pick(readings: &[&Reading], metric: &str, needles: &[&str]) -> Option<f32> {
-    for needle in needles {
+/// Which metric a column reads and which sensor-name tokens select it.
+struct Spec<'a> {
+    metric: &'a str,
+    needles: &'a [&'a str],
+    is_temp: bool,
+}
+
+impl<'a> Spec<'a> {
+    fn temp(needles: &'a [&'a str]) -> Self {
+        Self {
+            metric: METRIC_TEMPERATURE,
+            needles,
+            is_temp: true,
+        }
+    }
+
+    fn power(needles: &'a [&'a str]) -> Self {
+        Self {
+            metric: METRIC_POWER,
+            needles,
+            is_temp: false,
+        }
+    }
+}
+
+fn pick(readings: &[&Reading], spec: &Spec) -> Option<f32> {
+    for needle in spec.needles {
         if let Some(r) = readings
             .iter()
-            .find(|r| r.metric == metric && contains_token(&r.sensor_name, needle))
+            .find(|r| r.metric == spec.metric && contains_token(&r.sensor_name, needle))
         {
-            return plausible(r.value, metric == METRIC_TEMPERATURE);
+            return plausible(r.value, spec.is_temp);
         }
     }
     None

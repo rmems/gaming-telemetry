@@ -300,36 +300,12 @@ impl LhmSource {
             succeeded_at: now,
         }));
         let stop = Arc::new(AtomicBool::new(false));
-        let worker_shared = Arc::clone(&shared);
-        let worker_stop = Arc::clone(&stop);
         thread::Builder::new()
             .name("cpu-lhm-fetch".into())
-            .spawn(move || {
-                while !worker_stop.load(Ordering::Relaxed) {
-                    // The fetch blocks up to the request deadline; it must run
-                    // *outside* the lock or a stalled server would block the
-                    // capture tick that takes it.
-                    let result = fetch_sample();
-                    if let Ok(mut shared) = worker_shared.lock() {
-                        match result {
-                            Some(sample) => {
-                                // An answered request that yields nothing is
-                                // not liveness: a server whose readings all
-                                // go stale must still fall out of use so the
-                                // monitor can re-probe another source.
-                                if sample != CpuSample::EMPTY {
-                                    shared.succeeded_at = Instant::now();
-                                }
-                                shared.sample = sample;
-                            }
-                            // A failed fetch is not a stale value to keep
-                            // serving — the columns go null until the server
-                            // answers again.
-                            None => shared.sample = CpuSample::EMPTY,
-                        }
-                    }
-                    thread::sleep(LHM_REFRESH);
-                }
+            .spawn({
+                let shared = Arc::clone(&shared);
+                let stop = Arc::clone(&stop);
+                move || fetch_loop(shared, stop)
             })
             .ok()?;
         Some(Self { shared, stop })
@@ -346,6 +322,32 @@ impl LhmSource {
 impl Drop for LhmSource {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Fetch `/metrics` forever until `stop`, publishing each result into
+/// `shared`. The fetch blocks up to the request deadline, so it runs here —
+/// *outside* the lock and off the capture tick.
+fn fetch_loop(shared: Arc<Mutex<LhmShared>>, stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::Relaxed) {
+        let result = fetch_sample();
+        if let Ok(mut shared) = shared.lock() {
+            match result {
+                Some(sample) => {
+                    // An answered request that yields nothing is not liveness:
+                    // a server whose readings all go stale must still fall out
+                    // of use so the monitor can re-probe another source.
+                    if sample != CpuSample::EMPTY {
+                        shared.succeeded_at = Instant::now();
+                    }
+                    shared.sample = sample;
+                }
+                // A failed fetch is not a stale value to keep serving — the
+                // columns go null until the server answers again.
+                None => shared.sample = CpuSample::EMPTY,
+            }
+        }
+        thread::sleep(LHM_REFRESH);
     }
 }
 

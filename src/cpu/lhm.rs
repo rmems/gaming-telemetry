@@ -100,7 +100,12 @@ fn http_get(addr: &str, path: &str) -> Option<Vec<u8>> {
             format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
         )
         .ok()?;
+    read_response(&mut stream)
+}
 
+/// Read a response body to EOF, the per-read timeout, or the total deadline —
+/// whichever comes first.
+fn read_response(stream: &mut TcpStream) -> Option<Vec<u8>> {
     let start = std::time::Instant::now();
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];

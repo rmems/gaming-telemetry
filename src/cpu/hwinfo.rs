@@ -83,31 +83,42 @@ fn parse_layout(buf: &[u8]) -> Option<Layout> {
     if buf.len() < HEADER_SIZE || u32_at(buf, 0)? != MAGIC {
         return None;
     }
-    let layout = Layout {
+    // One collect() applies the `?` to all six fields at once — a corrupt
+    // header yields None without six early-return branches.
+    let fields: Option<Vec<usize>> = [0x14, 0x18, 0x1C, 0x20, 0x24, 0x28]
+        .iter()
+        .map(|&off| u32_at(buf, off).map(|v| v as usize))
+        .collect();
+    let f = fields?;
+    Layout {
         stamp: i64_at(buf, 0x0C)?,
-        sensor_off: u32_at(buf, 0x14)? as usize,
-        sensor_size: u32_at(buf, 0x18)? as usize,
-        sensor_count: u32_at(buf, 0x1C)? as usize,
-        entry_off: u32_at(buf, 0x20)? as usize,
-        entry_size: u32_at(buf, 0x24)? as usize,
-        entry_count: u32_at(buf, 0x28)? as usize,
-    };
-    let plausible = layout.sensor_size >= MIN_SENSOR_SIZE
-        && layout.entry_size >= MIN_ENTRY_SIZE
-        && layout.sensor_count <= MAX_ELEMENTS
-        && layout.entry_count <= MAX_ELEMENTS;
-    let in_bounds = section_in_bounds(
-        buf.len(),
-        layout.sensor_off,
-        layout.sensor_size,
-        layout.sensor_count,
-    ) && section_in_bounds(
-        buf.len(),
-        layout.entry_off,
-        layout.entry_size,
-        layout.entry_count,
-    );
-    (plausible && in_bounds).then_some(layout)
+        sensor_off: f[0],
+        sensor_size: f[1],
+        sensor_count: f[2],
+        entry_off: f[3],
+        entry_size: f[4],
+        entry_count: f[5],
+    }
+    .validate(buf.len())
+}
+
+impl Layout {
+    /// The decoded layout must have plausible element sizes/counts and keep
+    /// every declared section inside the buffer.
+    fn validate(self, buf_len: usize) -> Option<Self> {
+        let plausible = self.sensor_size >= MIN_SENSOR_SIZE
+            && self.entry_size >= MIN_ENTRY_SIZE
+            && self.sensor_count <= MAX_ELEMENTS
+            && self.entry_count <= MAX_ELEMENTS;
+        let in_bounds =
+            section_in_bounds(
+                buf_len,
+                self.sensor_off,
+                self.sensor_size,
+                self.sensor_count,
+            ) && section_in_bounds(buf_len, self.entry_off, self.entry_size, self.entry_count);
+        (plausible && in_bounds).then_some(self)
+    }
 }
 
 /// Decode every sensor and reading element of a snapshot whose header

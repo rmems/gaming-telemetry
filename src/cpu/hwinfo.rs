@@ -286,7 +286,6 @@ mod imp {
             // SAFETY: `name` is a NUL-terminated UTF-16 buffer that outlives
             // the call; the returned handle is null-checked before use.
             unsafe {
-                // nosemgrep
                 let handle = OpenFileMappingW(FILE_MAP_READ, 0, name.as_ptr());
                 if handle.is_null() {
                     return None;
@@ -337,7 +336,6 @@ mod imp {
             // the call; `view` spans `self.len` live bytes while `self` is
             // alive; the mutex is released only when it was acquired.
             unsafe {
-                // nosemgrep
                 // The handle is opened per snapshot so it never keeps the
                 // mutex object alive on its own — `producer_alive` must keep
                 // meaning "HWiNFO is running", not "we once attached".
@@ -379,7 +377,6 @@ mod imp {
             // SAFETY: `name` is a NUL-terminated UTF-16 buffer that outlives
             // the call; the handle is null-checked before `CloseHandle`.
             unsafe {
-                // nosemgrep
                 let mutex = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, name.as_ptr());
                 if mutex.is_null() {
                     false
@@ -397,7 +394,6 @@ mod imp {
             // OpenFileMappingW returned in `open` and are released exactly
             // once, here.
             unsafe {
-                // nosemgrep
                 UnmapViewOfFile(self.view);
                 CloseHandle(self.handle);
             }

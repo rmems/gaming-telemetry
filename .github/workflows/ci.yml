@@ -9,7 +9,6 @@ on:
 permissions:
   contents: read
   pull-requests: read
-  id-token: write # Qlty coverage upload (OIDC)
 
 jobs:
   fmt:
@@ -100,6 +99,9 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Qlty coverage upload (OIDC)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable

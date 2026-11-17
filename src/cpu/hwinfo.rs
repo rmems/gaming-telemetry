@@ -355,6 +355,7 @@ mod tests {
             (TYPE_POWER, 0, "CPU Package Power", 142.5),
         ]);
         let scan = scan(&buf).expect("valid region");
+        assert_eq!(scan.stamp, 1_763_340_000);
         let sample = select(&scan);
         assert_eq!(sample.tctl_c, Some(61.5));
         assert_eq!(sample.ccd1_c, Some(68.0));

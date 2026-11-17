@@ -27,6 +27,7 @@ use std::time::Duration;
 use super::{CpuSample, MAX_PLAUSIBLE_PACKAGE_POWER_W};
 
 /// LHM's default listener. Only loopback is ever contacted.
+#[cfg(windows)]
 pub const DEFAULT_ADDR: &str = "127.0.0.1:8085";
 const METRICS_PATH: &str = "/metrics?timestamps=1";
 

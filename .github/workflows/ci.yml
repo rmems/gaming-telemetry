@@ -99,6 +99,9 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Qlty coverage upload (OIDC)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -128,6 +131,13 @@ jobs:
           files: lcov.info
           fail_ci_if_error: false
           verbose: true
+      - name: Upload coverage to Qlty
+        # Fork PRs get no OIDC token; pushes to main still upload.
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        uses: qltysh/qlty-action/coverage@10ccbe4bf74e9f71f24c9266a87f34265011ac1f # v2.7.0
+        with:
+          oidc: true
+          files: lcov.info
 
   build:
     runs-on: ubuntu-latest

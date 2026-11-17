@@ -50,4 +50,7 @@ Run fmt and clippy before committing; CI fails on either. The MSRV guard in `ci.
 - `.claude/` is gitignored, so keep shared agent guidance in this file or `AGENTS.md`.
 - The collector exits at startup without an NVIDIA GPU and driver (`Nvml::init()?`); build and tests do not need one.
 - `Cargo.lock` is tracked, so `--locked` is correct.
+- A new PR is not done until it sits on the Theseus Machine Physiology board
+  (`github.com/users/rmems/projects/7`) at `In review` — see the PR-metadata
+  bullet in `AGENTS.md` for the exact commands.
 - Edit only what the task needs.

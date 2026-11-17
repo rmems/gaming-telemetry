@@ -56,3 +56,8 @@ Run the collector: `SESSION_LABEL=my-session cargo run --release --bin gaming-te
   `src/manifest_failure_tests.rs` currently do not.
 - `CHANGELOG.md` is maintained. Commit subjects follow Conventional Commits; scopes
   (`fix(privacy):`, `feat(export):`) and PR numbers are optional.
+- PRs for this repo go on the **Theseus Machine Physiology** board
+  (`github.com/users/rmems/projects/7`): add each new PR with
+  `gh project item-add 7 --owner rmems --url <pr>` and set its status (`In review`
+  while open). Apply the usual metadata too — assignee `rmems`, existing labels
+  only, milestone only when one already exists.

@@ -60,3 +60,18 @@ impl CpuSample {
 /// available to check. The same bound rejects a torn or misparsed reading from
 /// a Windows sensor host.
 pub(crate) const MAX_PLAUSIBLE_PACKAGE_POWER_W: f64 = 1000.0;
+
+/// `true` when `needle` occurs in `hay` (ASCII case-insensitive) and is not
+/// immediately followed by a digit — `"ccd1"` must not match `"ccd10"`, or a
+/// many-CCD part would populate `cpu_ccd1_c` from the wrong die.
+#[cfg(any(windows, test))]
+pub(crate) fn contains_token(hay: &str, needle: &str) -> bool {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    if h.len() < n.len() {
+        return false;
+    }
+    (0..=h.len() - n.len()).any(|i| {
+        h[i..i + n.len()].eq_ignore_ascii_case(n)
+            && h.get(i + n.len()).is_none_or(|b| !b.is_ascii_digit())
+    })
+}

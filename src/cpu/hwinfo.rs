@@ -14,12 +14,15 @@
 //! never assumed — a future HWiNFO build that grows an element keeps working as
 //! long as the fields this reader needs stay at their documented offsets.
 //!
-//! Reads are unsynchronised: the producer mutex is used for liveness, not
-//! locking, so a torn 8-byte value is possible in principle. The plausibility
-//! gates in [`select`] turn any such garbage into `None` rather than persisting
-//! it.
+//! Snapshots are taken while holding the producer mutex, so a torn 8-byte
+//! value cannot slip into a column: HWiNFO holds the lock only for the brief
+//! span of its own update, keeping the wait effectively uncontended. The
+//! plausibility gates in [`select`] remain the last line of defence for
+//! corrupt data.
 
-use super::{CpuSample, MAX_PLAUSIBLE_PACKAGE_POWER_W};
+use std::borrow::Cow;
+
+use super::{CpuSample, MAX_PLAUSIBLE_PACKAGE_POWER_W, contains_token};
 
 /// `HWiNFO_HEADER_MAGIC`, the multi-character constant `'SiWH'` — the bytes
 /// `"HWiS"` read as a little-endian `u32`.
@@ -38,24 +41,27 @@ const MAX_ELEMENTS: usize = 4096;
 const TYPE_TEMPERATURE: u32 = 1;
 const TYPE_POWER: u32 = 5;
 
-/// Everything decoded from one snapshot of the shared region.
-pub struct Scan {
+/// Everything decoded from one snapshot of the shared region. Names borrow
+/// the snapshot rather than copying — a 5 ms tick should not pay hundreds of
+/// string allocations per poll.
+pub struct Scan<'a> {
     /// `last_update` verbatim. Its units are not relied on; the caller compares
     /// successive stamps to detect whether the feed is still advancing.
     pub stamp: i64,
-    /// Sensor-element names (the parent hardware node of each entry).
-    sensors: Vec<String>,
-    entries: Vec<Entry>,
+    /// Sensor-element `[name_original, name_user]` (the parent hardware node
+    /// of each entry).
+    sensors: Vec<[Cow<'a, str>; 2]>,
+    entries: Vec<Entry<'a>>,
 }
 
 /// One reading element, decoded only as far as selection needs.
-struct Entry {
+struct Entry<'a> {
     ty: u32,
     /// Index into `Scan::sensors` — *not* the element's `id` field.
     sensor_index: u32,
     /// `[name_original, name_user]` — users can rename readings in HWiNFO, so
     /// both are matched.
-    names: [String; 2],
+    names: [Cow<'a, str>; 2],
     value: f64,
 }
 
@@ -107,11 +113,14 @@ fn parse_layout(buf: &[u8]) -> Option<Layout> {
 /// Decode every sensor and reading element of a snapshot whose header
 /// validates. `None` on a bad magic, a truncated buffer, or a layout that
 /// cannot hold the fields this reader uses.
-pub fn scan(buf: &[u8]) -> Option<Scan> {
+pub fn scan(buf: &[u8]) -> Option<Scan<'_>> {
     let l = parse_layout(buf)?;
 
     let sensors = (0..l.sensor_count)
-        .map(|i| read_cstr(&buf[l.sensor_off + i * l.sensor_size + 0x08..][..128]))
+        .map(|i| {
+            let s = &buf[l.sensor_off + i * l.sensor_size..];
+            [read_cstr(&s[0x08..][..128]), read_cstr(&s[0x88..][..128])]
+        })
         .collect();
 
     let entries = (0..l.entry_count)
@@ -144,11 +153,11 @@ pub fn select(scan: &Scan) -> CpuSample {
     }
 }
 
-/// First value whose entry type and a name needle match, trying each needle in
-/// order. Entries under a `CPU [...]` parent node are preferred; an unscoped
-/// pass follows so a differently-labelled CPU node still resolves.
+/// First value whose entry type and a name needle match, trying each needle
+/// in order. Only entries under a `CPU` parent node qualify: a motherboard
+/// "Tctl" or fan-controller "Package" is a real reading of the *wrong* thing,
+/// and this contract prefers a null column to misattributed data.
 fn find(scan: &Scan, ty: u32, needles: &[&str]) -> Option<f64> {
-    let mut unscoped = None;
     for needle in needles {
         for entry in &scan.entries {
             if entry.ty != ty || !entry.matches(needle) {
@@ -157,21 +166,18 @@ fn find(scan: &Scan, ty: u32, needles: &[&str]) -> Option<f64> {
             let scoped = scan
                 .sensors
                 .get(entry.sensor_index as usize)
-                .is_some_and(|parent| parent.to_ascii_lowercase().starts_with("cpu"));
+                .is_some_and(|parent| parent.iter().any(|n| contains_token(n, "cpu")));
             if scoped {
                 return Some(entry.value);
             }
-            unscoped = unscoped.or(Some(entry.value));
         }
     }
-    unscoped
+    None
 }
 
-impl Entry {
+impl Entry<'_> {
     fn matches(&self, needle: &str) -> bool {
-        self.names
-            .iter()
-            .any(|name| name.to_ascii_lowercase().contains(needle))
+        self.names.iter().any(|name| contains_token(name, needle))
     }
 }
 
@@ -209,25 +215,34 @@ fn f64_at(buf: &[u8], off: usize) -> Option<f64> {
 
 /// Names in the region are fixed-width, NUL-terminated, and not guaranteed
 /// UTF-8 (units can carry a `°` sign in a legacy code page), so decode
-/// lossily — every needle this reader matches on is plain ASCII.
-fn read_cstr(field: &[u8]) -> String {
+/// lossily — every needle this reader matches on is plain ASCII. Names that
+/// are already valid UTF-8 borrow the snapshot instead of copying.
+fn read_cstr(field: &[u8]) -> Cow<'_, str> {
     let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
-    String::from_utf8_lossy(&field[..end]).into_owned()
+    String::from_utf8_lossy(&field[..end])
 }
 
 #[cfg(windows)]
 mod imp {
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Memory::{
         FILE_MAP_READ, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
         OpenFileMappingW, UnmapViewOfFile, VirtualQuery,
     };
-    use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    use windows_sys::Win32::System::Threading::{
+        MUTEX_MODIFY_STATE, OpenMutexW, ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE,
+        WaitForSingleObject,
+    };
 
     use super::HEADER_SIZE;
 
     const MAPPING_NAME: &str = "Global\\HWiNFO_SENS_SM2";
     const MUTEX_NAME: &str = "Global\\HWiNFO_SM2_MUTEX";
+
+    /// HWiNFO holds its sensor mutex only for the span of a write, so the
+    /// wait is uncontended in practice; the bound exists for a wedged lock —
+    /// this tick reports nothing rather than copy a mid-update region.
+    const MUTEX_WAIT_MS: u32 = 50;
 
     /// A read-only view of HWiNFO's shared sensor region.
     ///
@@ -284,13 +299,43 @@ mod imp {
             }
         }
 
-        /// Copy the mapped region out for parsing. Copying rather than holding
-        /// a borrow keeps every later bounds check against a stable buffer —
-        /// the producer can rewrite the region at any moment.
+        /// Copy the mapped region out for parsing, under the producer mutex.
+        /// Copying rather than holding a borrow keeps every later bounds
+        /// check against a stable buffer, and holding the mutex for the copy
+        /// keeps a mid-update region — torn `f64`s and all — out of the
+        /// telemetry columns. `None` when the mutex is absent (producer gone)
+        /// or cannot be taken in time (wedged) — both mean "no trustworthy
+        /// sample this tick", which is what `None` is for.
         pub fn snapshot(&self) -> Option<Vec<u8>> {
-            (self.len >= HEADER_SIZE).then(|| unsafe {
-                std::slice::from_raw_parts(self.view.Value as *const u8, self.len).to_vec()
-            })
+            if self.len < HEADER_SIZE {
+                return None;
+            }
+            let name: Vec<u16> = MUTEX_NAME
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            unsafe {
+                // The handle is opened per snapshot so it never keeps the
+                // mutex object alive on its own — `producer_alive` must keep
+                // meaning "HWiNFO is running", not "we once attached".
+                let mutex = OpenMutexW(
+                    SYNCHRONIZATION_SYNCHRONIZE | MUTEX_MODIFY_STATE,
+                    0,
+                    name.as_ptr(),
+                );
+                if mutex.is_null() {
+                    return None;
+                }
+                let waited = WaitForSingleObject(mutex, MUTEX_WAIT_MS);
+                let buf = (waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED).then(|| {
+                    std::slice::from_raw_parts(self.view.Value as *const u8, self.len).to_vec()
+                });
+                if buf.is_some() {
+                    ReleaseMutex(mutex);
+                }
+                CloseHandle(mutex);
+                buf
+            }
         }
 
         /// Whether a process currently holds HWiNFO's sensor mutex — i.e.
@@ -334,9 +379,15 @@ mod tests {
     /// Build a minimal but spec-accurate region: one CPU sensor node plus the
     /// given `(type, sensor_index, name, value)` entries.
     fn region(entries: &[(u32, u32, &str, f64)]) -> Vec<u8> {
+        region_with_sensors(&["CPU [#0]: AMD Ryzen 9 9950X"], entries)
+    }
+
+    /// Same as [`region`] but with caller-named sensor nodes, so tests can
+    /// put identically-named readings under different parents.
+    fn region_with_sensors(sensors: &[&str], entries: &[(u32, u32, &str, f64)]) -> Vec<u8> {
         let sensor_off = HEADER_SIZE;
         let sensor_size = MIN_SENSOR_SIZE;
-        let entry_off = sensor_off + sensor_size;
+        let entry_off = sensor_off + sensor_size * sensors.len();
         let entry_size = MIN_ENTRY_SIZE;
         let mut buf = vec![0u8; entry_off + entry_size * entries.len()];
 
@@ -347,7 +398,7 @@ mod tests {
         for (off, v) in [
             (0x14, sensor_off as u32),
             (0x18, sensor_size as u32),
-            (0x1C, 1u32),
+            (0x1C, sensors.len() as u32),
             (0x20, entry_off as u32),
             (0x24, entry_size as u32),
             (0x28, entries.len() as u32),
@@ -355,9 +406,10 @@ mod tests {
             buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
         }
 
-        buf[sensor_off..sensor_off + 4].copy_from_slice(&0u32.to_le_bytes());
-        buf[sensor_off + 0x08..][.."CPU [#0]: AMD Ryzen 9 9950X".len()]
-            .copy_from_slice(b"CPU [#0]: AMD Ryzen 9 9950X");
+        for (i, name) in sensors.iter().enumerate() {
+            let s = sensor_off + i * sensor_size;
+            buf[s + 0x08..][..name.len()].copy_from_slice(name.as_bytes());
+        }
 
         for (i, (ty, parent, name, value)) in entries.iter().enumerate() {
             let e = entry_off + i * entry_size;
@@ -420,36 +472,36 @@ mod tests {
         assert_eq!(sample.package_power_w, None);
     }
 
-    /// A motherboard "CPU" temperature lives under a different parent node; the
-    /// scoped pass must not mistake it for the CPU package.
+    /// A motherboard "Tctl" is a real reading of the wrong thing: only an
+    /// entry under a CPU parent node may fill `cpu_tctl_c`.
     #[test]
     fn parent_scope_disambiguates_same_named_readings() {
-        // Two sensors: index 0 is a Super I/O chip, index 1 the CPU node.
-        let sensor_off = HEADER_SIZE;
-        let sensor_size = MIN_SENSOR_SIZE;
-        let entry_off = sensor_off + sensor_size * 2;
-        let entry_size = MIN_ENTRY_SIZE;
-        let mut buf = vec![0u8; entry_off + entry_size];
-        buf[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        for (off, v) in [
-            (0x14, sensor_off as u32),
-            (0x18, sensor_size as u32),
-            (0x1C, 2u32),
-            (0x20, entry_off as u32),
-            (0x24, entry_size as u32),
-            (0x28, 1u32),
-        ] {
-            buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
-        }
-        buf[sensor_off + 0x08..][..14].copy_from_slice(b"Nuvoton NCT679");
-        buf[sensor_off + sensor_size + 0x08..][..9].copy_from_slice(b"CPU [#0]:");
-        // The only Tctl-looking entry sits under the motherboard node: the
-        // scoped match fails and the unscoped fallback still reports it.
-        buf[entry_off..entry_off + 4].copy_from_slice(&TYPE_TEMPERATURE.to_le_bytes());
-        buf[entry_off + 0x0C..][..4].copy_from_slice(b"Tctl");
-        buf[entry_off + 0x11C..entry_off + 0x124].copy_from_slice(&42.0f64.to_le_bytes());
+        // The CPU node's same-named entry wins over the motherboard's.
+        let buf = region_with_sensors(
+            &["Nuvoton NCT6798D", "CPU [#0]: AMD Ryzen 9 9950X"],
+            &[
+                (TYPE_TEMPERATURE, 0, "Tctl", 42.0),
+                (TYPE_TEMPERATURE, 1, "Tctl", 61.5),
+            ],
+        );
+        assert_eq!(select(&scan(&buf).unwrap()).tctl_c, Some(61.5));
 
+        // With no CPU-parent entry at all, the column stays null — a
+        // motherboard reading is never attributed to the package.
+        let buf = region_with_sensors(
+            &["Nuvoton NCT6798D"],
+            &[(TYPE_TEMPERATURE, 0, "Tctl", 42.0)],
+        );
+        assert_eq!(select(&scan(&buf).unwrap()).tctl_c, None);
+    }
+
+    /// Token-boundary matching: a many-CCD part's `CCD10` must not populate
+    /// `cpu_ccd1_c`.
+    #[test]
+    fn ccd10_does_not_fill_ccd1() {
+        let buf = region(&[(TYPE_TEMPERATURE, 0, "CPU CCD10 (Tdie)", 77.0)]);
         let sample = select(&scan(&buf).unwrap());
-        assert_eq!(sample.tctl_c, Some(42.0), "unscoped fallback keeps it");
+        assert_eq!(sample.ccd1_c, None);
+        assert_eq!(sample.ccd2_c, None);
     }
 }

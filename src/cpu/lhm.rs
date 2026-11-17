@@ -24,7 +24,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use super::{CpuSample, MAX_PLAUSIBLE_PACKAGE_POWER_W};
+use super::{CpuSample, MAX_PLAUSIBLE_PACKAGE_POWER_W, contains_token};
 
 /// LHM's default listener. Only loopback is ever contacted.
 #[cfg(windows)]
@@ -236,7 +236,13 @@ pub fn select(readings: &[Reading], now_ms: i64, stale_ms: i64) -> CpuSample {
     let any_ts = readings.iter().any(|r| r.ts_ms.is_some());
     let fresh: Vec<&Reading> = readings
         .iter()
-        .filter(|r| !any_ts || r.ts_ms.is_some_and(|ts| (now_ms - ts).abs() <= stale_ms))
+        .filter(|r| {
+            // `abs_diff`: a corrupt extreme timestamp must not overflow the
+            // subtraction and wrap back into the window.
+            !any_ts
+                || r.ts_ms
+                    .is_some_and(|ts| now_ms.abs_diff(ts) <= stale_ms.max(0) as u64)
+        })
         .collect();
     CpuSample {
         tctl_c: pick(&fresh, METRIC_TEMPERATURE, &["tctl", "package"]),
@@ -250,7 +256,7 @@ fn pick(readings: &[&Reading], metric: &str, needles: &[&str]) -> Option<f32> {
     for needle in needles {
         if let Some(r) = readings
             .iter()
-            .find(|r| r.metric == metric && r.sensor_name.to_ascii_lowercase().contains(needle))
+            .find(|r| r.metric == metric && contains_token(&r.sensor_name, needle))
         {
             return plausible(r.value, metric == METRIC_TEMPERATURE);
         }

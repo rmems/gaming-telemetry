@@ -261,7 +261,8 @@ impl HwinfoSource {
     /// `Some` with this tick's sample while the feed advances, `None` once it
     /// has been frozen longer than [`HWINFO_STALE`].
     fn poll(&mut self, now: Instant) -> Option<CpuSample> {
-        let scan = hwinfo::scan(&self.shm.snapshot()?)?;
+        let buf = self.shm.snapshot()?;
+        let scan = hwinfo::scan(&buf)?;
         if scan.stamp != self.stamp {
             self.stamp = scan.stamp;
             self.advanced_at = now;
@@ -305,8 +306,12 @@ impl LhmSource {
             .name("cpu-lhm-fetch".into())
             .spawn(move || {
                 while !worker_stop.load(Ordering::Relaxed) {
+                    // The fetch blocks up to the request deadline; it must run
+                    // *outside* the lock or a stalled server would block the
+                    // capture tick that takes it.
+                    let result = fetch_sample();
                     if let Ok(mut shared) = worker_shared.lock() {
-                        match fetch_sample() {
+                        match result {
                             Some(sample) => {
                                 // An answered request that yields nothing is
                                 // not liveness: a server whose readings all

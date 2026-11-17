@@ -308,8 +308,14 @@ impl LhmSource {
                     if let Ok(mut shared) = worker_shared.lock() {
                         match fetch_sample() {
                             Some(sample) => {
+                                // An answered request that yields nothing is
+                                // not liveness: a server whose readings all
+                                // go stale must still fall out of use so the
+                                // monitor can re-probe another source.
+                                if sample != CpuSample::EMPTY {
+                                    shared.succeeded_at = Instant::now();
+                                }
                                 shared.sample = sample;
-                                shared.succeeded_at = Instant::now();
                             }
                             // A failed fetch is not a stale value to keep
                             // serving — the columns go null until the server

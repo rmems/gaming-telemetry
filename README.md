@@ -37,7 +37,8 @@ MangoHud (or any overlay) is **not** recorded. You may still run it yourself for
 
 ## Prerequisites
 
-- **OS**: Linux (developed on Fedora)
+- **OS**: Linux (developed on Fedora) or Windows 10/11 — see
+  [CPU sensors on Windows](#cpu-sensors-on-windows) for its extra prerequisites
 - **GPU**: NVIDIA with NVML (RTX 50-series preferred)
 - **Build**: Rust 1.98+ / Cargo
 

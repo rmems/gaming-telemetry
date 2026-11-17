@@ -64,13 +64,7 @@ pub fn fetch(addr: &str) -> Option<String> {
     {
         return None;
     }
-    let declared_len = headers.lines().find_map(|line| {
-        line.split_once(':').and_then(|(name, value)| {
-            name.trim()
-                .eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())?
-        })
-    });
+    let declared_len = content_length(headers);
     let body = if headers
         .to_ascii_lowercase()
         .contains("transfer-encoding: chunked")
@@ -85,6 +79,16 @@ pub fn fetch(addr: &str) -> Option<String> {
         return None;
     }
     String::from_utf8(body).ok()
+}
+
+/// The response's declared `Content-Length`, if any.
+fn content_length(headers: &str) -> Option<usize> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())?
+    })
 }
 
 fn http_get(addr: &str, path: &str) -> Option<Vec<u8>> {
@@ -106,12 +110,8 @@ fn http_get(addr: &str, path: &str) -> Option<Vec<u8>> {
         }
         match stream.read(&mut chunk) {
             Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.len() > MAX_RESPONSE {
-                    return None;
-                }
-            }
+            Ok(n) if buf.len() + n > MAX_RESPONSE => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             // WouldBlock/TimedOut: the server stalled mid-body. Keep what
             // arrived — the caller rejects bodies short of Content-Length,
@@ -193,11 +193,19 @@ fn parse_line(line: &str) -> Option<Reading> {
         return None;
     }
     let ts_ms = fields.next().and_then(|t| t.parse::<i64>().ok());
+    Some(Reading {
+        metric,
+        sensor_name: sensor_name(labels),
+        value,
+        ts_ms,
+    })
+}
 
-    let mut sensor_name = String::new();
-    let mut rest_labels = labels;
-    while let Some((_, after_key)) = rest_labels.split_once('"') {
-        let Some((key, after_key)) = after_key.split_once('"') else {
+/// The `sensorName` label of a `{ "k"="v", ... }` list, or empty.
+fn sensor_name(labels: &str) -> String {
+    let mut rest = labels;
+    while let Some((_, after_quote)) = rest.split_once('"') {
+        let Some((key, after_key)) = after_quote.split_once('"') else {
             break;
         };
         let Some((_, value_part)) = after_key.split_once('"') else {
@@ -207,17 +215,11 @@ fn parse_line(line: &str) -> Option<Reading> {
             break;
         };
         if key == "sensorName" {
-            sensor_name = val.to_string();
+            return val.to_string();
         }
-        rest_labels = remaining;
+        rest = remaining;
     }
-
-    Some(Reading {
-        metric,
-        sensor_name,
-        value,
-        ts_ms,
-    })
+    String::new()
 }
 
 /// Pick the four telemetry columns. `now_ms` gates freshness: a reading whose
@@ -400,22 +402,28 @@ mod tests {
         assert!(dechunk(b"zz\r\nx\r\n").is_none());
     }
 
-    /// The loopback fetch against a real listener: the whole request/response
-    /// path, not just the parser.
-    #[test]
-    fn fetch_reads_a_live_loopback_server() {
+    /// Serve `page` once on an ephemeral loopback port; returns its address.
+    fn serve_once(page: &'static str) -> String {
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let page =
-            "HTTP/1.1 200 OK\r\nContent-Length: 36\r\n\r\nlhm_cpu_temperature_celsius {} 61.5\n";
         std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
             let mut req = [0u8; 1024];
             let _ = conn.read(&mut req);
             conn.write_all(page.as_bytes()).unwrap();
         });
+        addr
+    }
+
+    /// The loopback fetch against a real listener: the whole request/response
+    /// path, not just the parser.
+    #[test]
+    fn fetch_reads_a_live_loopback_server() {
+        let addr = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 36\r\n\r\nlhm_cpu_temperature_celsius {} 61.5\n",
+        );
         let body = fetch(&addr).expect("server answered");
         assert!(body.contains("lhm_cpu_temperature_celsius"));
     }
@@ -424,19 +432,10 @@ mod tests {
     /// truncated final sample could otherwise parse as a valid value.
     #[test]
     fn fetch_rejects_a_body_short_of_content_length() {
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
         // Declares 100 bytes, sends 36, closes.
-        let page =
-            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nlhm_cpu_temperature_celsius {} 61.5\n";
-        std::thread::spawn(move || {
-            let (mut conn, _) = listener.accept().unwrap();
-            let mut req = [0u8; 1024];
-            let _ = conn.read(&mut req);
-            conn.write_all(page.as_bytes()).unwrap();
-        });
+        let addr = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nlhm_cpu_temperature_celsius {} 61.5\n",
+        );
         assert!(fetch(&addr).is_none());
     }
 }

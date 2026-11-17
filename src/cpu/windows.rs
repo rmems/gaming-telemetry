@@ -8,6 +8,10 @@
 //! monitor that found nothing keeps re-probing so a sensor host started
 //! mid-session is picked up without a collector restart.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::{CpuSample, hwinfo, lhm};
@@ -26,18 +30,30 @@ const HWINFO_STALE: Duration = Duration::from_secs(10);
 /// different source, so a brief HWiNFO hiccup does not flap between backends.
 const HWINFO_GIVE_UP: Duration = Duration::from_secs(30);
 
-/// Minimum interval between `/metrics` fetches. LHM refreshes its sensor tree
-/// roughly once a second; polling faster buys nothing and hammers its HTTP
-/// server during a 5 ms capture tick.
+/// Interval between `/metrics` fetches on the LHM worker thread. LHM
+/// refreshes its sensor tree roughly once a second; polling faster buys
+/// nothing and hammers its HTTP server.
 const LHM_REFRESH: Duration = Duration::from_millis(500);
 
 /// A `/metrics` sample older than this counts as not measured.
 const LHM_STALE_MS: i64 = 10_000;
 
+/// How long the LHM worker may go without a completed fetch before the source
+/// is abandoned and another probe is tried — the same patience the HWiNFO
+/// path allows a frozen feed.
+const LHM_DEAD: Duration = Duration::from_secs(10);
+
 /// Tracks the energy-independent sensor host selected at probe time.
+///
+/// Two pieces of sensor work block on other processes — attaching to a
+/// source, and each LHM HTTP round-trip — and `poll` runs inside a 5 ms
+/// capture tick ahead of the GPU read. Both run on detached threads so a
+/// hung sensor host stalls only its own worker, never a capture tick.
 pub struct CpuMonitor {
     source: Source,
     next_probe_at: Instant,
+    /// Receives the next probe's result while it runs detached.
+    probe_rx: Option<mpsc::Receiver<ProbeResult>>,
 }
 
 enum Source {
@@ -45,6 +61,13 @@ enum Source {
     Lhm(LhmSource),
     Disconnected,
 }
+
+/// A completed probe handed back from the detached probe thread. The handles
+/// it can wrap (a mapped view, a mutex) name process-global kernel objects —
+/// not thread-affine — and the value has exactly one owner at a time, so
+/// moving ownership between threads is safe.
+struct ProbeResult(Source, Option<&'static str>);
+unsafe impl Send for ProbeResult {}
 
 struct HwinfoSource {
     shm: hwinfo::SharedMemory,
@@ -56,9 +79,17 @@ struct HwinfoSource {
 }
 
 struct LhmSource {
-    /// Last fetch attempt — successes and failures both rate-limit.
-    fetched_at: Instant,
+    /// Written by the fetch worker, read by capture ticks.
+    shared: Arc<Mutex<LhmShared>>,
+    /// Asked on drop so a superseded worker exits instead of fetching forever.
+    stop: Arc<AtomicBool>,
+}
+
+struct LhmShared {
+    /// The most recent fetch's sample; `EMPTY` after a failed one.
     sample: CpuSample,
+    /// When the last *successful* fetch finished.
+    succeeded_at: Instant,
 }
 
 impl Default for CpuMonitor {
@@ -74,11 +105,13 @@ impl CpuMonitor {
     /// indistinguishable from a broken build.
     pub fn new() -> Self {
         let now = Instant::now();
-        let mut monitor = Self {
-            source: Source::Disconnected,
-            next_probe_at: now,
+        let ProbeResult(source, name) = probe(now);
+        let monitor = Self {
+            source,
+            next_probe_at: now + PROBE_RETRY,
+            probe_rx: None,
         };
-        match monitor.probe(now) {
+        match name {
             Some(name) => eprintln!("CPU telemetry via {name}."),
             None => eprintln!(
                 "CPU telemetry unavailable: no supported Windows sensor host found. \
@@ -99,6 +132,7 @@ impl CpuMonitor {
         Self {
             source: Source::Disconnected,
             next_probe_at: Instant::now() + Duration::from_secs(3600),
+            probe_rx: None,
         }
     }
 
@@ -124,33 +158,70 @@ impl CpuMonitor {
                     CpuSample::EMPTY
                 }
             },
-            Source::Lhm(src) => src.poll(now),
-            Source::Disconnected => {
-                if now >= self.next_probe_at
-                    && let Some(name) = self.probe(now)
-                {
-                    eprintln!("CPU telemetry via {name}.");
+            Source::Lhm(src) => match src.poll(now) {
+                Some(sample) => sample,
+                None => {
+                    // The server stopped answering (exited, or stopped its web
+                    // server). Re-probe: HWiNFO may have appeared meanwhile.
+                    eprintln!(
+                        "LibreHardwareMonitor /metrics stopped answering; CPU \
+                         columns going empty while another source is probed."
+                    );
+                    self.source = Source::Disconnected;
+                    self.next_probe_at = now;
+                    CpuSample::EMPTY
                 }
+            },
+            Source::Disconnected => {
+                self.drive_probe(now);
                 CpuSample::EMPTY
             }
         }
     }
 
-    /// Try each source in probe order; on success the monitor switches to it.
-    /// Returns the source name for logging.
-    fn probe(&mut self, now: Instant) -> Option<&'static str> {
-        self.next_probe_at = now + PROBE_RETRY;
-        if let Some(src) = HwinfoSource::connect(now) {
-            self.source = Source::Hwinfo(src);
-            return Some("HWiNFO64 shared memory");
+    /// Advance the detached probe, if any, and start one when due. Never
+    /// blocks the tick on loopback TCP.
+    fn drive_probe(&mut self, now: Instant) {
+        if let Some(rx) = &self.probe_rx {
+            match rx.try_recv() {
+                Ok(ProbeResult(source, name)) => {
+                    self.probe_rx = None;
+                    self.source = source;
+                    if let Some(name) = name {
+                        eprintln!("CPU telemetry via {name}.");
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                // A probe thread that died before answering is retried at the
+                // next scheduled probe, not in a hot loop.
+                Err(TryRecvError::Disconnected) => self.probe_rx = None,
+            }
+        } else if now >= self.next_probe_at {
+            self.next_probe_at = now + PROBE_RETRY;
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(probe(Instant::now()));
+            });
+            self.probe_rx = Some(rx);
         }
-        if let Some(src) = LhmSource::connect(now) {
-            self.source = Source::Lhm(src);
-            return Some("LibreHardwareMonitor /metrics (loopback:8085)");
-        }
-        self.source = Source::Disconnected;
-        None
     }
+}
+
+/// Try each source in probe order; the result names what was found for
+/// logging. Runs on the detached probe thread (or once synchronously at
+/// startup) — it can take a full HTTP round-trip and must not run inside a
+/// capture tick.
+fn probe(now: Instant) -> ProbeResult {
+    if let Some(src) = HwinfoSource::connect(now) {
+        return ProbeResult(Source::Hwinfo(src), Some("HWiNFO64 shared memory"));
+    }
+    if let Some(src) = LhmSource::connect(now) {
+        return ProbeResult(
+            Source::Lhm(src),
+            Some("LibreHardwareMonitor /metrics (loopback:8085)"),
+        );
+    }
+    ProbeResult(Source::Disconnected, None)
 }
 
 impl HwinfoSource {
@@ -179,8 +250,11 @@ impl HwinfoSource {
             frozen_since: None,
         };
         // Prove the feed produces a sample on connect; `scan` succeeded but
-        // `select` may still find nothing on a non-CPU host.
-        let _ = src.poll(now)?;
+        // `select` may still find nothing on a non-CPU host, in which case the
+        // LHM fallback is never reached while every column stays null.
+        if src.poll(now)? == CpuSample::EMPTY {
+            return None;
+        }
         Some(src)
     }
 
@@ -212,31 +286,63 @@ impl HwinfoSource {
 }
 
 impl LhmSource {
+    /// One synchronous fetch proves the listener is actually LHM — a service
+    /// that merely shares port 8085 is not a source — then hands fetching to
+    /// a worker so a hung server never stalls a capture tick.
     fn connect(now: Instant) -> Option<Self> {
-        let body = lhm::fetch(lhm::DEFAULT_ADDR)?;
-        let sample = lhm::select(&lhm::parse(&body), now_unix_ms(), LHM_STALE_MS);
-        // Connecting to a web server that happens to share the port is not
-        // enough — it must actually be serving LibreHardwareMonitor metrics.
+        let sample = fetch_sample()?;
         if sample == CpuSample::EMPTY {
             return None;
         }
-        Some(Self {
-            fetched_at: now,
+        let shared = Arc::new(Mutex::new(LhmShared {
             sample,
-        })
+            succeeded_at: now,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_shared = Arc::clone(&shared);
+        let worker_stop = Arc::clone(&stop);
+        thread::Builder::new()
+            .name("cpu-lhm-fetch".into())
+            .spawn(move || {
+                while !worker_stop.load(Ordering::Relaxed) {
+                    if let Ok(mut shared) = worker_shared.lock() {
+                        match fetch_sample() {
+                            Some(sample) => {
+                                shared.sample = sample;
+                                shared.succeeded_at = Instant::now();
+                            }
+                            // A failed fetch is not a stale value to keep
+                            // serving — the columns go null until the server
+                            // answers again.
+                            None => shared.sample = CpuSample::EMPTY,
+                        }
+                    }
+                    thread::sleep(LHM_REFRESH);
+                }
+            })
+            .ok()?;
+        Some(Self { shared, stop })
     }
 
-    fn poll(&mut self, now: Instant) -> CpuSample {
-        if now.duration_since(self.fetched_at) >= LHM_REFRESH {
-            self.fetched_at = now;
-            self.sample = lhm::fetch(lhm::DEFAULT_ADDR)
-                .map(|body| lhm::select(&lhm::parse(&body), now_unix_ms(), LHM_STALE_MS))
-                // A failed fetch is not a stale value to keep serving — the
-                // columns go null until the server answers again.
-                .unwrap_or(CpuSample::EMPTY);
-        }
-        self.sample
+    /// `Some` with the worker's latest sample while fetches keep completing;
+    /// `None` once the worker has gone [`LHM_DEAD`] without a success.
+    fn poll(&mut self, now: Instant) -> Option<CpuSample> {
+        let shared = self.shared.lock().ok()?;
+        (now.duration_since(shared.succeeded_at) <= LHM_DEAD).then_some(shared.sample)
     }
+}
+
+impl Drop for LhmSource {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Fetch and pick one `/metrics` sample; `None` when the server is absent,
+/// stalled, or replies with nothing usable.
+fn fetch_sample() -> Option<CpuSample> {
+    let body = lhm::fetch(lhm::DEFAULT_ADDR)?;
+    Some(lhm::select(&lhm::parse(&body), now_unix_ms(), LHM_STALE_MS))
 }
 
 /// `last_update` is a unix timestamp, but its units are not documented

@@ -35,6 +35,9 @@ const METRICS_PATH: &str = "/metrics?timestamps=1";
 /// telemetry tick, so both timeouts stay well under a second.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const IO_TIMEOUT: Duration = Duration::from_millis(800);
+/// A drip-feeding server could satisfy the per-read timeout indefinitely;
+/// bound the whole request instead.
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// A real response is tens of kilobytes; anything far larger is not LHM.
 const MAX_RESPONSE: usize = 1 << 20;
 
@@ -61,6 +64,13 @@ pub fn fetch(addr: &str) -> Option<String> {
     {
         return None;
     }
+    let declared_len = headers.lines().find_map(|line| {
+        line.split_once(':').and_then(|(name, value)| {
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+    });
     let body = if headers
         .to_ascii_lowercase()
         .contains("transfer-encoding: chunked")
@@ -69,6 +79,11 @@ pub fn fetch(addr: &str) -> Option<String> {
     } else {
         body.to_vec()
     };
+    // A connection cut mid-response leaves a short body; a truncated final
+    // sample line could otherwise parse as a valid, different value.
+    if declared_len.is_some_and(|n| body.len() < n) {
+        return None;
+    }
     String::from_utf8(body).ok()
 }
 
@@ -82,9 +97,13 @@ fn http_get(addr: &str, path: &str) -> Option<Vec<u8>> {
         )
         .ok()?;
 
+    let start = std::time::Instant::now();
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
+        if start.elapsed() > TOTAL_TIMEOUT {
+            return None;
+        }
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => {
@@ -94,10 +113,9 @@ fn http_get(addr: &str, path: &str) -> Option<Vec<u8>> {
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            // WouldBlock/TimedOut: the server stalled mid-body — take whatever
-            // arrived only if the headers were complete? No: a partial body is
-            // just truncated sensor lines, which are individually valid. Keep
-            // what we have; the parser skips anything malformed.
+            // WouldBlock/TimedOut: the server stalled mid-body. Keep what
+            // arrived — the caller rejects bodies short of Content-Length,
+            // and the parser skips malformed lines.
             Err(_) => break,
         }
     }
@@ -207,9 +225,16 @@ fn parse_line(line: &str) -> Option<Reading> {
 /// counts as not measured — a far-future stamp pins a column just as a stale
 /// one does.
 pub fn select(readings: &[Reading], now_ms: i64, stale_ms: i64) -> CpuSample {
+    // Timestamps are requested via `?timestamps=1`. When the response carries
+    // them, a sample without one — or with one far from `now_ms` in *either*
+    // direction — counts as not measured: a far-future stamp pins a column
+    // just as a stale one does, and a missing stamp usually means the line
+    // was truncated mid-write. A server that emits no timestamps at all is
+    // trusted as fresh.
+    let any_ts = readings.iter().any(|r| r.ts_ms.is_some());
     let fresh: Vec<&Reading> = readings
         .iter()
-        .filter(|r| r.ts_ms.is_none_or(|ts| (now_ms - ts).abs() <= stale_ms))
+        .filter(|r| !any_ts || r.ts_ms.is_some_and(|ts| (now_ms - ts).abs() <= stale_ms))
         .collect();
     CpuSample {
         tctl_c: pick(&fresh, METRIC_TEMPERATURE, &["tctl", "package"]),
@@ -328,6 +353,30 @@ mod tests {
         assert_eq!(parse_and_select(&body).tctl_c, None);
     }
 
+    /// When the feed carries timestamps, a sample line missing one counts as
+    /// truncated — a severed `142.5` must not come back as a valid `14`.
+    #[test]
+    fn a_timestamped_feed_rejects_lines_missing_theirs() {
+        let body = body(&[
+            &format!(
+                "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\"}} 61.5 {NOW}"
+            ),
+            "lhm_cpu_power_watts {\"sensorName\"=\"Package\"} 14",
+        ]);
+        let sample = parse_and_select(&body);
+        assert_eq!(sample.tctl_c, Some(61.5));
+        assert_eq!(sample.package_power_w, None);
+    }
+
+    /// A feed without any timestamps (an LHM build ignoring `?timestamps=1`)
+    /// is trusted as fresh rather than left unmeasurable.
+    #[test]
+    fn a_feed_without_timestamps_is_fresh() {
+        let body =
+            body(&["lhm_cpu_temperature_celsius {\"sensorName\"=\"Core (Tctl/Tdie)\"} 61.5"]);
+        assert_eq!(parse_and_select(&body).tctl_c, Some(61.5));
+    }
+
     #[test]
     fn implausible_values_become_none() {
         let body = body(&[
@@ -369,5 +418,25 @@ mod tests {
         });
         let body = fetch(&addr).expect("server answered");
         assert!(body.contains("lhm_cpu_temperature_celsius"));
+    }
+
+    /// A connection cut mid-body must not yield the partial response — a
+    /// truncated final sample could otherwise parse as a valid value.
+    #[test]
+    fn fetch_rejects_a_body_short_of_content_length() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        // Declares 100 bytes, sends 36, closes.
+        let page =
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nlhm_cpu_temperature_celsius {} 61.5\n";
+        std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut req = [0u8; 1024];
+            let _ = conn.read(&mut req);
+            conn.write_all(page.as_bytes()).unwrap();
+        });
+        assert!(fetch(&addr).is_none());
     }
 }

@@ -59,41 +59,64 @@ struct Entry {
     value: f64,
 }
 
-/// Validate the header and decode every sensor and reading element. `None` on
-/// a bad magic, a truncated buffer, or a layout that cannot hold the fields
-/// this reader uses.
-pub fn scan(buf: &[u8]) -> Option<Scan> {
+/// Section offsets, sizes and counts taken from the header.
+struct Layout {
+    stamp: i64,
+    sensor_off: usize,
+    sensor_size: usize,
+    sensor_count: usize,
+    entry_off: usize,
+    entry_size: usize,
+    entry_count: usize,
+}
+
+/// Validate the header: right magic, elements big enough to hold the fields
+/// this reader uses, counts small enough to be plausible, and every section
+/// inside the buffer. `None` rejects anything else.
+fn parse_layout(buf: &[u8]) -> Option<Layout> {
     if buf.len() < HEADER_SIZE || u32_at(buf, 0)? != MAGIC {
         return None;
     }
-    let stamp = i64_at(buf, 0x0C)?;
-    let sensor_off = u32_at(buf, 0x14)? as usize;
-    let sensor_size = u32_at(buf, 0x18)? as usize;
-    let sensor_count = u32_at(buf, 0x1C)? as usize;
-    let entry_off = u32_at(buf, 0x20)? as usize;
-    let entry_size = u32_at(buf, 0x24)? as usize;
-    let entry_count = u32_at(buf, 0x28)? as usize;
+    let layout = Layout {
+        stamp: i64_at(buf, 0x0C)?,
+        sensor_off: u32_at(buf, 0x14)? as usize,
+        sensor_size: u32_at(buf, 0x18)? as usize,
+        sensor_count: u32_at(buf, 0x1C)? as usize,
+        entry_off: u32_at(buf, 0x20)? as usize,
+        entry_size: u32_at(buf, 0x24)? as usize,
+        entry_count: u32_at(buf, 0x28)? as usize,
+    };
+    let plausible = layout.sensor_size >= MIN_SENSOR_SIZE
+        && layout.entry_size >= MIN_ENTRY_SIZE
+        && layout.sensor_count <= MAX_ELEMENTS
+        && layout.entry_count <= MAX_ELEMENTS;
+    let in_bounds = section_in_bounds(
+        buf.len(),
+        layout.sensor_off,
+        layout.sensor_size,
+        layout.sensor_count,
+    ) && section_in_bounds(
+        buf.len(),
+        layout.entry_off,
+        layout.entry_size,
+        layout.entry_count,
+    );
+    (plausible && in_bounds).then_some(layout)
+}
 
-    if sensor_size < MIN_SENSOR_SIZE
-        || entry_size < MIN_ENTRY_SIZE
-        || sensor_count > MAX_ELEMENTS
-        || entry_count > MAX_ELEMENTS
-    {
-        return None;
-    }
-    if !section_in_bounds(buf.len(), sensor_off, sensor_size, sensor_count)
-        || !section_in_bounds(buf.len(), entry_off, entry_size, entry_count)
-    {
-        return None;
-    }
+/// Decode every sensor and reading element of a snapshot whose header
+/// validates. `None` on a bad magic, a truncated buffer, or a layout that
+/// cannot hold the fields this reader uses.
+pub fn scan(buf: &[u8]) -> Option<Scan> {
+    let l = parse_layout(buf)?;
 
-    let sensors = (0..sensor_count)
-        .map(|i| read_cstr(&buf[sensor_off + i * sensor_size + 0x08..][..128]))
+    let sensors = (0..l.sensor_count)
+        .map(|i| read_cstr(&buf[l.sensor_off + i * l.sensor_size + 0x08..][..128]))
         .collect();
 
-    let entries = (0..entry_count)
+    let entries = (0..l.entry_count)
         .map(|i| {
-            let e = &buf[entry_off + i * entry_size..];
+            let e = &buf[l.entry_off + i * l.entry_size..];
             Entry {
                 ty: u32_at(e, 0x00).unwrap_or(0),
                 sensor_index: u32_at(e, 0x04).unwrap_or(0),
@@ -104,7 +127,7 @@ pub fn scan(buf: &[u8]) -> Option<Scan> {
         .collect();
 
     Some(Scan {
-        stamp,
+        stamp: l.stamp,
         sensors,
         entries,
     })

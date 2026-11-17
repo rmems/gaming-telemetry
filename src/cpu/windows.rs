@@ -154,12 +154,23 @@ impl CpuMonitor {
 }
 
 impl HwinfoSource {
-    /// Attach only when the region is present, parses, and is still advancing —
-    /// a stale leftover region is no better than none.
+    /// Attach only when the region is present, parses, and is still live —
+    /// a stale leftover region is no better than none. Both failure modes are
+    /// checked: a dead producer leaves the mutex unheld, and a frozen feed
+    /// (the free edition's 12-hour cutoff) leaves the region readable with an
+    /// old `last_update`. Without the age check a frozen mapping would be
+    /// re-adopted on every re-probe and LHM would never get a turn.
     fn connect(now: Instant) -> Option<Self> {
+        if !hwinfo::SharedMemory::producer_alive() {
+            return None;
+        }
         let shm = hwinfo::SharedMemory::open()?;
         let buf = shm.snapshot()?;
         let scan = hwinfo::scan(&buf)?;
+        let age_secs = now_unix_secs() - stamp_unix_secs(scan.stamp);
+        if age_secs > HWINFO_STALE.as_secs() as i64 {
+            return None;
+        }
         let stamp = scan.stamp;
         let mut src = Self {
             shm,
@@ -228,11 +239,25 @@ impl LhmSource {
     }
 }
 
+/// `last_update` is a unix timestamp, but its units are not documented
+/// precisely; normalise to seconds whether a given build writes s or ms.
+fn stamp_unix_secs(stamp: i64) -> i64 {
+    if stamp.abs() >= 1_000_000_000_000 {
+        stamp / 1_000
+    } else {
+        stamp
+    }
+}
+
 fn now_unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn now_unix_secs() -> i64 {
+    now_unix_ms() / 1_000
 }
 
 #[cfg(test)]

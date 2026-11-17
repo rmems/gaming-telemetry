@@ -123,11 +123,12 @@ fn dechunk(body: &[u8]) -> Option<Vec<u8>> {
         if size == 0 {
             return Some(out);
         }
-        if rest.len() < size + 2 {
+        let crlf_end = size.checked_add(2)?;
+        if rest.len() < crlf_end {
             return None;
         }
         out.extend_from_slice(&rest[..size]);
-        rest = &rest[size + 2..]; // skip trailing CRLF
+        rest = &rest[crlf_end..]; // skip trailing CRLF
     }
 }
 
@@ -141,22 +142,24 @@ pub fn parse(body: &str) -> Vec<Reading> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some(reading) = parse_line(line) else {
-            continue;
-        };
-        match out
-            .iter_mut()
-            .find(|r| r.metric == reading.metric && r.sensor_name == reading.sensor_name)
-        {
-            Some(existing) => {
-                if reading.ts_ms > existing.ts_ms {
-                    *existing = reading;
-                }
-            }
-            None => out.push(reading),
+        if let Some(reading) = parse_line(line) {
+            upsert(&mut out, reading);
         }
     }
     out
+}
+
+/// Keep the newest sample per `(metric, sensor_name)` — LHM 0.9.5 lists
+/// archived history per sensor, newest timestamp wins.
+fn upsert(out: &mut Vec<Reading>, reading: Reading) {
+    match out
+        .iter_mut()
+        .find(|r| r.metric == reading.metric && r.sensor_name == reading.sensor_name)
+    {
+        Some(existing) if reading.ts_ms > existing.ts_ms => *existing = reading,
+        Some(_) => {}
+        None => out.push(reading),
+    }
 }
 
 fn parse_line(line: &str) -> Option<Reading> {
@@ -200,35 +203,28 @@ fn parse_line(line: &str) -> Option<Reading> {
 }
 
 /// Pick the four telemetry columns. `now_ms` gates freshness: a reading whose
-/// timestamp is older than `stale_ms` counts as not measured.
+/// timestamp is further than `stale_ms` from `now_ms` in *either* direction
+/// counts as not measured — a far-future stamp pins a column just as a stale
+/// one does.
 pub fn select(readings: &[Reading], now_ms: i64, stale_ms: i64) -> CpuSample {
+    let fresh: Vec<&Reading> = readings
+        .iter()
+        .filter(|r| r.ts_ms.is_none_or(|ts| (now_ms - ts).abs() <= stale_ms))
+        .collect();
     CpuSample {
-        tctl_c: pick(
-            readings,
-            now_ms,
-            stale_ms,
-            METRIC_TEMPERATURE,
-            &["tctl", "package"],
-        ),
-        ccd1_c: pick(readings, now_ms, stale_ms, METRIC_TEMPERATURE, &["ccd1"]),
-        ccd2_c: pick(readings, now_ms, stale_ms, METRIC_TEMPERATURE, &["ccd2"]),
-        package_power_w: pick(readings, now_ms, stale_ms, METRIC_POWER, &["package"]),
+        tctl_c: pick(&fresh, METRIC_TEMPERATURE, &["tctl", "package"]),
+        ccd1_c: pick(&fresh, METRIC_TEMPERATURE, &["ccd1"]),
+        ccd2_c: pick(&fresh, METRIC_TEMPERATURE, &["ccd2"]),
+        package_power_w: pick(&fresh, METRIC_POWER, &["package"]),
     }
 }
 
-fn pick(
-    readings: &[Reading],
-    now_ms: i64,
-    stale_ms: i64,
-    metric: &str,
-    needles: &[&str],
-) -> Option<f32> {
+fn pick(readings: &[&Reading], metric: &str, needles: &[&str]) -> Option<f32> {
     for needle in needles {
-        if let Some(r) = readings.iter().find(|r| {
-            r.metric == metric
-                && r.sensor_name.to_ascii_lowercase().contains(needle)
-                && r.ts_ms.is_none_or(|ts| now_ms - ts <= stale_ms)
-        }) {
+        if let Some(r) = readings
+            .iter()
+            .find(|r| r.metric == metric && r.sensor_name.to_ascii_lowercase().contains(needle))
+        {
             return plausible(r.value, metric == METRIC_TEMPERATURE);
         }
     }
@@ -364,7 +360,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let page =
-            "HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nlhm_cpu_temperature_celsius {} 61.5\n";
+            "HTTP/1.1 200 OK\r\nContent-Length: 36\r\n\r\nlhm_cpu_temperature_celsius {} 61.5\n";
         std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
             let mut req = [0u8; 1024];

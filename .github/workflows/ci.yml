@@ -11,7 +11,10 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # PRs share one group per PR so superseded runs cancel. Pushes to main get a
+  # per-commit group: GitHub drops *pending* runs in a shared group even with
+  # cancel-in-progress off, which would skip CI for intermediate commits.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

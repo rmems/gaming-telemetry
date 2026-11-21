@@ -10,6 +10,13 @@ permissions:
   contents: read
   pull-requests: read
 
+concurrency:
+  # PRs share one group per PR so superseded runs cancel. Pushes to main get a
+  # per-commit group: GitHub drops *pending* runs in a shared group even with
+  # cancel-in-progress off, which would skip CI for intermediate commits.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   fmt:
     runs-on: ubuntu-latest
@@ -84,6 +91,8 @@ jobs:
           components: clippy,llvm-tools-preview
           toolchain: "1.98.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.7.3
+        with:
+          shared-key: clippy-all-features
       - name: clippy
         # --all-features so the optional `query` code is linted too.
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -98,6 +107,8 @@ jobs:
         with:
           toolchain: "1.98.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.7.3
+        with:
+          shared-key: check-strict
       - name: Cargo check (default features)
         run: cargo check --locked
       - name: Cargo check (strict -D warnings, all features)
@@ -121,6 +132,8 @@ jobs:
           components: clippy
           toolchain: "1.98.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.7.3
+        with:
+          shared-key: windows-default
       - name: Cargo check (default features)
         run: cargo check --locked
       - name: clippy (default features)
@@ -129,7 +142,7 @@ jobs:
       - name: Test (default features)
         run: cargo test --locked
 
-  test:
+  test-default:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -143,18 +156,18 @@ jobs:
           components: llvm-tools-preview
           toolchain: "1.98.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.7.3
+        with:
+          shared-key: test-default
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: grcov
       - name: Test
-        # Both configurations: `--all-features` alone never builds the tests for
-        # the default (no-`query`) build that operators actually run.
-        run: |
-          cargo test --locked
-          cargo test --locked --all-features
+        run: cargo test --locked
         env:
           CARGO_INCREMENTAL: 0
           RUSTFLAGS: "-C instrument-coverage"
       - name: Generate lcov.info
         run: |
-          cargo install grcov --locked --force
           grcov . -s . --binary-path ./target/debug -t lcov --branch --ignore-not-existing --ignore build.rs -o lcov.info
           test -s lcov.info
           ! grep -q '^SF:build.rs$' lcov.info
@@ -173,7 +186,97 @@ jobs:
           oidc: true
           files: lcov.info
 
-  build:
+  # `--all-features` alone never builds the tests for the default (no-`query`)
+  # build that operators actually run, so both configurations are tested.
+  # Coverage is instrumented here too so `query`-gated code stays measured;
+  # Codecov merges this job's lcov with test-default's. Qlty uploads only from
+  # test-default to avoid two coverage reports racing for the same commit.
+  test-all-features:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: llvm-tools-preview
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.7.3
+        with:
+          shared-key: test-all-features
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: grcov
+      - name: Test (all features)
+        run: cargo test --locked --all-features
+        env:
+          CARGO_INCREMENTAL: 0
+          RUSTFLAGS: "-C instrument-coverage"
+      - name: Generate lcov.info
+        run: |
+          grcov . -s . --binary-path ./target/debug -t lcov --branch --ignore-not-existing --ignore build.rs -o lcov.info
+          test -s lcov.info
+          ! grep -q '^SF:build.rs$' lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@cd8b657745c0c7bb7f101e61a61c9ed5d74b8561 # v5.5.4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: false
+          verbose: true
+
+  build-release:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+        with:
+          mold-version: "3.0.0"
+      - name: Expose ld.mold for -fuse-ld=mold
+        # The action installs to /usr/local/bin; GCC's -fuse-ld lookup finds
+        # ld.mold via /usr/bin (same place the apt package puts it).
+        run: sudo ln -sf /usr/local/bin/mold /usr/bin/ld.mold
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.7.3
+        with:
+          shared-key: build-release
+      - name: Build release (default features)
+        run: cargo build --locked --release
+
+  build-bins:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: rui314/setup-mold@339e96b4ff1f3bd865856ba4cbbe8818a7acb038 # v1
+        with:
+          mold-version: "3.0.0"
+      - name: Expose ld.mold for -fuse-ld=mold
+        # The action installs to /usr/local/bin; GCC's -fuse-ld lookup finds
+        # ld.mold via /usr/bin (same place the apt package puts it).
+        run: sudo ln -sf /usr/local/bin/mold /usr/bin/ld.mold
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.7.3
+        with:
+          shared-key: build-bins
+      - name: Build bins (all features)
+        # `query` is behind the `query` feature, which pulls in bundled DuckDB.
+        run: cargo build --locked --all-features --bin gaming-telemetry --bin export_csv --bin query
+
+  audit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -182,12 +285,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: "1.98.0"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.7.3
-      - name: Build release (default features)
-        run: cargo build --locked --release
-      - name: Build bins (all features)
-        # `query` is behind the `query` feature, which pulls in bundled DuckDB.
-        run: cargo build --locked --all-features --bin gaming-telemetry --bin export_csv --bin query
       - name: Cargo audit (non-blocking)
         # rustsec/audit-check@v1 — pinned; advisory noise must not block capture PRs.
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v1

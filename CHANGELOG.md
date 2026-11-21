@@ -28,6 +28,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   **Breaking for CLI consumers of the six-column file:** it is now
   `export_csv --labelled`.
 
+- **CI wall-clock reduced by parallelizing long jobs.** The monolithic `build`
+  job (two sequential release builds) is split into `build-release` and
+  `build-bins`, and the monolithic `test` job is split into `test-default`
+  (with coverage upload) and `test-all-features`. `cargo audit` moves to its
+  own non-blocking job, `grcov` is installed from a prebuilt binary instead of
+  compiled from source, release bins link with mold, and a workflow-level
+  concurrency block cancels superseded PR runs.
+
 ### Deprecated
 
 - `export::canonical_frame` and `export::CANONICAL_COLUMNS` are renamed

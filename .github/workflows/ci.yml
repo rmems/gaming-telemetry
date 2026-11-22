@@ -149,12 +149,17 @@ jobs:
       - name: Sidecar unelevated smoke test
         # Exit 3 when the runner's token is unelevated, 4 when elevated but
         # PawnIO is absent (hosted runners have no PawnIO driver) — either is
-        # a correct gate exit. 0 or a crash would mean the gating broke.
+        # a correct gate exit, and both gate messages name PawnIO. Asserting
+        # the message stops a failure past the driver check (e.g. a broken
+        # LibreHardwareMonitor init, also exit 4) from passing as a gate.
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath sidecar/publish/gaming-telemetry-cpu-sidecar.exe -PassThru -NoNewWindow
+          $err = Join-Path $env:TEMP "sidecar-smoke-stderr.txt"
+          $p = Start-Process -FilePath sidecar/publish/gaming-telemetry-cpu-sidecar.exe -PassThru -NoNewWindow -RedirectStandardError $err
           if (-not $p.WaitForExit(30000)) { $p.Kill(); throw "sidecar hung on a driverless runner" }
           if ($p.ExitCode -notin 3, 4) { throw "expected gate exit 3 or 4, got $($p.ExitCode)" }
+          $msg = Get-Content $err -Raw
+          if ($msg -notmatch 'PawnIO') { throw "gate exited correctly but with an unexpected message: $msg" }
 
   test-default:
     runs-on: ubuntu-latest

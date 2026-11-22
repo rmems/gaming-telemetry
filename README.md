@@ -381,7 +381,9 @@ Probe order:
 
    then put `gaming-telemetry-cpu-sidecar.exe` next to
    `gaming-telemetry.exe`. `CPU_SIDECAR_PATH` overrides where the collector
-   looks; `CPU_SIDECAR_DISABLE=1` skips the sidecar entirely (columns stay
+   looks — honored only when the collector is *not* elevated, since an
+   administrator-launched run must not let a less-trusted environment choose
+   which binary gets the admin token; `CPU_SIDECAR_DISABLE=1` skips the sidecar entirely (columns stay
    null unless a host below is running).
 
 2. **HWiNFO64 shared memory** — enable "Shared Memory Support" under

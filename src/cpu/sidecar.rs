@@ -196,7 +196,9 @@ mod imp {
                 &mut size,
             );
             CloseHandle(token);
-            ok != 0 && elevation.TokenIsElevated != 0
+            // A failed query answers "elevated" — the env override is not
+            // trusted whenever elevation cannot be ruled out.
+            ok == 0 || elevation.TokenIsElevated != 0
         }
     }
 
@@ -239,6 +241,7 @@ mod imp {
             (child.stdin.take(), child.stdout.take(), child.stderr.take())
         else {
             let _ = child.kill();
+            let _ = child.wait();
             return None;
         };
         let shared = Arc::new(Mutex::new(FeedState::new()));
@@ -276,9 +279,12 @@ mod imp {
 
     /// Decode sample lines until the child's stdout closes. Liveness requires
     /// a sample that is actually usable — an all-null stream proves nothing
-    /// (a running HWiNFO or LHM host would serve real data in its place), and
-    /// a stale `ts_ms` only proves the pipe holds a backlog. A line that does
-    /// not parse is skipped, not treated as a dead feed.
+    /// (a running HWiNFO or LHM host would serve real data in its place) — and
+    /// a stale `ts_ms` means the pipe holds a backlog: those lines are dropped
+    /// outright rather than published, so an expired reading can neither
+    /// refresh the feed's liveness nor replace the mailbox values a tick
+    /// would write into a row. A line that does not parse is skipped, not
+    /// treated as a dead feed.
     fn read_loop(stdout: impl Read, shared: Arc<Mutex<FeedState>>) {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
@@ -286,7 +292,9 @@ mod imp {
                 continue;
             };
             let fresh = ts_ms.is_none_or(|ts| now_unix_ms().saturating_sub(ts) <= SAMPLE_STALE_MS);
-            publish(&shared, fresh && sample != CpuSample::EMPTY, sample);
+            if fresh {
+                publish(&shared, sample != CpuSample::EMPTY, sample);
+            }
         }
     }
 

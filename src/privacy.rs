@@ -92,11 +92,13 @@ fn current_user_identities() -> Vec<String> {
         }
     }
     for key in ["HOME", "USERPROFILE"] {
-        if let Some(home) = env::var_os(key)
-            && let Some(name) = Path::new(&home).file_name()
-        {
-            push(&mut identities, name.to_string_lossy().into_owned());
-        }
+        let Some(home) = env::var_os(key) else {
+            continue;
+        };
+        let Some(name) = Path::new(&home).file_name() else {
+            continue;
+        };
+        push(&mut identities, name.to_string_lossy().into_owned());
     }
     identities
 }
@@ -169,10 +171,14 @@ fn root_anchored_username(parts: &[&str], index: usize) -> Option<usize> {
 /// A component from splitting a full error message on `/` can carry prose after
 /// the username -- `"alice: permission denied"` -- so only the identifier
 /// prefix is a redaction target; replacing the whole component would silently
-/// delete the diagnostic text after it.
+/// delete the diagnostic text after it. Spaces count as identifier characters:
+/// Windows profile folders like `Jane Doe` put a space inside the name, and
+/// stopping at the first space would leave `Doe` unredacted. The trade is
+/// deliberately conservative — `/home/alice had an error` loses its trailing
+/// prose to `$USER`, which is the safe direction for a redaction pass.
 fn split_identifier(component: &str) -> (&str, &str) {
     let end = component
-        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ')))
         .unwrap_or(component.len());
     component.split_at(end)
 }
@@ -357,6 +363,12 @@ mod tests {
         );
         assert_eq!(
             redact_user_named_parents("C:/Users/zztestuser/tool.exe"),
+            "C:/Users/$USER/tool.exe"
+        );
+        // A profile folder whose name contains a space still loses the whole
+        // name — stopping at the space would leave `Doe` behind.
+        assert_eq!(
+            redact_user_named_parents("C:/Users/Jane Doe/tool.exe"),
             "C:/Users/$USER/tool.exe"
         );
         // A bare `Users` directory nested mid-path names no one.

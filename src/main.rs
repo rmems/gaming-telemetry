@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use gaming_telemetry::cpu::CpuMonitor;
+use gaming_telemetry::cpu::{CpuMonitor, CpuSample};
 use gaming_telemetry::manifest::{self, HostInfo, SessionManifest};
 use gaming_telemetry::privacy;
 use gaming_telemetry::session;
@@ -136,6 +136,39 @@ fn build_batch_frame(samples: &[GpuSample]) -> Result<DataFrame> {
 /// idle encoder or a silent PCIe link once it reaches a training set.
 fn nvml_optional<T, E>(result: Result<T, E>) -> Option<T> {
     result.ok()
+}
+
+/// Assemble one capture tick's row. Every NVML read that can fail degrades
+/// to `None` — never a fabricated zero — the same contract the CPU fields
+/// carry in from the monitor's own sample.
+fn collect_sample(device: &nvml_wrapper::Device, session_label: &str, cpu: CpuSample) -> GpuSample {
+    let (memory_used_mb, memory_total_mb) =
+        memory_mb(device.memory_info().map(|m| (m.used, m.total)));
+    GpuSample {
+        timestamp: Utc::now(),
+        session_label: session_label.to_owned(),
+        power_usage_mw: nvml_optional(device.power_usage()),
+        temperature_c: nvml_optional(device.temperature(TemperatureSensor::Gpu)),
+        graphics_clock_mhz: nvml_optional(device.clock_info(Clock::Graphics)),
+        memory_clock_mhz: nvml_optional(device.clock_info(Clock::Memory)),
+        pcie_rx_throughput_kbps: nvml_optional(
+            device.pcie_throughput(nvml_wrapper::enum_wrappers::device::PcieUtilCounter::Receive),
+        ),
+        pcie_tx_throughput_kbps: nvml_optional(
+            device.pcie_throughput(nvml_wrapper::enum_wrappers::device::PcieUtilCounter::Send),
+        ),
+        pstate: nvml_optional(device.performance_state()).map(|p| p as u32),
+        throttle_reasons: nvml_optional(device.current_throttle_reasons()).map(|t| t.bits()),
+        fan_speed_perc: nvml_optional(device.fan_speed(0)),
+        memory_used_mb,
+        memory_total_mb,
+        encoder_util_perc: nvml_optional(device.encoder_utilization()).map(|u| u.utilization),
+        decoder_util_perc: nvml_optional(device.decoder_utilization()).map(|u| u.utilization),
+        cpu_tctl_c: cpu.tctl_c,
+        cpu_ccd1_c: cpu.ccd1_c,
+        cpu_ccd2_c: cpu.ccd2_c,
+        cpu_package_power_w: cpu.package_power_w,
+    }
 }
 
 /// Convert NVML `memory_info` bytes into megabytes, or null both columns on fail.
@@ -274,10 +307,6 @@ async fn drain_in_flight(in_flight: &mut JoinSet<Result<()>>, write_failures: &m
     }
 }
 
-/// Flush the tail buffer, drain outstanding writes, then finalize the manifest.
-///
-/// Both shutdown paths (Ctrl+C, and Ctrl+C during write backpressure) converge
-/// here, so the manifest is finalized and rewritten exactly once per run.
 /// Fold the monitor's source record into the manifest, rewriting the file
 /// only when the recorded source actually changed. Bind/unbind transitions
 /// are rare, so the atomic write costs nothing per tick — while a crash
@@ -296,6 +325,10 @@ fn sync_cpu_source(
     Ok(())
 }
 
+/// Flush the tail buffer, drain outstanding writes, then finalize the manifest.
+///
+/// Both shutdown paths (Ctrl+C, and Ctrl+C during write backpressure) converge
+/// here, so the manifest is finalized and rewritten exactly once per run.
 async fn perform_shutdown(
     buffer: Vec<GpuSample>,
     batch_counter: u32,
@@ -434,10 +467,9 @@ async fn main() -> Result<()> {
     // sensor host fed this run's cpu_* columns — the answer to "why is every
     // cpu_* column null" must be on disk, not only on stderr.
     let mut cpu_monitor = CpuMonitor::new();
-    // The first probe runs detached, so the source usually is not bound yet;
-    // the manifest records `null` at start and `sync_cpu_source` in the loop
-    // rewrites it the moment a source binds.
-    sync_cpu_source(&mut manifest, &cpu_monitor, &output_dir)?;
+    // The first probe runs detached, so nothing is bound yet: the manifest
+    // records `null` at start, and `sync_cpu_source` in the loop rewrites it
+    // the moment a source binds.
     // Publish only after the fallible resume scan succeeds, so an unreadable
     // existing directory cannot overwrite its prior completed manifest.
     manifest.write_atomic(&output_dir)?;
@@ -471,44 +503,17 @@ async fn main() -> Result<()> {
             tick = interval.tick() => {
                 timing.record_scheduled_tick(tick.into_std());
 
-                let (memory_used_mb, memory_total_mb) =
-                    memory_mb(device.memory_info().map(|m| (m.used, m.total)));
-
                 // CPU telemetry (poll for time-delta power calculation)
                 let cpu = cpu_monitor.poll();
                 // Keep on-disk source attribution current through binds and
-                // unbinds; cheap compare every tick, one tiny rewrite per
-                // transition — a crash between them must not misattribute rows.
-                sync_cpu_source(&mut manifest, &cpu_monitor, &output_dir)?;
+                // unbinds. A transient rewrite failure must not kill the run
+                // — the in-memory field is already updated, so finalization
+                // still records the source, and a later transition retries.
+                if let Err(e) = sync_cpu_source(&mut manifest, &cpu_monitor, &output_dir) {
+                    report_failure("Failed to update session manifest cpu_source", &format!("{e:?}"));
+                }
 
-                let sample = GpuSample {
-                    timestamp: Utc::now(),
-                    session_label: session_label.clone(),
-                    power_usage_mw: nvml_optional(device.power_usage()),
-                    temperature_c: nvml_optional(device.temperature(TemperatureSensor::Gpu)),
-                    graphics_clock_mhz: nvml_optional(device.clock_info(Clock::Graphics)),
-                    memory_clock_mhz: nvml_optional(device.clock_info(Clock::Memory)),
-                    pcie_rx_throughput_kbps: nvml_optional(device.pcie_throughput(
-                        nvml_wrapper::enum_wrappers::device::PcieUtilCounter::Receive,
-                    )),
-                    pcie_tx_throughput_kbps: nvml_optional(device.pcie_throughput(
-                        nvml_wrapper::enum_wrappers::device::PcieUtilCounter::Send,
-                    )),
-                    pstate: nvml_optional(device.performance_state()).map(|p| p as u32),
-                    throttle_reasons: nvml_optional(device.current_throttle_reasons())
-                        .map(|t| t.bits()),
-                    fan_speed_perc: nvml_optional(device.fan_speed(0)),
-                    memory_used_mb,
-                    memory_total_mb,
-                    encoder_util_perc: nvml_optional(device.encoder_utilization())
-                        .map(|u| u.utilization),
-                    decoder_util_perc: nvml_optional(device.decoder_utilization())
-                        .map(|u| u.utilization),
-                    cpu_tctl_c: cpu.tctl_c,
-                    cpu_ccd1_c: cpu.ccd1_c,
-                    cpu_ccd2_c: cpu.ccd2_c,
-                    cpu_package_power_w: cpu.package_power_w,
-                };
+                let sample = collect_sample(&device, &session_label, cpu);
 
                 // Measure when telemetry was actually obtained, not the Tokio
                 // scheduler's nominal deadline. This includes collection stalls.
@@ -525,7 +530,10 @@ async fn main() -> Result<()> {
                     .await?
                     {
                         println!("\nShutdown signal received during write backpressure...");
-                        sync_cpu_source(&mut manifest, &cpu_monitor, &output_dir)?;
+                        // Infallible field update only — perform_shutdown
+                        // persists it; a fallible manifest write here would
+                        // skip the flush and drain below and lose rows.
+                        manifest.cpu_source = cpu_monitor.bound_source().map(str::to_owned);
                         perform_shutdown(
                             std::mem::take(&mut buffer),
                             batch_counter,
@@ -546,7 +554,8 @@ async fn main() -> Result<()> {
                             // still in flight. Converge on the same shutdown path
                             // Ctrl+C uses so nothing already captured is lost.
                             report_failure("Cannot start a new batch", &format!("{:?}", e));
-                            sync_cpu_source(&mut manifest, &cpu_monitor, &output_dir)?;
+                            manifest.cpu_source =
+                                cpu_monitor.bound_source().map(str::to_owned);
                             perform_shutdown(
                                 samples_to_write,
                                 batch_counter,
@@ -572,7 +581,7 @@ async fn main() -> Result<()> {
             signal = shutdown.recv() => {
                 signal?;
                 println!("\nShutdown signal received. Finalizing last batch...");
-                sync_cpu_source(&mut manifest, &cpu_monitor, &output_dir)?;
+                manifest.cpu_source = cpu_monitor.bound_source().map(str::to_owned);
                 perform_shutdown(
                     buffer,
                     batch_counter,

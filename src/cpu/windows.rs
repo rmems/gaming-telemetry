@@ -528,4 +528,26 @@ mod tests {
         let _ = monitor.poll();
         assert!(started.elapsed() < Duration::from_secs(5));
     }
+
+    /// The deterministic stall case the previous test can only approximate:
+    /// a probe channel that never delivers is the worst blocking probe —
+    /// ticks must still return `EMPTY` immediately and `bound_source` must
+    /// honestly report that nothing is feeding the columns.
+    #[test]
+    fn a_stalled_probe_never_blocks_a_tick() {
+        let (_tx, rx) = mpsc::channel();
+        let mut monitor = CpuMonitor {
+            source: Source::Disconnected,
+            next_probe_at: Instant::now() + Duration::from_secs(3600),
+            probe_rx: Some(rx),
+            warned_unbound: false,
+            last_bound: None,
+        };
+        let started = Instant::now();
+        for _ in 0..100 {
+            assert_eq!(monitor.poll(), CpuSample::EMPTY);
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(monitor.bound_source().is_none());
+    }
 }

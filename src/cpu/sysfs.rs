@@ -111,6 +111,13 @@ impl CpuMonitor {
         }
     }
 
+    /// The sensor host feeding the columns, as recorded in the session
+    /// manifest. sysfs is the only source on Linux; `None` only when neither
+    /// k10temp nor a readable RAPL counter was found at startup.
+    pub fn bound_source(&self) -> Option<&'static str> {
+        (self.k10temp_base_path.is_some() || self.rapl_path.is_some()).then_some("linux-sysfs")
+    }
+
     /// Read every CPU sensor for this tick.
     pub fn poll(&mut self) -> CpuSample {
         // `TEMP_INPUTS` is consumed generically in `new()`'s startup probe, but

@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- The collector looks for this exact filename next to its own binary. -->
+    <AssemblyName>gaming-telemetry-cpu-sidecar</AssemblyName>
+    <!-- Single self-contained exe: the capture machine needs no .NET install,
+         only the PawnIO driver and an elevated collector. -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <!-- LHM's native helpers (MonoPosixHelper) must ride inside the single
+         file too — the collector ships exactly one exe. -->
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- PawnIO replaced WinRing0 in LHM 0.9.5; pinned to the latest stable
+         rather than the 0.9.7-pre* rolling builds. -->
+    <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.6" />
+  </ItemGroup>
+
+</Project>

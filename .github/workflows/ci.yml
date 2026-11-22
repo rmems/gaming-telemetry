@@ -129,18 +129,83 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          components: clippy
+          components: clippy, llvm-tools-preview
           toolchain: "1.98.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.7.3
         with:
           shared-key: windows-default
-      - name: Cargo check (default features)
-        run: cargo check --locked
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: grcov
+      - name: Cache instrumented target dir
+        # The instrumented test build lives in `target-coverage/` — a sibling
+        # of `target/`, not a child, so the windows-default rust-cache tarball
+        # cannot swallow it. Its own cache key turns the ~13 min cold dep
+        # rebuild into an incremental one; a lockfile/toolchain bump just
+        # falls back to the prefix entry.
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: target-coverage
+          key: ${{ runner.os }}-coverage-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ${{ runner.os }}-coverage-
       - name: clippy (default features)
-        # The Linux clippy job never compiles `#[cfg(windows)]` code.
+        # The Linux clippy job never compiles `#[cfg(windows)]` code. This also
+        # covers `cargo check`: --all-targets type-checks tests and benches too.
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Drop stale instrumented artifacts
+        # A restored cache can hold test binaries and .profraw for names this
+        # tree no longer builds; grcov would merge their stale line mappings
+        # into the report. `cargo clean -p` removes only this crate's
+        # artifacts, so cached dep objects still skip the ~13 min rebuild.
+        shell: bash
+        run: |
+          rm -f default_*.profraw
+          cargo clean -p gaming-telemetry
+        env:
+          CARGO_TARGET_DIR: target-coverage
       - name: Test (default features)
         run: cargo test --locked
+        env:
+          CARGO_INCREMENTAL: 0
+          RUSTFLAGS: "-C instrument-coverage"
+          # Separate target dir: instrumented artifacts have a different
+          # fingerprint than the clippy builds sharing the windows-default key,
+          # and mixing them recompiles the whole tree every run.
+          CARGO_TARGET_DIR: target-coverage
+      - name: Generate lcov.info
+        # cfg(windows) code is uncovered on the Linux coverage jobs, so this
+        # lcov is what keeps the Windows backend inside the patch gate.
+        shell: bash
+        run: |
+          grcov . -s . --binary-path ./target-coverage/debug -t lcov --branch --ignore-not-existing --ignore build.rs -o lcov.info
+          test -s lcov.info
+          ! grep -q '^SF:build.rs$' lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@cd8b657745c0c7bb7f101e61a61c9ed5d74b8561 # v5.5.4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: false
+          verbose: true
+      - name: Publish CPU sidecar (.NET)
+        # The runner image carries the .NET 8 SDK the sidecar targets; this
+        # proves the helper still restores and publishes on every PR, since
+        # the Rust spawn test exercises the pipe plumbing with cmd.exe only.
+        run: dotnet publish sidecar/GamingTelemetry.CpuSidecar.csproj -c Release -o sidecar/publish
+      - name: Sidecar unelevated smoke test
+        # Exit 3 when the runner's token is unelevated, 4 when elevated but
+        # PawnIO is absent (hosted runners have no PawnIO driver) — either is
+        # a correct gate exit, and both gate messages name PawnIO. Asserting
+        # the message stops a failure past the driver check (e.g. a broken
+        # LibreHardwareMonitor init, also exit 4) from passing as a gate.
+        shell: pwsh
+        run: |
+          $err = Join-Path $env:TEMP "sidecar-smoke-stderr.txt"
+          $p = Start-Process -FilePath sidecar/publish/gaming-telemetry-cpu-sidecar.exe -PassThru -NoNewWindow -RedirectStandardError $err
+          if (-not $p.WaitForExit(30000)) { $p.Kill(); throw "sidecar hung on a driverless runner" }
+          if ($p.ExitCode -notin 3, 4) { throw "expected gate exit 3 or 4, got $($p.ExitCode)" }
+          $msg = Get-Content $err -Raw
+          if ($msg -notmatch 'PawnIO') { throw "gate exited correctly but with an unexpected message: $msg" }
 
   test-default:
     runs-on: ubuntu-latest

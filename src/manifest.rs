@@ -87,6 +87,10 @@ pub struct PriorRun {
     pub git_commit: String,
     pub host: HostInfo,
     pub workload: Workload,
+    /// Sensor host that fed that run's `cpu_*` columns; `null` when nothing
+    /// was bound. Absent in manifests written before the field existed.
+    #[serde(default)]
+    pub cpu_source: Option<String>,
     pub timing: Option<TimingSummary>,
 }
 
@@ -132,6 +136,15 @@ pub struct SessionManifest {
     pub unclean_restart_count: u32,
     pub host: HostInfo,
     pub workload: Workload,
+    /// Sensor host that fed this run's `cpu_*` columns — `lhm-sidecar`,
+    /// `hwinfo-shm`, `lhm-metrics`, or `linux-sysfs`. `null` means nothing
+    /// ever bound, which is exactly what an all-null CPU block should record;
+    /// a silent 100%-null session must be distinguishable from a broken
+    /// build after the fact. Rewritten on every bind/unbind transition during
+    /// capture, so the name on disk is the last source that fed rows even
+    /// when the session ends uncleanly or the feed dies before shutdown.
+    #[serde(default)]
+    pub cpu_source: Option<String>,
     /// Total Parquet batches that failed during this session. A nonzero
     /// value means timing sample_count can exceed rows available on disk.
     #[serde(default)]
@@ -302,6 +315,7 @@ impl SessionManifest {
             unclean_restart_count: 0,
             host,
             workload,
+            cpu_source: None,
             parquet_write_failures: 0,
             timing: None,
             prior_runs: Vec::new(),
@@ -477,6 +491,7 @@ impl From<&SessionManifest> for PriorRun {
             git_commit: manifest.git_commit.clone(),
             host: manifest.host.clone(),
             workload: manifest.workload.clone(),
+            cpu_source: manifest.cpu_source.clone(),
             timing: manifest.timing.clone(),
         }
     }

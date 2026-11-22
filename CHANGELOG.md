@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Bundled LibreHardwareMonitor sidecar for Windows CPU telemetry.**
+  `gaming-telemetry-cpu-sidecar` (C# helper under `sidecar/`, built on
+  `LibreHardwareMonitorLib` 0.9.6 with the signed PawnIO driver) is spawned
+  and owned by the collector at capture start — no GUI app to launch, no
+  shared-memory option to enable, no `/metrics` server, and no 12-hour
+  shared-memory expiry. It is the first Windows probe source; the HWiNFO64
+  shared-memory and LHM `/metrics` readers remain as opportunistic fallbacks
+  below it. The sidecar needs the PawnIO driver installed and an elevated
+  collector; absent, unelevated, or disabled (`CPU_SIDECAR_DISABLE`,
+  `CPU_SIDECAR_PATH` to relocate), the `cpu_*` columns stay null — never
+  zeros.
+
+- **Session manifest records `cpu_source`.** The bound Windows sensor host
+  (`lhm-sidecar`, `hwinfo-shm`, `lhm-metrics`), `linux-sysfs`, or `null` when
+  nothing was bound is written at capture start and refreshed at finalize, so
+  a 100%-null CPU block is attributable instead of silent. Additive field —
+  schema stays version 1.
+
 ### Changed
 
 - **`export_csv` now emits the frozen vahtisiru corinth CSV contract by default

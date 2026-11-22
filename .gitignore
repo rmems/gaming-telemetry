@@ -17,6 +17,8 @@ docs/superpowers/
 
 # Compiled output
 /target/
+# Instrumented coverage target dir (CI mirrors this as CARGO_TARGET_DIR)
+/target-coverage/
 
 # IDE / editor
 .idea/
@@ -53,3 +55,13 @@ remotes.txt
 *.csv
 # Contract fixtures are source, not generated output.
 !tests/fixtures/**/*.csv
+
+# Sidecar build artifacts (Windows .NET CPU sensor helper)
+sidecar/bin/
+sidecar/obj/
+sidecar/publish/
+/gaming-telemetry-cpu-sidecar.exe
+
+# Runtime session artifacts when SESSION_DIR is the repo root
+/.gaming-telemetry.lock
+/session_manifest.json

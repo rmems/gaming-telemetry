@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Windows `CpuMonitor`: CPU telemetry through a running sensor host.
+//! Windows `CpuMonitor`: CPU telemetry through a sensor host.
 //!
-//! Probe order is HWiNFO64 shared memory, then LibreHardwareMonitor's
-//! `/metrics` server, then nothing — matching how much setup each asks of the
-//! operator and how fast each source can be read at capture tick rates. A
-//! monitor that found nothing keeps re-probing so a sensor host started
-//! mid-session is picked up without a collector restart.
+//! Probe order is the bundled LibreHardwareMonitor sidecar — which the
+//! collector itself spawns and owns — then an operator-run host: HWiNFO64
+//! shared memory, then LibreHardwareMonitor's `/metrics` server, then
+//! nothing. The sidecar comes first because it is the only source whose
+//! lifecycle the collector controls: the other two are opportunistic
+//! fallbacks for a box where the sidecar cannot run. A monitor that found
+//! nothing keeps re-probing so a host started mid-session is picked up
+//! without a collector restart.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
@@ -14,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::{CpuSample, hwinfo, lhm};
+use super::{CpuSample, FeedState, hwinfo, lhm, publish, sidecar};
 
 /// A monitor with no source re-probes at this interval, so an operator who
 /// starts HWiNFO or LHM mid-session still gets CPU columns for the rest of it.
@@ -38,10 +41,21 @@ const LHM_REFRESH: Duration = Duration::from_millis(500);
 /// A `/metrics` sample older than this counts as not measured.
 const LHM_STALE_MS: i64 = 10_000;
 
-/// How long the LHM worker may go without a completed fetch before the source
-/// is abandoned and another probe is tried — the same patience the HWiNFO
-/// path allows a frozen feed.
-const LHM_DEAD: Duration = Duration::from_secs(10);
+/// How long a worker-fed source may go without proving liveness before it is
+/// abandoned and another probe is tried — the same patience the HWiNFO path
+/// allows a frozen feed. Covers both the LHM fetch loop and the sidecar's
+/// stdout reader.
+const FEED_DEAD: Duration = Duration::from_secs(10);
+
+/// At connect, how long a spawned sidecar may take to produce its first
+/// non-empty sample before it is killed and the probe falls through to
+/// HWiNFO/LHM. An unelevated or driverless helper exits within seconds; only
+/// the happy path — driver load plus first sensor update — takes any real
+/// time, and even that is normally a few seconds.
+const SIDECAR_CONNECT: Duration = Duration::from_secs(20);
+
+/// Poll cadence while waiting out [`SIDECAR_CONNECT`].
+const SIDECAR_CONNECT_POLL: Duration = Duration::from_millis(20);
 
 /// Tracks the energy-independent sensor host selected at probe time.
 ///
@@ -54,12 +68,63 @@ pub struct CpuMonitor {
     next_probe_at: Instant,
     /// Receives the next probe's result while it runs detached.
     probe_rx: Option<mpsc::Receiver<ProbeResult>>,
+    /// Set once the loud "no source bound" report has fired — the first probe
+    /// result that finds nothing warns once, not on every re-probe.
+    warned_unbound: bool,
+    /// Manifest name of the last source that ever bound. A feed that dies
+    /// before shutdown must still leave its name on the run's CPU columns;
+    /// `Disconnected` alone would overwrite real provenance with `null`.
+    last_bound: Option<&'static str>,
 }
 
 enum Source {
+    Sidecar(SidecarSource),
     Hwinfo(HwinfoSource),
     Lhm(LhmSource),
     Disconnected,
+}
+
+impl Source {
+    /// The name recorded in the session manifest's `cpu_source` field.
+    fn manifest_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Sidecar(_) => Some("lhm-sidecar"),
+            Self::Hwinfo(_) => Some("hwinfo-shm"),
+            Self::Lhm(_) => Some("lhm-metrics"),
+            Self::Disconnected => None,
+        }
+    }
+}
+
+/// What a source's `poll` returned, without borrowing `self` any longer —
+/// the death paths below mutate the monitor itself.
+enum PollOutcome {
+    /// A real or all-null sample this tick.
+    Sample(CpuSample),
+    /// No sample, but the source may recover on its own (a HWiNFO freeze
+    /// still inside its give-up window): keep it bound, return `EMPTY`.
+    Stalled,
+    /// The feed is dead; drop the source and re-probe. The string is the
+    /// stderr report — a dying source is announced, not silent.
+    Dead(&'static str),
+}
+
+/// The sidecar child exited or stopped producing; a dead helper cannot
+/// recover on its own, so re-probe — the next cycle respawns it or finds
+/// HWiNFO/LHM meanwhile.
+const SIDECAR_DIED: &str = "Bundled LibreHardwareMonitor sidecar stopped producing samples; CPU columns going empty while another source is probed.";
+
+/// The feed froze and stayed frozen (HWiNFO exited, or the free edition's
+/// 12-hour shared-memory window closed). Re-probe: LHM may be running, or
+/// HWiNFO may come back under a fresh mapping.
+const HWINFO_DIED: &str = "HWiNFO64 sensor feed stopped updating; CPU columns going empty while another source is probed.";
+
+/// The server stopped answering (exited, or stopped its web server).
+/// Re-probe: HWiNFO may have appeared meanwhile.
+const LHM_DIED: &str = "LibreHardwareMonitor /metrics stopped answering; CPU columns going empty while another source is probed.";
+
+struct SidecarSource {
+    sidecar: sidecar::Sidecar,
 }
 
 /// A completed probe handed back from the detached probe thread. The handles
@@ -80,16 +145,9 @@ struct HwinfoSource {
 
 struct LhmSource {
     /// Written by the fetch worker, read by capture ticks.
-    shared: Arc<Mutex<LhmShared>>,
+    shared: Arc<Mutex<FeedState>>,
     /// Asked on drop so a superseded worker exits instead of fetching forever.
     stop: Arc<AtomicBool>,
-}
-
-struct LhmShared {
-    /// The most recent fetch's sample; `EMPTY` after a failed one.
-    sample: CpuSample,
-    /// When the last *successful* fetch finished.
-    succeeded_at: Instant,
 }
 
 impl Default for CpuMonitor {
@@ -99,31 +157,25 @@ impl Default for CpuMonitor {
 }
 
 impl CpuMonitor {
-    /// Probe for a sensor host, reporting on stderr what was found — or, with
-    /// none, exactly what the operator can run. The report matters as much here
-    /// as on Linux: without it, an empty CPU column for a whole session is
-    /// indistinguishable from a broken build.
+    /// Start probing for a sensor host on the same detached thread the
+    /// re-probe path uses. The first probe cannot run synchronously here:
+    /// [`SidecarSource::connect`] may wait out [`SIDECAR_CONNECT`] for a
+    /// spawned helper that never produces a sample, which would stall the
+    /// manifest write and the first capture ticks. The result — a bound
+    /// source, or the loud no-source report — lands on the first `poll`
+    /// after the probe finishes instead.
     pub fn new() -> Self {
-        let now = Instant::now();
-        let ProbeResult(source, name) = probe(now);
-        let monitor = Self {
-            source,
-            next_probe_at: now + PROBE_RETRY,
-            probe_rx: None,
-        };
-        match name {
-            Some(name) => eprintln!("CPU telemetry via {name}."),
-            None => eprintln!(
-                "CPU telemetry unavailable: no supported Windows sensor host found. \
-                 Run HWiNFO64 with \"Shared Memory Support\" enabled (Settings → \
-                 General/User Interface), or LibreHardwareMonitor with its remote \
-                 web server running (Options → Remote Web Server → Run, port \
-                 8085). The cpu_* columns will be empty; probing again every \
-                 {}s.",
-                PROBE_RETRY.as_secs()
-            ),
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(probe());
+        });
+        Self {
+            source: Source::Disconnected,
+            next_probe_at: Instant::now() + PROBE_RETRY,
+            probe_rx: Some(rx),
+            warned_unbound: false,
+            last_bound: None,
         }
-        monitor
     }
 
     /// A monitor bound to no source; every reading is `None`.
@@ -133,47 +185,47 @@ impl CpuMonitor {
             source: Source::Disconnected,
             next_probe_at: Instant::now() + Duration::from_secs(3600),
             probe_rx: None,
+            warned_unbound: false,
+            last_bound: None,
         }
+    }
+
+    /// The sensor host that fed this run's columns — the current binding, or
+    /// the last one that bound when it has since died. `None` only when
+    /// nothing ever bound, which is itself the answer to "why is every cpu_*
+    /// column null". The manifest records the last binding because every
+    /// connected source produced at least one real sample to get bound.
+    pub fn bound_source(&self) -> Option<&'static str> {
+        self.source.manifest_name().or(self.last_bound)
     }
 
     /// Read every CPU sensor for this tick.
     pub fn poll(&mut self) -> CpuSample {
         let now = Instant::now();
-        match &mut self.source {
+        let outcome = match &mut self.source {
+            Source::Sidecar(src) => src
+                .poll(now)
+                .map_or(PollOutcome::Dead(SIDECAR_DIED), PollOutcome::Sample),
             Source::Hwinfo(src) => match src.poll(now) {
-                Some(sample) => sample,
-                None => {
-                    if src.gave_up(now) {
-                        // The feed froze and stayed frozen (HWiNFO exited, or
-                        // the free edition's 12-hour shared-memory window
-                        // closed). Re-probe: LHM may be running, or HWiNFO may
-                        // come back under a fresh mapping.
-                        eprintln!(
-                            "HWiNFO64 sensor feed stopped updating; CPU columns \
-                             going empty while another source is probed."
-                        );
-                        self.source = Source::Disconnected;
-                        self.next_probe_at = now;
-                    }
-                    CpuSample::EMPTY
-                }
+                Some(sample) => PollOutcome::Sample(sample),
+                None if src.gave_up(now) => PollOutcome::Dead(HWINFO_DIED),
+                None => PollOutcome::Stalled,
             },
-            Source::Lhm(src) => match src.poll(now) {
-                Some(sample) => sample,
-                None => {
-                    // The server stopped answering (exited, or stopped its web
-                    // server). Re-probe: HWiNFO may have appeared meanwhile.
-                    eprintln!(
-                        "LibreHardwareMonitor /metrics stopped answering; CPU \
-                         columns going empty while another source is probed."
-                    );
-                    self.source = Source::Disconnected;
-                    self.next_probe_at = now;
-                    CpuSample::EMPTY
-                }
-            },
+            Source::Lhm(src) => src
+                .poll(now)
+                .map_or(PollOutcome::Dead(LHM_DIED), PollOutcome::Sample),
             Source::Disconnected => {
                 self.drive_probe(now);
+                return CpuSample::EMPTY;
+            }
+        };
+        match outcome {
+            PollOutcome::Sample(sample) => sample,
+            PollOutcome::Stalled => CpuSample::EMPTY,
+            PollOutcome::Dead(message) => {
+                eprintln!("{message}");
+                self.source = Source::Disconnected;
+                self.next_probe_at = now;
                 CpuSample::EMPTY
             }
         }
@@ -189,6 +241,10 @@ impl CpuMonitor {
                     self.source = source;
                     if let Some(name) = name {
                         eprintln!("CPU telemetry via {name}.");
+                        self.last_bound = self.source.manifest_name();
+                    } else if !self.warned_unbound {
+                        self.warned_unbound = true;
+                        warn_unbound();
                     }
                 }
                 Err(TryRecvError::Empty) => {}
@@ -200,7 +256,7 @@ impl CpuMonitor {
             self.next_probe_at = now + PROBE_RETRY;
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
-                let _ = tx.send(probe(Instant::now()));
+                let _ = tx.send(probe());
             });
             self.probe_rx = Some(rx);
         }
@@ -208,20 +264,79 @@ impl CpuMonitor {
 }
 
 /// Try each source in probe order; the result names what was found for
-/// logging. Runs on the detached probe thread (or once synchronously at
-/// startup) — it can take a full HTTP round-trip and must not run inside a
-/// capture tick.
-fn probe(now: Instant) -> ProbeResult {
-    if let Some(src) = HwinfoSource::connect(now) {
+/// logging. Always runs on a detached probe thread — it can wait out a
+/// sidecar connect plus a full HTTP round-trip and must never run inside
+/// `new` or a capture tick. Every connect seeds its freshness clocks from a
+/// timestamp taken at *its own* attempt: a `now` captured before the
+/// sidecar's connect wait would mark a just-fetched fallback sample
+/// already-dead.
+fn probe() -> ProbeResult {
+    if let Some(src) = SidecarSource::connect() {
+        return ProbeResult(
+            Source::Sidecar(src),
+            Some("bundled LibreHardwareMonitor sidecar"),
+        );
+    }
+    if let Some(src) = HwinfoSource::connect() {
         return ProbeResult(Source::Hwinfo(src), Some("HWiNFO64 shared memory"));
     }
-    if let Some(src) = LhmSource::connect(now) {
+    if let Some(src) = LhmSource::connect() {
         return ProbeResult(
             Source::Lhm(src),
             Some("LibreHardwareMonitor /metrics (loopback:8085)"),
         );
     }
     ProbeResult(Source::Disconnected, None)
+}
+
+/// The first probe that finds nothing reports it loudly, once: without this,
+/// an empty CPU column for a whole session is indistinguishable from a
+/// broken build.
+fn warn_unbound() {
+    eprintln!(
+        "CPU telemetry unavailable: no Windows CPU sensor source bound. \
+         Place the bundled {SIDECAR} next to the collector and run \
+         elevated (it needs the PawnIO driver), or run HWiNFO64 with \
+         \"Shared Memory Support\" enabled (Settings → General/User \
+         Interface), or LibreHardwareMonitor with its remote web \
+         server running (Options → Remote Web Server → Run, port \
+         8085). The cpu_* columns will be empty for every tick until a \
+         source binds; probing again every {}s.",
+        PROBE_RETRY.as_secs(),
+        SIDECAR = sidecar::SIDECAR_FILENAME
+    );
+}
+
+impl SidecarSource {
+    /// Spawn the bundled LHM helper and hold it bound once it proves it can
+    /// produce at least one real reading. An all-null stream is not a bind —
+    /// the helper that found no target sensors exits on its own, and one that
+    /// merely starts slowly gets [`SIDECAR_CONNECT`] before the probe falls
+    /// through to the operator-run hosts.
+    fn connect() -> Option<Self> {
+        let mut sidecar = sidecar::spawn()?;
+        let deadline = Instant::now() + SIDECAR_CONNECT;
+        loop {
+            if sidecar.published().is_some_and(|s| s != CpuSample::EMPTY) {
+                return Some(Self { sidecar });
+            }
+            // `sidecar` drops here on either failure path, which kills the
+            // child — a spawn that could not produce must not leak.
+            if sidecar.exited() || Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(SIDECAR_CONNECT_POLL);
+        }
+    }
+
+    /// `Some` with the latest sample while the child keeps producing; `None`
+    /// once it has exited or gone [`FEED_DEAD`] without a line.
+    fn poll(&mut self, now: Instant) -> Option<CpuSample> {
+        if self.sidecar.exited() {
+            return None;
+        }
+        self.sidecar.fresh(now, FEED_DEAD)
+    }
 }
 
 impl HwinfoSource {
@@ -231,7 +346,7 @@ impl HwinfoSource {
     /// (the free edition's 12-hour cutoff) leaves the region readable with an
     /// old `last_update`. Without the age check a frozen mapping would be
     /// re-adopted on every re-probe and LHM would never get a turn.
-    fn connect(now: Instant) -> Option<Self> {
+    fn connect() -> Option<Self> {
         if !hwinfo::SharedMemory::producer_alive() {
             return None;
         }
@@ -243,16 +358,19 @@ impl HwinfoSource {
             return None;
         }
         let stamp = scan.stamp;
+        // `advanced_at` starts at this connect — not at the moment the probe
+        // chain began — so time burned on an earlier source cannot make a
+        // live feed look stale.
         let mut src = Self {
             shm,
             stamp,
-            advanced_at: now,
+            advanced_at: Instant::now(),
             frozen_since: None,
         };
         // Prove the feed produces a sample on connect; `scan` succeeded but
         // `select` may still find nothing on a non-CPU host, in which case the
         // LHM fallback is never reached while every column stays null.
-        if src.poll(now)? == CpuSample::EMPTY {
+        if src.poll(Instant::now())? == CpuSample::EMPTY {
             return None;
         }
         Some(src)
@@ -301,14 +419,17 @@ impl LhmSource {
     /// One synchronous fetch proves the listener is actually LHM — a service
     /// that merely shares port 8085 is not a source — then hands fetching to
     /// a worker so a hung server never stalls a capture tick.
-    fn connect(now: Instant) -> Option<Self> {
+    fn connect() -> Option<Self> {
         let sample = fetch_sample()?;
         if sample == CpuSample::EMPTY {
             return None;
         }
-        let shared = Arc::new(Mutex::new(LhmShared {
+        // Freshness is stamped when the fetch completed — not when the probe
+        // chain started — or a sidecar that burned its whole connect window
+        // would leave this just-fetched sample already expired.
+        let shared = Arc::new(Mutex::new(FeedState {
             sample,
-            succeeded_at: now,
+            alive_at: Some(Instant::now()),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         thread::Builder::new()
@@ -323,10 +444,13 @@ impl LhmSource {
     }
 
     /// `Some` with the worker's latest sample while fetches keep completing;
-    /// `None` once the worker has gone [`LHM_DEAD`] without a success.
+    /// `None` once the worker has gone [`FEED_DEAD`] without a success.
     fn poll(&mut self, now: Instant) -> Option<CpuSample> {
         let shared = self.shared.lock().ok()?;
-        (now.duration_since(shared.succeeded_at) <= LHM_DEAD).then_some(shared.sample)
+        shared
+            .alive_at
+            .is_some_and(|t| now.duration_since(t) <= FEED_DEAD)
+            .then_some(shared.sample)
     }
 }
 
@@ -339,29 +463,17 @@ impl Drop for LhmSource {
 /// Fetch `/metrics` forever until `stop`, publishing each result into
 /// `shared`. The fetch blocks up to the request deadline, so it runs here —
 /// *outside* the lock and off the capture tick.
-fn fetch_loop(shared: Arc<Mutex<LhmShared>>, stop: Arc<AtomicBool>) {
+fn fetch_loop(shared: Arc<Mutex<FeedState>>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Relaxed) {
-        publish(shared.as_ref(), fetch_sample());
-        thread::sleep(LHM_REFRESH);
-    }
-}
-
-/// Store one fetch result. An answered request that yields nothing is not
-/// liveness — a server whose readings all go stale must still fall out of use
-/// so the monitor can re-probe another source. A failed fetch is not a stale
-/// value to keep serving either: the columns go null until it answers again.
-fn publish(shared: &Mutex<LhmShared>, result: Option<CpuSample>) {
-    let Ok(mut shared) = shared.lock() else {
-        return;
-    };
-    match result {
-        Some(sample) => {
-            if sample != CpuSample::EMPTY {
-                shared.succeeded_at = Instant::now();
-            }
-            shared.sample = sample;
+        // An answered request that yields nothing is not liveness — a server
+        // whose readings all go stale must still fall out of use so the
+        // monitor can re-probe another source. A failed fetch is not a stale
+        // value to keep serving either: the columns go null until it answers.
+        match fetch_sample() {
+            Some(sample) => publish(shared.as_ref(), sample != CpuSample::EMPTY, sample),
+            None => publish(shared.as_ref(), false, CpuSample::EMPTY),
         }
-        None => shared.sample = CpuSample::EMPTY,
+        thread::sleep(LHM_REFRESH);
     }
 }
 
@@ -397,11 +509,568 @@ fn now_unix_secs() -> i64 {
 mod tests {
     use super::*;
 
+    /// A disconnected monitor with no probe in flight; tests override the
+    /// fields they exercise.
+    fn monitor() -> CpuMonitor {
+        CpuMonitor {
+            source: Source::Disconnected,
+            next_probe_at: Instant::now() + Duration::from_secs(3600),
+            probe_rx: None,
+            warned_unbound: false,
+            last_bound: None,
+        }
+    }
+
+    /// Serialises tests that bind or probe `127.0.0.1:8085`: a probe that
+    /// finds a stub server is no longer a "found nothing" probe.
+    static NET_LOCK: Mutex<()> = Mutex::new(());
+
     /// Same guarantee as the sysfs backend: no sensor host means no data, not
     /// zeros.
     #[test]
     fn a_monitor_without_a_source_reports_nothing_measured() {
         let mut monitor = CpuMonitor::disconnected();
         assert_eq!(monitor.poll(), CpuSample::EMPTY);
+    }
+
+    /// The first probe runs detached: neither construction nor the first tick
+    /// may wait out a stalled sidecar connect. On a box where the helper
+    /// exists but cannot produce, a synchronous probe would stall capture
+    /// start for the whole `SIDECAR_CONNECT` — this pins the regression.
+    #[test]
+    fn new_and_the_first_poll_do_not_wait_on_the_probe() {
+        let started = Instant::now();
+        let mut monitor = CpuMonitor::new();
+        let _ = monitor.poll();
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The deterministic stall case the previous test can only approximate:
+    /// a probe channel that never delivers is the worst blocking probe —
+    /// ticks must still return `EMPTY` immediately and `bound_source` must
+    /// honestly report that nothing is feeding the columns.
+    #[test]
+    fn a_stalled_probe_never_blocks_a_tick() {
+        let (_tx, rx) = mpsc::channel();
+        let mut monitor = CpuMonitor {
+            probe_rx: Some(rx),
+            ..monitor()
+        };
+        let started = Instant::now();
+        for _ in 0..100 {
+            assert_eq!(monitor.poll(), CpuSample::EMPTY);
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(monitor.bound_source().is_none());
+    }
+
+    /// A finished probe that found no source is consumed, reports once, and
+    /// leaves the monitor disconnected — the second empty result must not
+    /// re-fire the loud warning.
+    #[test]
+    fn an_empty_probe_result_warns_once() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(ProbeResult(Source::Disconnected, None)).unwrap();
+        let mut monitor = CpuMonitor {
+            probe_rx: Some(rx),
+            ..monitor()
+        };
+        let _ = monitor.poll();
+        assert!(monitor.probe_rx.is_none());
+        assert!(monitor.warned_unbound);
+        assert!(monitor.bound_source().is_none());
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(ProbeResult(Source::Disconnected, None)).unwrap();
+        monitor.probe_rx = Some(rx);
+        let _ = monitor.poll();
+        assert!(monitor.warned_unbound);
+    }
+
+    /// Provenance survives a disconnect: once a source fed real columns the
+    /// manifest keeps its name even after the feed is gone.
+    #[test]
+    fn bound_source_keeps_the_last_source_that_fed() {
+        let monitor = CpuMonitor {
+            last_bound: Some("hwinfo-shm"),
+            ..monitor()
+        };
+        assert_eq!(monitor.bound_source(), Some("hwinfo-shm"));
+    }
+
+    /// A live binding outranks `last_bound`; the LHM variant is the one that
+    /// constructs without a sensor host.
+    #[test]
+    fn bound_source_prefers_the_current_binding() {
+        let monitor = CpuMonitor {
+            source: Source::Lhm(LhmSource {
+                shared: Arc::new(Mutex::new(FeedState::new())),
+                stop: Arc::new(AtomicBool::new(false)),
+            }),
+            last_bound: Some("hwinfo-shm"),
+            ..monitor()
+        };
+        assert_eq!(monitor.bound_source(), Some("lhm-metrics"));
+    }
+
+    /// An expired probe window launches a detached probe, and on a box with
+    /// no sensor host the probe reports back and warns. Also the cheapest way
+    /// to run `probe()` itself: every connect's early-fail path — no sidecar
+    /// beside the test binary, no HWiNFO region, no :8085 listener — fires in
+    /// the same pass.
+    #[test]
+    fn an_expired_probe_window_probes_detached_and_finds_nothing() {
+        let _net = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut monitor = CpuMonitor {
+            next_probe_at: Instant::now() - Duration::from_secs(1),
+            ..monitor()
+        };
+        let _ = monitor.poll();
+        assert!(monitor.probe_rx.is_some());
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while monitor.probe_rx.is_some() && Instant::now() < deadline {
+            let _ = monitor.poll();
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(monitor.probe_rx.is_none());
+        // On a box with a live sensor host the probe legitimately binds a
+        // source instead of warning; the contract under test is only that a
+        // found-nothing probe warns once.
+        if matches!(monitor.source, Source::Disconnected) {
+            assert!(monitor.warned_unbound);
+        }
+    }
+
+    /// A bound source whose mailbox is still live yields its sample through
+    /// `poll` — the `PollOutcome::Sample` arm — and a mailbox that stopped
+    /// proving liveness transitions the monitor to Dead: announced on stderr,
+    /// source dropped, re-probe due immediately.
+    #[test]
+    fn an_lhm_source_serves_then_dies_on_a_quiet_mailbox() {
+        let live = CpuSample {
+            tctl_c: Some(61.5),
+            ..CpuSample::EMPTY
+        };
+        let mut monitor = CpuMonitor {
+            source: Source::Lhm(LhmSource {
+                shared: Arc::new(Mutex::new(FeedState {
+                    sample: live,
+                    alive_at: Some(Instant::now()),
+                })),
+                stop: Arc::new(AtomicBool::new(false)),
+            }),
+            last_bound: Some("lhm-metrics"),
+            ..monitor()
+        };
+        assert_eq!(monitor.poll(), live);
+
+        monitor.source = Source::Lhm(LhmSource {
+            shared: Arc::new(Mutex::new(FeedState {
+                sample: live,
+                alive_at: Some(Instant::now() - FEED_DEAD - Duration::from_secs(1)),
+            })),
+            stop: Arc::new(AtomicBool::new(false)),
+        });
+        assert_eq!(monitor.poll(), CpuSample::EMPTY);
+        assert!(matches!(monitor.source, Source::Disconnected));
+        // The dead feed is scheduled for an immediate re-probe.
+        assert!(monitor.next_probe_at <= Instant::now());
+    }
+
+    /// `last_update` arrives in seconds on some builds and milliseconds on
+    /// others; the normaliser accepts both.
+    #[test]
+    fn stamp_unix_secs_normalises_millisecond_stamps() {
+        assert_eq!(stamp_unix_secs(1_763_340_000), 1_763_340_000);
+        assert_eq!(stamp_unix_secs(1_763_340_000_000), 1_763_340_000);
+    }
+
+    /// The override is honoured only while unelevated; either way an
+    /// unspawnable target must not panic or fabricate a source. The override
+    /// is injected as a parameter — no test ever mutates process-global
+    /// environment state a detached probe thread might race with.
+    #[test]
+    fn an_unspawnable_override_falls_through_to_no_source() {
+        let fake = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("gaming-telemetry-fake-sidecar.exe");
+        // A custom CARGO_TARGET_DIR leaves no target/ on a clean checkout.
+        std::fs::create_dir_all(fake.parent().unwrap()).unwrap();
+        std::fs::write(&fake, b"not an executable").unwrap();
+
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(fake.clone());
+
+        if sidecar::elevated() == Some(false) {
+            // Unelevated, the override is actually honoured: the resolver
+            // picks the fake rather than falling back to co-located names.
+            assert_eq!(
+                sidecar::resolve_path(Some(std::ffi::OsString::from(&fake))).as_deref(),
+                Some(fake.as_path())
+            );
+        }
+        assert!(sidecar::spawn_child(&fake, &[]).is_none());
+    }
+
+    /// Serve one canned Ryzen `/metrics` body per connection until `stop`
+    /// drops it — a stand-in for an operator-run LHM on its default port. The
+    /// tctl value increments per connection so a worker fetch is
+    /// distinguishable from `connect`'s synchronous proof fetch. Callers must
+    /// join the thread after setting `stop`: a server that outlived the test
+    /// would let a later probe bind a ghost LHM source.
+    fn serve_stub_metrics(listener: std::net::TcpListener, stop: Arc<AtomicBool>) {
+        use std::io::{Read, Write};
+
+        let mut served = 0u32;
+        // Backstop only — callers `stop` and `join` in the normal path.
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+            let Ok((mut conn, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            let mut req = [0u8; 4096];
+            let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
+            let _ = conn.read(&mut req);
+            let tctl = 61.5 + served as f64;
+            served += 1;
+            let body = format!(
+                "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\", \"sensorId\"=\"/temperature/2\", \"hardwareId\"=\"/amdcpu/0\"}} {tctl} {}\nlhm_cpu_power_watts {{\"sensorName\"=\"Package\", \"sensorId\"=\"/power/0\", \"hardwareId\"=\"/amdcpu/0\"}} 142.5 {}\n",
+                now_unix_ms(),
+                now_unix_ms()
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = conn.write_all(response.as_bytes());
+        }
+    }
+
+    /// `probe`'s bound arm: with a live `/metrics` stub the connect ladder
+    /// reports the LHM binding and its manifest name.
+    #[test]
+    fn a_probe_binds_a_live_lhm_server() {
+        use std::net::TcpListener;
+
+        let _net = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(listener) = TcpListener::bind(lhm::DEFAULT_ADDR) else {
+            return;
+        };
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || serve_stub_metrics(listener, stop)
+        });
+
+        let ProbeResult(source, name) = probe();
+        // Probe order is sidecar → hwinfo → lhm: on a box where HWiNFO (or a
+        // real sidecar) is actually installed, an earlier arm binds first —
+        // equally correct, so assert per-variant instead of demanding LHM.
+        match source {
+            Source::Lhm(_) => {
+                // The probe reports the human description; the manifest
+                // keeps the machine name.
+                assert_eq!(name, Some("LibreHardwareMonitor /metrics (loopback:8085)"));
+                assert_eq!(source.manifest_name(), Some("lhm-metrics"));
+            }
+            Source::Hwinfo(_) => {
+                assert_eq!(source.manifest_name(), Some("hwinfo-shm"));
+            }
+            Source::Sidecar(_) => {
+                assert_eq!(source.manifest_name(), Some("lhm-sidecar"));
+            }
+            Source::Disconnected => {
+                panic!("a live /metrics stub should bind a source")
+            }
+        }
+        drop(source);
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    /// A co-located but unspawnable sidecar exe exercises `resolve_path`'s
+    /// `current_exe` arm and `spawn`'s failed-spawn fall-through — the probe
+    /// just moves on to the next source.
+    #[test]
+    fn a_co_located_fake_sidecar_fails_spawn_cleanly() {
+        // Test-only: drops a fake unspawnable exe beside the test binary so
+        // `resolve_path`'s co-located arm and `spawn`'s failure path run — the
+        // exe path is the anchor the production lookup trusts.
+        // nosemgrep: rust.lang.security.current-exe.current-exe
+        let fake = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(sidecar::SIDECAR_FILENAME);
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        std::fs::write(&fake, b"not an executable").unwrap();
+        let _cleanup = Cleanup(fake);
+        assert!(sidecar::spawn().is_none());
+    }
+
+    /// The whole LHM path against a stub `/metrics` server: `connect`'s proof
+    /// fetch, the worker thread it spawns, the mailbox publish, and `poll`
+    /// serving the sample — every line an operator-run LHM would hit.
+    #[test]
+    fn an_lhm_server_binds_through_connect_and_serves() {
+        use std::net::TcpListener;
+
+        let _net = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(listener) = TcpListener::bind(lhm::DEFAULT_ADDR) else {
+            // Another LHM (or a parallel run) owns the port — nothing to
+            // prove here, and no assertion is safe either way.
+            return;
+        };
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || serve_stub_metrics(listener, stop)
+        });
+
+        let mut src = LhmSource::connect().expect("a live /metrics server binds");
+        // The proof fetch served 61.5; a value above it can only have come
+        // from the spawned worker's later fetch — poll until one lands.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match src.poll(Instant::now()) {
+                Some(sample)
+                    if sample
+                        .tctl_c
+                        .is_some_and(|t| t > 61.5 && sample.package_power_w == Some(142.5)) =>
+                {
+                    break;
+                }
+                _ if Instant::now() >= deadline => {
+                    panic!("no worker-fetched sample from a bound LHM source")
+                }
+                _ => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        drop(src);
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    /// `Default` constructs the same detached-probe monitor `new` does —
+    /// without exercising it the `new_without_default` impl is dead code.
+    /// The probe itself is not consumed here: construction alone must start
+    /// disconnected.
+    #[test]
+    fn default_monitor_starts_disconnected() {
+        let monitor = CpuMonitor::default();
+        assert!(matches!(monitor.source, Source::Disconnected));
+        assert!(monitor.bound_source().is_none());
+    }
+
+    /// A probe thread that dies before answering leaves a receiver that can
+    /// never deliver: `poll` must clear it so the next probe window spawns a
+    /// fresh attempt instead of waiting on a dead channel.
+    #[test]
+    fn a_dead_probe_channel_is_dropped() {
+        let rx = {
+            let (_tx, rx) = mpsc::channel();
+            // `_tx` drops at the end of this block — the same `Disconnected`
+            // a panicked probe thread leaves behind.
+            rx
+        };
+        let mut monitor = CpuMonitor {
+            probe_rx: Some(rx),
+            ..monitor()
+        };
+        let _ = monitor.poll();
+        assert!(monitor.probe_rx.is_none());
+    }
+
+    /// A finished probe that bound a source is announced on stderr and its
+    /// manifest name recorded as `last_bound` — the provenance that survives
+    /// the feed dying before shutdown.
+    #[test]
+    fn a_bound_probe_result_is_announced_and_recorded() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(ProbeResult(
+            Source::Lhm(LhmSource {
+                shared: Arc::new(Mutex::new(FeedState::new())),
+                stop: Arc::new(AtomicBool::new(false)),
+            }),
+            Some("LibreHardwareMonitor /metrics (loopback:8085)"),
+        ))
+        .unwrap();
+        let mut monitor = CpuMonitor {
+            probe_rx: Some(rx),
+            ..monitor()
+        };
+        let _ = monitor.poll();
+        assert!(monitor.probe_rx.is_none());
+        assert_eq!(monitor.bound_source(), Some("lhm-metrics"));
+        assert!(!monitor.warned_unbound);
+        // Provenance outlives the binding itself: once the feed drops to
+        // `Disconnected`, `bound_source` still reports the last name — the
+        // field the manifest actually records at shutdown.
+        monitor.source = Source::Disconnected;
+        assert_eq!(monitor.bound_source(), Some("lhm-metrics"));
+    }
+
+    /// `resolve_override` honours the configured path only when the verdict
+    /// is "unelevated": an injected `Some(false)` returns it verbatim, while
+    /// elevated (`Some(true)`) and undetermined (`None`) verdicts reject it —
+    /// deterministic on every runner since no real token query is involved.
+    #[test]
+    fn an_override_path_follows_the_injected_verdict() {
+        let path = std::path::PathBuf::from("no-such-sidecar-anywhere.exe");
+        assert_eq!(
+            sidecar::resolve_override(path.clone(), Some(false)).as_deref(),
+            Some(path.as_path())
+        );
+        assert!(sidecar::resolve_override(path.clone(), Some(true)).is_none());
+        assert!(sidecar::resolve_override(path, None).is_none());
+    }
+
+    /// A poisoned sample mailbox must not panic a worker publish: the failed
+    /// lock fails closed and the columns stay null rather than the tick
+    /// taking the panic.
+    #[test]
+    fn publish_survives_a_poisoned_mailbox() {
+        let shared = Arc::new(Mutex::new(FeedState::new()));
+        let poisoned = Arc::clone(&shared);
+        let _ = thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison the mailbox");
+        })
+        .join();
+        publish(shared.as_ref(), true, CpuSample::EMPTY);
+        let feed = shared.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(feed.alive_at.is_none());
+        assert_eq!(feed.sample, CpuSample::EMPTY);
+    }
+
+    /// The seconds variant of the wall-clock helper — used by the HWiNFO
+    /// stamp-age check — agrees with `now_unix_ms` to within a tick.
+    #[test]
+    fn now_unix_secs_matches_now_unix_ms() {
+        let secs = now_unix_ms() / 1_000;
+        assert!((now_unix_secs() - secs).abs() <= 1);
+    }
+
+    /// A loopback 200 that carries no sensor samples is not a source:
+    /// `connect`'s proof fetch yields `EMPTY` and the bind fails closed
+    /// rather than adopting a server that merely shares LHM's port.
+    #[test]
+    fn a_metrics_reply_without_samples_is_not_a_source() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let _net = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(listener) = TcpListener::bind(lhm::DEFAULT_ADDR) else {
+            // Another LHM (or a parallel run) owns the port — nothing to
+            // prove here, and no assertion is safe either way.
+            return;
+        };
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                let deadline = Instant::now() + Duration::from_secs(8);
+                while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                    let Ok((mut conn, _)) = listener.accept() else {
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    };
+                    let mut req = [0u8; 1024];
+                    let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
+                    let _ = conn.read(&mut req);
+                    let body = "a server that is not LHM\n";
+                    let _ = conn.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        )
+                        .as_bytes(),
+                    );
+                }
+            }
+        });
+
+        assert!(LhmSource::connect().is_none());
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    /// A bound `Source::Sidecar` serves its mailbox sample while the helper
+    /// lives — the `PollOutcome::Sample` arm and the `lhm-sidecar` manifest
+    /// name — and once the child exits, the next poll reports the feed dead
+    /// and drops back to `Disconnected` for an immediate re-probe.
+    #[test]
+    fn a_bound_sidecar_serves_then_reports_the_feed_dead() {
+        use std::path::Path;
+
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-fixtures")
+            .join(format!("sidecar_poll_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("emit_then_stay.cmd");
+        // A sample line, then a few seconds of life so `poll` meets a live
+        // helper; the child then exits so the next poll sees the dead feed.
+        std::fs::write(
+            &script,
+            "echo {\"tctl_c\":61.5,\"package_power_w\":142.5}\r\nping -n 5 127.0.0.1 >nul\r\n",
+        )
+        .unwrap();
+
+        let sidecar =
+            sidecar::spawn_child(Path::new("cmd.exe"), &["/c", &script.to_string_lossy()])
+                .expect("cmd spawns");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if sidecar.published().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "child sample never arrived");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let live = CpuSample {
+            tctl_c: Some(61.5),
+            package_power_w: Some(142.5),
+            ..CpuSample::EMPTY
+        };
+        let mut monitor = CpuMonitor {
+            source: Source::Sidecar(SidecarSource { sidecar }),
+            last_bound: Some("lhm-sidecar"),
+            ..monitor()
+        };
+        assert_eq!(monitor.poll(), live);
+        assert_eq!(monitor.bound_source(), Some("lhm-sidecar"));
+
+        let Source::Sidecar(src) = &mut monitor.source else {
+            unreachable!("the sidecar binding is still live");
+        };
+        while !src.sidecar.exited() {
+            assert!(Instant::now() < deadline, "child never exited");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(monitor.poll(), CpuSample::EMPTY);
+        assert!(matches!(monitor.source, Source::Disconnected));
+        // The dead feed is due an immediate re-probe, and the manifest keeps
+        // the name of the last source that fed the columns.
+        assert!(monitor.next_probe_at <= Instant::now());
+        assert_eq!(monitor.bound_source(), Some("lhm-sidecar"));
     }
 }

@@ -141,6 +141,7 @@ never publish truncated JSON.
   "unclean_restart_count": 0,
   "host": { "gpu_name": "NVIDIA GeForce RTX 5080", "driver": "580.00", "cpu_model": "…" },
   "workload": { "class": "gaming", "label": "kcd2" },
+  "cpu_source": "lhm-sidecar",
   "parquet_write_failures": 0,
   "prior_runs": [],
   "timing": {
@@ -360,25 +361,52 @@ counter for your user.
 
 #### CPU sensors on Windows
 
-Windows has no hwmon or RAPL sysfs, so the collector reads a sensor host you run
-alongside it. Probe order:
+Windows has no hwmon or RAPL sysfs, so the collector reads a sensor host.
+Probe order:
 
-1. **HWiNFO64 shared memory** — enable "Shared Memory Support" under
+1. **Bundled LibreHardwareMonitor sidecar** — `gaming-telemetry-cpu-sidecar.exe`
+   next to the collector binary. The collector spawns it at capture start and
+   kills it at the end: no GUI to launch, nothing to enable, no 12-hour
+   licensing cliff. It embeds `LibreHardwareMonitorLib` — the same sensor
+   stack the LHM app runs, on the signed PawnIO driver that replaced WinRing0
+   in 0.9.5 — and prints one JSON sample per line on stdout. It needs:
+   - the **PawnIO driver**, installed once (<https://pawnio.eu>), and
+   - an **elevated** collector; the sidecar inherits the collector's token.
+
+   Build it once with the .NET 8 SDK (`sidecar/`):
+
+   ```powershell
+   dotnet publish sidecar/GamingTelemetry.CpuSidecar.csproj -c Release -o sidecar/publish
+   ```
+
+   then put `gaming-telemetry-cpu-sidecar.exe` next to
+   `gaming-telemetry.exe`. `CPU_SIDECAR_PATH` overrides where the collector
+   looks — honored only when the collector is *not* elevated, since an
+   administrator-launched run must not let a less-trusted environment choose
+   which binary gets the admin token; `CPU_SIDECAR_DISABLE=1` skips the sidecar entirely (columns stay
+   null unless a host below is running).
+
+2. **HWiNFO64 shared memory** — enable "Shared Memory Support" under
    Settings → General/User Interface and keep HWiNFO running (sensors-only mode
    is enough). Readings are memory-mapped, fast enough for the highest poll
    rates. The free edition freezes the shared region after 12 hours of
    continuous use; the collector detects the freeze and the columns go null
    rather than repeating stale numbers.
-2. **LibreHardwareMonitor `/metrics`** — enable the remote web server under
+3. **LibreHardwareMonitor `/metrics`** — enable the remote web server under
    Options → Remote Web Server → Run (default port 8085) and keep LHM running
    as administrator. The collector polls `http://127.0.0.1:8085/metrics` at
    most every 500 ms — a loopback read of sensor data only, and the only
    network traffic the collector ever makes. LHM's WMI namespace was removed in
    0.9.5, so the web server is required even on versions that still publish
    WMI.
-3. **Neither present** — all four `cpu_*` columns stay null, and the collector
-   keeps re-probing every 30 s so a sensor host started mid-session is picked
-   up.
+4. **Nothing bound** — all four `cpu_*` columns stay null, the collector
+   warns at startup, `cpu_source` in `session_manifest.json` is `null`, and
+   it keeps re-probing every 30 s so a host started mid-session is picked up.
+
+Whichever source binds is recorded in the session manifest as `cpu_source`
+(`lhm-sidecar`, `hwinfo-shm`, `lhm-metrics`, `linux-sysfs`, or `null`), so an
+all-null CPU block is distinguishable from a misconfigured host after the
+fact.
 
 On Ryzen, `cpu_tctl_c` maps to `CPU (Tctl/Tdie)` / `Core (Tctl/Tdie)` and the
 CCD columns to `CCD1 (Tdie)` / `CCD2 (Tdie)`; on Intel the package temperature

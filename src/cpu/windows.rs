@@ -634,7 +634,12 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
         assert!(monitor.probe_rx.is_none());
-        assert!(monitor.warned_unbound);
+        // On a box with a live sensor host the probe legitimately binds a
+        // source instead of warning; the contract under test is only that a
+        // found-nothing probe warns once.
+        if matches!(monitor.source, Source::Disconnected) {
+            assert!(monitor.warned_unbound);
+        }
     }
 
     /// A bound source whose mailbox is still live yields its sample through
@@ -685,17 +690,66 @@ mod tests {
     /// unspawnable target must not panic or fabricate a source.
     #[test]
     fn spawn_tolerates_an_unspawnable_env_override() {
+        let _net = NET_LOCK.lock().unwrap();
         let fake = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("gaming-telemetry-fake-sidecar.exe");
         std::fs::write(&fake, b"not an executable").unwrap();
-        // Other tests share this process's environment; pointing the override
-        // at a file that can never spawn keeps every concurrent resolve_path
-        // call on the same "no source" outcome. The set_var itself is race-
-        // safe here for the same reason: a reader either sees this value or
-        // the unset state, and both resolve to "no spawnable sidecar".
+
+        // The variable is process-shared state — it and the file go away even
+        // when the assertion below panics.
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                // SAFETY: same serialisation argument as the set_var below.
+                unsafe { std::env::remove_var("CPU_SIDECAR_PATH") };
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(fake.clone());
+
+        // SAFETY: while NET_LOCK is held no probe is in flight, and the other
+        // env-reading tests reach CPU_SIDECAR_PATH only through resolve_path —
+        // a reader sees either this value or the unset state, both of which
+        // resolve to "no spawnable sidecar" on this box.
         unsafe { std::env::set_var("CPU_SIDECAR_PATH", &fake) };
+
+        if !sidecar::elevated() {
+            // Unelevated, the override is actually honoured: the resolver
+            // picks the fake rather than falling back to co-located names.
+            assert_eq!(sidecar::resolve_path().as_deref(), Some(fake.as_path()));
+        }
         assert!(sidecar::spawn().is_none());
+    }
+
+    /// Serve one canned Ryzen `/metrics` body per connection until `stop`
+    /// drops it — a stand-in for an operator-run LHM on its default port.
+    /// Callers must join the thread after setting `stop`: a server that
+    /// outlived the test would let a later probe bind a ghost LHM source.
+    fn serve_stub_metrics(listener: std::net::TcpListener, stop: Arc<AtomicBool>) {
+        use std::io::{Read, Write};
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+            let Ok((mut conn, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            let mut req = [0u8; 4096];
+            let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
+            let _ = conn.read(&mut req);
+            let body = format!(
+                "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\", \"sensorId\"=\"/temperature/2\", \"hardwareId\"=\"/amdcpu/0\"}} 61.5 {}\nlhm_cpu_power_watts {{\"sensorName\"=\"Package\", \"sensorId\"=\"/power/0\", \"hardwareId\"=\"/amdcpu/0\"}} 142.5 {}\n",
+                now_unix_ms(),
+                now_unix_ms()
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = conn.write_all(response.as_bytes());
+        }
     }
 
     /// The whole LHM path against a stub `/metrics` server: `connect`'s proof
@@ -703,7 +757,6 @@ mod tests {
     /// serving the sample — every line an operator-run LHM would hit.
     #[test]
     fn an_lhm_server_binds_through_connect_and_serves() {
-        use std::io::{Read, Write};
         use std::net::TcpListener;
 
         let _net = NET_LOCK.lock().unwrap();
@@ -713,32 +766,10 @@ mod tests {
             return;
         };
         listener.set_nonblocking(true).unwrap();
-        // `stop` joined before `NET_LOCK` drops: a server thread that outlived
-        // the test would let a later probe bind a ghost LHM source.
         let stop = Arc::new(AtomicBool::new(false));
-        let server_stop = Arc::clone(&stop);
-        let server = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(15);
-            while !server_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-                let Ok((mut conn, _)) = listener.accept() else {
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
-                };
-                let mut req = [0u8; 4096];
-                let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
-                let _ = conn.read(&mut req);
-                let body = format!(
-                    "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\", \"sensorId\"=\"/temperature/2\", \"hardwareId\"=\"/amdcpu/0\"}} 61.5 {}\nlhm_cpu_power_watts {{\"sensorName\"=\"Package\", \"sensorId\"=\"/power/0\", \"hardwareId\"=\"/amdcpu/0\"}} 142.5 {}\n",
-                    now_unix_ms(),
-                    now_unix_ms()
-                );
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = conn.write_all(response.as_bytes());
-            }
+        let server = thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || serve_stub_metrics(listener, stop)
         });
 
         let mut src = LhmSource::connect().expect("a live /metrics server binds");

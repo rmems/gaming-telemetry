@@ -149,7 +149,7 @@ mod imp {
     /// elevated collector spawning a path an unprivileged environment chose
     /// would hand administrator rights to whatever that variable points at, so
     /// the trusted locations are only the co-located ones.
-    fn resolve_path() -> Option<PathBuf> {
+    pub fn resolve_path() -> Option<PathBuf> {
         if let Some(path) = std::env::var_os("CPU_SIDECAR_PATH")
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
@@ -174,7 +174,7 @@ mod imp {
     /// `true` — the env override is a development convenience, and declining to
     /// trust it costs a developer one stderr note while trusting it wrongly
     /// costs a privilege boundary.
-    fn elevated() -> bool {
+    pub fn elevated() -> bool {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::Security::{
             GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
@@ -316,7 +316,10 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{Sidecar, spawn};
+// `elevated`/`resolve_path` are re-exported for tests in `cpu::windows`,
+// so a non-test build has no consumer for them.
+#[allow(unused_imports)]
+pub use imp::{Sidecar, elevated, resolve_path, spawn};
 
 #[cfg(test)]
 mod tests {

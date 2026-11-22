@@ -147,12 +147,16 @@ jobs:
         env:
           CARGO_INCREMENTAL: 0
           RUSTFLAGS: "-C instrument-coverage"
+          # Separate target dir: instrumented artifacts have a different
+          # fingerprint than the check/clippy builds sharing the cache key,
+          # and mixing them recompiles the whole tree every run.
+          CARGO_TARGET_DIR: target/coverage
       - name: Generate lcov.info
         # cfg(windows) code is uncovered on the Linux coverage jobs, so this
         # lcov is what keeps the Windows backend inside the patch gate.
         shell: bash
         run: |
-          grcov . -s . --binary-path ./target/debug -t lcov --branch --ignore-not-existing --ignore build.rs -o lcov.info
+          grcov . -s . --binary-path ./target/coverage/debug -t lcov --branch --ignore-not-existing --ignore build.rs -o lcov.info
           test -s lcov.info
           ! grep -q '^SF:build.rs$' lcov.info
       - name: Upload coverage to Codecov

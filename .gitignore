@@ -61,5 +61,5 @@ sidecar/publish/
 /gaming-telemetry-cpu-sidecar.exe
 
 # Runtime session artifacts when SESSION_DIR is the repo root
-/gaming-telemetry.lock
+/.gaming-telemetry.lock
 /session_manifest.json

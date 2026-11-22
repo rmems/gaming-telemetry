@@ -550,4 +550,148 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(monitor.bound_source().is_none());
     }
+
+    /// A finished probe that found no source is consumed, reports once, and
+    /// leaves the monitor disconnected — the second empty result must not
+    /// re-fire the loud warning.
+    #[test]
+    fn an_empty_probe_result_warns_once() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(ProbeResult(Source::Disconnected, None)).unwrap();
+        let mut monitor = CpuMonitor {
+            source: Source::Disconnected,
+            next_probe_at: Instant::now() + Duration::from_secs(3600),
+            probe_rx: Some(rx),
+            warned_unbound: false,
+            last_bound: None,
+        };
+        let _ = monitor.poll();
+        assert!(monitor.probe_rx.is_none());
+        assert!(monitor.warned_unbound);
+        assert!(monitor.bound_source().is_none());
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(ProbeResult(Source::Disconnected, None)).unwrap();
+        monitor.probe_rx = Some(rx);
+        let _ = monitor.poll();
+        assert!(monitor.warned_unbound);
+    }
+
+    /// Provenance survives a disconnect: once a source fed real columns the
+    /// manifest keeps its name even after the feed is gone.
+    #[test]
+    fn bound_source_keeps_the_last_source_that_fed() {
+        let monitor = CpuMonitor {
+            source: Source::Disconnected,
+            next_probe_at: Instant::now() + Duration::from_secs(3600),
+            probe_rx: None,
+            warned_unbound: false,
+            last_bound: Some("hwinfo-shm"),
+        };
+        assert_eq!(monitor.bound_source(), Some("hwinfo-shm"));
+    }
+
+    /// A live binding outranks `last_bound`; the LHM variant is the one that
+    /// constructs without a sensor host.
+    #[test]
+    fn bound_source_prefers_the_current_binding() {
+        let monitor = CpuMonitor {
+            source: Source::Lhm(LhmSource {
+                shared: Arc::new(Mutex::new(FeedState::new())),
+                stop: Arc::new(AtomicBool::new(false)),
+            }),
+            next_probe_at: Instant::now() + Duration::from_secs(3600),
+            probe_rx: None,
+            warned_unbound: false,
+            last_bound: Some("hwinfo-shm"),
+        };
+        assert_eq!(monitor.bound_source(), Some("lhm-metrics"));
+    }
+
+    /// An expired probe window launches a detached probe, and on a box with
+    /// no sensor host the probe reports back and warns. Also the cheapest way
+    /// to run `probe()` itself: every connect's early-fail path — no sidecar
+    /// beside the test binary, no HWiNFO region, no :8085 listener — fires in
+    /// the same pass.
+    #[test]
+    fn an_expired_probe_window_probes_detached_and_finds_nothing() {
+        let mut monitor = CpuMonitor {
+            source: Source::Disconnected,
+            next_probe_at: Instant::now() - Duration::from_secs(1),
+            probe_rx: None,
+            warned_unbound: false,
+            last_bound: None,
+        };
+        let _ = monitor.poll();
+        assert!(monitor.probe_rx.is_some());
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while monitor.probe_rx.is_some() && Instant::now() < deadline {
+            let _ = monitor.poll();
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(monitor.probe_rx.is_none());
+        assert!(monitor.warned_unbound);
+    }
+
+    /// A bound source whose mailbox is still live yields its sample through
+    /// `poll` — the `PollOutcome::Sample` arm — and a mailbox that stopped
+    /// proving liveness transitions the monitor to Dead: announced on stderr,
+    /// source dropped, re-probe due immediately.
+    #[test]
+    fn an_lhm_source_serves_then_dies_on_a_quiet_mailbox() {
+        let live = CpuSample {
+            tctl_c: Some(61.5),
+            ..CpuSample::EMPTY
+        };
+        let mut monitor = CpuMonitor {
+            source: Source::Lhm(LhmSource {
+                shared: Arc::new(Mutex::new(FeedState {
+                    sample: live,
+                    alive_at: Some(Instant::now()),
+                })),
+                stop: Arc::new(AtomicBool::new(false)),
+            }),
+            next_probe_at: Instant::now() + Duration::from_secs(3600),
+            probe_rx: None,
+            warned_unbound: false,
+            last_bound: Some("lhm-metrics"),
+        };
+        assert_eq!(monitor.poll(), live);
+
+        monitor.source = Source::Lhm(LhmSource {
+            shared: Arc::new(Mutex::new(FeedState {
+                sample: live,
+                alive_at: Some(Instant::now() - FEED_DEAD - Duration::from_secs(1)),
+            })),
+            stop: Arc::new(AtomicBool::new(false)),
+        });
+        assert_eq!(monitor.poll(), CpuSample::EMPTY);
+        assert!(matches!(monitor.source, Source::Disconnected));
+        // The dead feed is scheduled for an immediate re-probe.
+        assert!(monitor.next_probe_at <= Instant::now());
+    }
+
+    /// `last_update` arrives in seconds on some builds and milliseconds on
+    /// others; the normaliser accepts both.
+    #[test]
+    fn stamp_unix_secs_normalises_millisecond_stamps() {
+        assert_eq!(stamp_unix_secs(1_763_340_000), 1_763_340_000);
+        assert_eq!(stamp_unix_secs(1_763_340_000_000), 1_763_340_000);
+    }
+
+    /// The env override is honoured only while unelevated; either way an
+    /// unspawnable target must not panic or fabricate a source.
+    #[test]
+    fn spawn_tolerates_an_unspawnable_env_override() {
+        let fake = std::env::temp_dir().join("gaming-telemetry-fake-sidecar.exe");
+        std::fs::write(&fake, b"not an executable").unwrap();
+        // Other tests share this process's environment; pointing the override
+        // at a file that can never spawn keeps every concurrent resolve_path
+        // call on the same "no source" outcome. The set_var itself is race-
+        // safe here for the same reason: a reader either sees this value or
+        // the unset state, and both resolve to "no spawnable sidecar".
+        unsafe { std::env::set_var("CPU_SIDECAR_PATH", &fake) };
+        assert!(sidecar::spawn().is_none());
+    }
 }

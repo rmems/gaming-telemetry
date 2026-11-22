@@ -461,12 +461,44 @@ mod tests {
         }
     }
 
-    /// The reader's freshness gate and the mailbox's staleness window against
-    /// stand-in children: a stale-only `ts_ms` line is dropped as backlog
-    /// rather than published (and exercises the wall-clock gate
-    /// `now_unix_ms`), a stderr diagnostic is forwarded by the drain thread,
-    /// and once a real line lands `fresh` serves the sample only inside its
-    /// staleness window. Windows-only, like the plumbing itself.
+    /// A child emitting only a stale `ts_ms` line publishes nothing at all —
+    /// asserted while no fresh line exists, so a wrongly accepted stale
+    /// sample cannot hide under a later overwrite. Windows-only, like the
+    /// plumbing itself.
+    #[cfg(windows)]
+    #[test]
+    fn a_stale_line_is_never_published() {
+        use std::path::Path;
+        use std::time::{Duration, Instant};
+
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-fixtures")
+            .join(format!("sidecar_stale_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("stale_only.cmd");
+        std::fs::write(
+            &script,
+            "echo {\"ts_ms\":1,\"tctl_c\":99.0}\r\nping -n 3 127.0.0.1 >nul\r\n",
+        )
+        .unwrap();
+        let sidecar =
+            super::imp::spawn_child(Path::new("cmd.exe"), &["/c", &script.to_string_lossy()])
+                .expect("cmd spawns");
+        let quiet_until = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < quiet_until {
+            assert!(
+                sidecar.published().is_none(),
+                "a stale line must never be published"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// The mailbox's staleness window against a stand-in child: a stderr
+    /// diagnostic is forwarded by the drain thread, and once a real line
+    /// lands `fresh` serves the sample only inside its staleness window.
+    /// Windows-only, like the plumbing itself.
     #[cfg(windows)]
     #[test]
     fn fresh_serves_only_inside_the_staleness_window() {
@@ -478,30 +510,6 @@ mod tests {
             .join("test-fixtures")
             .join(format!("sidecar_fresh_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        // A child emitting only a stale line must publish nothing at all —
-        // asserted before any fresh line exists, so a wrongly accepted stale
-        // sample cannot hide under a later overwrite.
-        let stale_script = dir.join("stale_only.cmd");
-        std::fs::write(
-            &stale_script,
-            "echo {\"ts_ms\":1,\"tctl_c\":99.0}\r\nping -n 3 127.0.0.1 >nul\r\n",
-        )
-        .unwrap();
-        let stale_sidecar = super::imp::spawn_child(
-            Path::new("cmd.exe"),
-            &["/c", &stale_script.to_string_lossy()],
-        )
-        .expect("cmd spawns");
-        let quiet_until = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < quiet_until {
-            assert!(
-                stale_sidecar.published().is_none(),
-                "a stale line must never be published"
-            );
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        drop(stale_sidecar);
-
         let script = dir.join("emit.cmd");
         std::fs::write(
             &script,
@@ -520,8 +528,8 @@ mod tests {
             assert!(Instant::now() < deadline, "child sample never arrived");
             std::thread::sleep(Duration::from_millis(10));
         };
-        // The mailbox holds the real line — the stale-only child above
-        // already proved a stale line is dropped rather than published.
+        // The mailbox holds the real line — a stale `ts_ms` sibling already
+        // proved a stale line is dropped rather than published.
         assert_eq!(sample.tctl_c, Some(61.5));
 
         // Inside the window the mailbox serves the sample; past it the feed

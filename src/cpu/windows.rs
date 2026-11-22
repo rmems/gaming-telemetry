@@ -694,6 +694,8 @@ mod tests {
         let fake = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("gaming-telemetry-fake-sidecar.exe");
+        // A custom CARGO_TARGET_DIR leaves no target/ on a clean checkout.
+        std::fs::create_dir_all(fake.parent().unwrap()).unwrap();
         std::fs::write(&fake, b"not an executable").unwrap();
 
         // The variable is process-shared state — it and the file go away even
@@ -716,7 +718,7 @@ mod tests {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::env::set_var("CPU_SIDECAR_PATH", &fake) };
 
-        if !sidecar::elevated() {
+        if sidecar::elevated() == Some(false) {
             // Unelevated, the override is actually honoured: the resolver
             // picks the fake rather than falling back to co-located names.
             assert_eq!(sidecar::resolve_path().as_deref(), Some(fake.as_path()));
@@ -725,12 +727,15 @@ mod tests {
     }
 
     /// Serve one canned Ryzen `/metrics` body per connection until `stop`
-    /// drops it — a stand-in for an operator-run LHM on its default port.
-    /// Callers must join the thread after setting `stop`: a server that
-    /// outlived the test would let a later probe bind a ghost LHM source.
+    /// drops it — a stand-in for an operator-run LHM on its default port. The
+    /// tctl value increments per connection so a worker fetch is
+    /// distinguishable from `connect`'s synchronous proof fetch. Callers must
+    /// join the thread after setting `stop`: a server that outlived the test
+    /// would let a later probe bind a ghost LHM source.
     fn serve_stub_metrics(listener: std::net::TcpListener, stop: Arc<AtomicBool>) {
         use std::io::{Read, Write};
 
+        let mut served = 0u32;
         let deadline = Instant::now() + Duration::from_secs(15);
         while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
             let Ok((mut conn, _)) = listener.accept() else {
@@ -740,8 +745,10 @@ mod tests {
             let mut req = [0u8; 4096];
             let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
             let _ = conn.read(&mut req);
+            let tctl = 61.5 + served as f64;
+            served += 1;
             let body = format!(
-                "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\", \"sensorId\"=\"/temperature/2\", \"hardwareId\"=\"/amdcpu/0\"}} 61.5 {}\nlhm_cpu_power_watts {{\"sensorName\"=\"Package\", \"sensorId\"=\"/power/0\", \"hardwareId\"=\"/amdcpu/0\"}} 142.5 {}\n",
+                "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\", \"sensorId\"=\"/temperature/2\", \"hardwareId\"=\"/amdcpu/0\"}} {tctl} {}\nlhm_cpu_power_watts {{\"sensorName\"=\"Package\", \"sensorId\"=\"/power/0\", \"hardwareId\"=\"/amdcpu/0\"}} 142.5 {}\n",
                 now_unix_ms(),
                 now_unix_ms()
             );
@@ -775,17 +782,24 @@ mod tests {
         });
 
         let mut src = LhmSource::connect().expect("a live /metrics server binds");
-        // The worker keeps the mailbox fresh; poll serves the bound sample.
+        // The proof fetch served 61.5; a value above it can only have come
+        // from the spawned worker's later fetch — poll until one lands.
         let deadline = Instant::now() + Duration::from_secs(5);
-        let sample = loop {
+        loop {
             match src.poll(Instant::now()) {
-                Some(sample) if sample != CpuSample::EMPTY => break sample,
-                _ if Instant::now() >= deadline => panic!("no sample from a bound LHM source"),
+                Some(sample)
+                    if sample
+                        .tctl_c
+                        .is_some_and(|t| t > 61.5 && sample.package_power_w == Some(142.5)) =>
+                {
+                    break;
+                }
+                _ if Instant::now() >= deadline => {
+                    panic!("no worker-fetched sample from a bound LHM source")
+                }
                 _ => thread::sleep(Duration::from_millis(20)),
             }
-        };
-        assert_eq!(sample.tctl_c, Some(61.5));
-        assert_eq!(sample.package_power_w, Some(142.5));
+        }
         drop(src);
         stop.store(true, Ordering::Relaxed);
         server.join().unwrap();

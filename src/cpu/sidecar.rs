@@ -154,13 +154,18 @@ mod imp {
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
         {
-            if elevated() {
-                eprintln!(
-                    "CPU telemetry: CPU_SIDECAR_PATH ignored — the collector is \
-                     elevated, so only a sidecar next to its binary is trusted."
-                );
-            } else {
-                return Some(path);
+            match elevated() {
+                Some(false) => return Some(path),
+                verdict => {
+                    let why = match verdict {
+                        Some(true) => "the collector is elevated",
+                        _ => "the collector's elevation could not be determined",
+                    };
+                    eprintln!(
+                        "CPU telemetry: CPU_SIDECAR_PATH ignored — {why}, so only \
+                         a sidecar next to its binary is trusted."
+                    );
+                }
             }
         }
         // current_exe is the trusted anchor here: the bundled helper is the
@@ -173,11 +178,12 @@ mod imp {
             .find(|p| p.is_file())
     }
 
-    /// `true` when this process holds an elevated token. A failed query answers
-    /// `true` — the env override is a development convenience, and declining to
-    /// trust it costs a developer one stderr note while trusting it wrongly
-    /// costs a privilege boundary.
-    pub fn elevated() -> bool {
+    /// `Some` when this process's elevation could be determined, `None` when
+    /// the token query failed — callers must distrust the env override in that
+    /// case: the override is a development convenience, and declining to trust
+    /// it costs a developer one stderr note while trusting it wrongly costs a
+    /// privilege boundary.
+    pub fn elevated() -> Option<bool> {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::Security::{
             GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
@@ -190,7 +196,7 @@ mod imp {
         unsafe {
             let mut token = std::mem::zeroed();
             if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-                return true;
+                return None;
             }
             let mut elevation = TOKEN_ELEVATION::default();
             let mut size = std::mem::size_of::<TOKEN_ELEVATION>() as u32;
@@ -202,9 +208,9 @@ mod imp {
                 &mut size,
             );
             CloseHandle(token);
-            // A failed query answers "elevated" — the env override is not
+            // `None` here means "elevation unknown" — the env override is not
             // trusted whenever elevation cannot be ruled out.
-            ok == 0 || elevation.TokenIsElevated != 0
+            (ok != 0).then_some(elevation.TokenIsElevated != 0)
         }
     }
 

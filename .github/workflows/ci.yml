@@ -129,11 +129,14 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          components: clippy
+          components: clippy, llvm-tools-preview
           toolchain: "1.98.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.7.3
         with:
           shared-key: windows-default
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: grcov
       - name: Cargo check (default features)
         run: cargo check --locked
       - name: clippy (default features)
@@ -141,6 +144,24 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test (default features)
         run: cargo test --locked
+        env:
+          CARGO_INCREMENTAL: 0
+          RUSTFLAGS: "-C instrument-coverage"
+      - name: Generate lcov.info
+        # cfg(windows) code is uncovered on the Linux coverage jobs, so this
+        # lcov is what keeps the Windows backend inside the patch gate.
+        shell: bash
+        run: |
+          grcov . -s . --binary-path ./target/debug -t lcov --branch --ignore-not-existing --ignore build.rs -o lcov.info
+          test -s lcov.info
+          ! grep -q '^SF:build.rs$' lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@cd8b657745c0c7bb7f101e61a61c9ed5d74b8561 # v5.5.4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+          fail_ci_if_error: false
+          verbose: true
       - name: Publish CPU sidecar (.NET)
         # The runner image carries the .NET 8 SDK the sidecar targets; this
         # proves the helper still restores and publishes on every PR, since

@@ -157,25 +157,9 @@ mod imp {
         if let Some(path) = override_path
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
+            .and_then(resolve_override)
         {
-            match elevated() {
-                Some(false) => return Some(path),
-                verdict => {
-                    // Once per process: probes re-resolve every ~30 s, and the
-                    // verdict is fixed at first query anyway.
-                    static WARNED: AtomicBool = AtomicBool::new(false);
-                    if !WARNED.swap(true, Ordering::Relaxed) {
-                        let why = match verdict {
-                            Some(true) => "the collector is elevated",
-                            _ => "the collector's elevation could not be determined",
-                        };
-                        eprintln!(
-                            "CPU telemetry: CPU_SIDECAR_PATH ignored — {why}, so only \
-                             a sidecar next to its binary is trusted."
-                        );
-                    }
-                }
-            }
+            return Some(path);
         }
         // current_exe is the trusted anchor here: the bundled helper is the
         // artifact shipped next to the collector binary, not a security check.
@@ -185,6 +169,32 @@ mod imp {
             .into_iter()
             .map(|dir| dir.join(SIDECAR_FILENAME))
             .find(|p| p.is_file())
+    }
+
+    /// The `override_path` arm of [`resolve_path`]: the configured path while
+    /// the collector is unelevated; `None` — fall back to the co-located
+    /// names — when the collector is elevated or the verdict is unknown, which
+    /// fails closed for the same privilege-boundary reason the override is
+    /// gated at all.
+    fn resolve_override(path: PathBuf) -> Option<PathBuf> {
+        let verdict = elevated();
+        if let Some(false) = verdict {
+            return Some(path);
+        }
+        // Once per process: probes re-resolve every ~30 s, and the verdict is
+        // fixed at first query anyway.
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            let why = match verdict {
+                Some(true) => "the collector is elevated",
+                _ => "the collector's elevation could not be determined",
+            };
+            eprintln!(
+                "CPU telemetry: CPU_SIDECAR_PATH ignored — {why}, so only \
+                 a sidecar next to its binary is trusted."
+            );
+        }
+        None
     }
 
     /// `Some` when this process's elevation could be determined, `None` when
@@ -445,6 +455,65 @@ mod tests {
         };
         assert_eq!(sample.tctl_c, Some(61.5));
         assert_eq!(sample.package_power_w, Some(142.5));
+        while !sidecar.exited() {
+            assert!(Instant::now() < deadline, "child never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The reader's freshness gate and the mailbox's staleness window against
+    /// a stand-in child: a stale `ts_ms` line is dropped as backlog rather
+    /// than published (and exercises the wall-clock gate `now_unix_ms`), a
+    /// stderr diagnostic is forwarded by the drain thread, and once a real
+    /// line lands `fresh` serves the sample only inside its staleness window.
+    /// Windows-only, like the plumbing itself.
+    #[cfg(windows)]
+    #[test]
+    fn fresh_serves_only_inside_the_staleness_window() {
+        use std::path::Path;
+        use std::time::{Duration, Instant};
+
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-fixtures")
+            .join(format!("sidecar_fresh_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("emit.cmd");
+        std::fs::write(
+            &script,
+            "echo {\"ts_ms\":1,\"tctl_c\":99.0}\r\necho starting up 1>&2\r\necho {\"tctl_c\":61.5,\"package_power_w\":142.5}\r\nping -n 4 127.0.0.1 >nul\r\n",
+        )
+        .unwrap();
+
+        let mut sidecar =
+            super::imp::spawn_child(Path::new("cmd.exe"), &["/c", &script.to_string_lossy()])
+                .expect("cmd spawns");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let sample = loop {
+            if let Some(sample) = sidecar.published() {
+                break sample;
+            }
+            assert!(Instant::now() < deadline, "child sample never arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // The stale-ts line was dropped, not published — the mailbox holds
+        // the later real line.
+        assert_eq!(sample.tctl_c, Some(61.5));
+
+        // Inside the window the mailbox serves the sample; past it the feed
+        // is not measured — the same staleness contract `poll` relies on.
+        assert_eq!(
+            sidecar.fresh(Instant::now(), Duration::from_secs(60)),
+            Some(sample)
+        );
+        assert_eq!(
+            sidecar.fresh(
+                Instant::now() + Duration::from_secs(120),
+                Duration::from_secs(60)
+            ),
+            None
+        );
+
         while !sidecar.exited() {
             assert!(Instant::now() < deadline, "child never exited");
             std::thread::sleep(Duration::from_millis(10));

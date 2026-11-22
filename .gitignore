@@ -17,6 +17,8 @@ docs/superpowers/
 
 # Compiled output
 /target/
+# Instrumented coverage target dir (CI mirrors this as CARGO_TARGET_DIR)
+/target-coverage/
 
 # IDE / editor
 .idea/

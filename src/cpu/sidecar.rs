@@ -163,6 +163,9 @@ mod imp {
                 return Some(path);
             }
         }
+        // current_exe is the trusted anchor here: the bundled helper is the
+        // artifact shipped next to the collector binary, not a security check.
+        // nosemgrep: rust.lang.security.current-exe.current-exe
         let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
         [exe_dir.clone(), exe_dir.join("sidecar")]
             .into_iter()
@@ -181,6 +184,9 @@ mod imp {
         };
         use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
+        // Token elevation is only exposed through Win32 FFI; the unsafe block
+        // is the query itself and every failure path fails closed above.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             let mut token = std::mem::zeroed();
             if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {

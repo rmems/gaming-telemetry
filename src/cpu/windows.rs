@@ -702,6 +702,7 @@ mod tests {
         impl Drop for Cleanup {
             fn drop(&mut self) {
                 // SAFETY: same serialisation argument as the set_var below.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 unsafe { std::env::remove_var("CPU_SIDECAR_PATH") };
                 let _ = std::fs::remove_file(&self.0);
             }
@@ -712,6 +713,7 @@ mod tests {
         // env-reading tests reach CPU_SIDECAR_PATH only through resolve_path —
         // a reader sees either this value or the unset state, both of which
         // resolve to "no spawnable sidecar" on this box.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::env::set_var("CPU_SIDECAR_PATH", &fake) };
 
         if !sidecar::elevated() {

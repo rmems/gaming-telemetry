@@ -21,7 +21,10 @@ use serde::Deserialize;
 
 use super::{CpuSample, plausible_power, plausible_temp};
 
-/// Filename the collector looks for next to its own binary.
+/// Filename the collector looks for next to its own binary. Windows-only:
+/// the Linux test build compiles this module for its parsers but never
+/// spawns the helper, so an un-gated constant is dead code there.
+#[cfg(windows)]
 pub const SIDECAR_FILENAME: &str = "gaming-telemetry-cpu-sidecar.exe";
 
 /// One sample line the sidecar prints on stdout. A missing key decodes as

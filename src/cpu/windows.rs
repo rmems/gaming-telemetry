@@ -772,11 +772,26 @@ mod tests {
         });
 
         let ProbeResult(source, name) = probe();
-        assert!(matches!(source, Source::Lhm(_)));
-        // The probe reports the human description; the manifest keeps the
-        // machine name.
-        assert_eq!(name, Some("LibreHardwareMonitor /metrics (loopback:8085)"));
-        assert_eq!(source.manifest_name(), Some("lhm-metrics"));
+        // Probe order is sidecar → hwinfo → lhm: on a box where HWiNFO (or a
+        // real sidecar) is actually installed, an earlier arm binds first —
+        // equally correct, so assert per-variant instead of demanding LHM.
+        match source {
+            Source::Lhm(_) => {
+                // The probe reports the human description; the manifest
+                // keeps the machine name.
+                assert_eq!(name, Some("LibreHardwareMonitor /metrics (loopback:8085)"));
+                assert_eq!(source.manifest_name(), Some("lhm-metrics"));
+            }
+            Source::Hwinfo(_) => {
+                assert_eq!(source.manifest_name(), Some("hwinfo-shm"));
+            }
+            Source::Sidecar(_) => {
+                assert_eq!(source.manifest_name(), Some("lhm-sidecar"));
+            }
+            Source::Disconnected => {
+                panic!("a live /metrics stub should bind a source")
+            }
+        }
         drop(source);
         stop.store(true, Ordering::Relaxed);
         server.join().unwrap();
@@ -903,21 +918,26 @@ mod tests {
         assert!(monitor.probe_rx.is_none());
         assert_eq!(monitor.bound_source(), Some("lhm-metrics"));
         assert!(!monitor.warned_unbound);
+        // Provenance outlives the binding itself: once the feed drops to
+        // `Disconnected`, `bound_source` still reports the last name — the
+        // field the manifest actually records at shutdown.
+        monitor.source = Source::Disconnected;
+        assert_eq!(monitor.bound_source(), Some("lhm-metrics"));
     }
 
-    /// `resolve_path`'s override arm: unelevated, a configured path is
-    /// honoured even when nothing exists there — the spawn error must name
-    /// what the operator configured. When the verdict is elevated or unknown
-    /// the override is untrusted and the arm is not exercised.
+    /// `resolve_override` honours the configured path only when the verdict
+    /// is "unelevated": an injected `Some(false)` returns it verbatim, while
+    /// elevated (`Some(true)`) and undetermined (`None`) verdicts reject it —
+    /// deterministic on every runner since no real token query is involved.
     #[test]
-    fn an_override_path_resolves_while_unelevated() {
-        if sidecar::elevated() == Some(false) {
-            let path = std::path::PathBuf::from("no-such-sidecar-anywhere.exe");
-            assert_eq!(
-                sidecar::resolve_path(Some(path.clone().into_os_string())).as_deref(),
-                Some(path.as_path())
-            );
-        }
+    fn an_override_path_follows_the_injected_verdict() {
+        let path = std::path::PathBuf::from("no-such-sidecar-anywhere.exe");
+        assert_eq!(
+            sidecar::resolve_override(path.clone(), Some(false)).as_deref(),
+            Some(path.as_path())
+        );
+        assert!(sidecar::resolve_override(path.clone(), Some(true)).is_none());
+        assert!(sidecar::resolve_override(path, None).is_none());
     }
 
     /// A poisoned sample mailbox must not panic a worker publish: the failed

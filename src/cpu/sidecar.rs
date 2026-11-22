@@ -157,7 +157,7 @@ mod imp {
         if let Some(path) = override_path
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
-            .and_then(resolve_override)
+            .and_then(|p| resolve_override(p, elevated()))
         {
             return Some(path);
         }
@@ -175,9 +175,9 @@ mod imp {
     /// the collector is unelevated; `None` — fall back to the co-located
     /// names — when the collector is elevated or the verdict is unknown, which
     /// fails closed for the same privilege-boundary reason the override is
-    /// gated at all.
-    fn resolve_override(path: PathBuf) -> Option<PathBuf> {
-        let verdict = elevated();
+    /// gated at all. The verdict is a parameter so tests exercise every arm
+    /// without needing a real token query.
+    pub fn resolve_override(path: PathBuf, verdict: Option<bool>) -> Option<PathBuf> {
         if let Some(false) = verdict {
             return Some(path);
         }
@@ -358,7 +358,7 @@ pub use imp::{Sidecar, spawn};
 
 /// Test-only surface for `cpu::windows` tests — not part of the shipped API.
 #[cfg(all(windows, test))]
-pub use imp::{elevated, resolve_path, spawn_child};
+pub use imp::{elevated, resolve_override, resolve_path, spawn_child};
 
 #[cfg(test)]
 mod tests {
@@ -462,11 +462,11 @@ mod tests {
     }
 
     /// The reader's freshness gate and the mailbox's staleness window against
-    /// a stand-in child: a stale `ts_ms` line is dropped as backlog rather
-    /// than published (and exercises the wall-clock gate `now_unix_ms`), a
-    /// stderr diagnostic is forwarded by the drain thread, and once a real
-    /// line lands `fresh` serves the sample only inside its staleness window.
-    /// Windows-only, like the plumbing itself.
+    /// stand-in children: a stale-only `ts_ms` line is dropped as backlog
+    /// rather than published (and exercises the wall-clock gate
+    /// `now_unix_ms`), a stderr diagnostic is forwarded by the drain thread,
+    /// and once a real line lands `fresh` serves the sample only inside its
+    /// staleness window. Windows-only, like the plumbing itself.
     #[cfg(windows)]
     #[test]
     fn fresh_serves_only_inside_the_staleness_window() {
@@ -478,10 +478,34 @@ mod tests {
             .join("test-fixtures")
             .join(format!("sidecar_fresh_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        // A child emitting only a stale line must publish nothing at all —
+        // asserted before any fresh line exists, so a wrongly accepted stale
+        // sample cannot hide under a later overwrite.
+        let stale_script = dir.join("stale_only.cmd");
+        std::fs::write(
+            &stale_script,
+            "echo {\"ts_ms\":1,\"tctl_c\":99.0}\r\nping -n 3 127.0.0.1 >nul\r\n",
+        )
+        .unwrap();
+        let stale_sidecar = super::imp::spawn_child(
+            Path::new("cmd.exe"),
+            &["/c", &stale_script.to_string_lossy()],
+        )
+        .expect("cmd spawns");
+        let quiet_until = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < quiet_until {
+            assert!(
+                stale_sidecar.published().is_none(),
+                "a stale line must never be published"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        drop(stale_sidecar);
+
         let script = dir.join("emit.cmd");
         std::fs::write(
             &script,
-            "echo {\"ts_ms\":1,\"tctl_c\":99.0}\r\necho starting up 1>&2\r\necho {\"tctl_c\":61.5,\"package_power_w\":142.5}\r\nping -n 4 127.0.0.1 >nul\r\n",
+            "echo starting up 1>&2\r\necho {\"tctl_c\":61.5,\"package_power_w\":142.5}\r\nping -n 4 127.0.0.1 >nul\r\n",
         )
         .unwrap();
 
@@ -496,8 +520,8 @@ mod tests {
             assert!(Instant::now() < deadline, "child sample never arrived");
             std::thread::sleep(Duration::from_millis(10));
         };
-        // The stale-ts line was dropped, not published — the mailbox holds
-        // the later real line.
+        // The mailbox holds the real line — the stale-only child above
+        // already proved a stale line is dropped rather than published.
         assert_eq!(sample.tctl_c, Some(61.5));
 
         // Inside the window the mailbox serves the sample; past it the feed

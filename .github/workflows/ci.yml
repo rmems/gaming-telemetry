@@ -152,6 +152,17 @@ jobs:
         # The Linux clippy job never compiles `#[cfg(windows)]` code. This also
         # covers `cargo check`: --all-targets type-checks tests and benches too.
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Drop stale instrumented artifacts
+        # A restored cache can hold test binaries and .profraw for names this
+        # tree no longer builds; grcov would merge their stale line mappings
+        # into the report. `cargo clean -p` removes only this crate's
+        # artifacts, so cached dep objects still skip the ~13 min rebuild.
+        shell: bash
+        run: |
+          rm -f default_*.profraw
+          cargo clean -p gaming-telemetry
+        env:
+          CARGO_TARGET_DIR: target-coverage
       - name: Test (default features)
         run: cargo test --locked
         env:

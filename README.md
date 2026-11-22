@@ -141,6 +141,7 @@ never publish truncated JSON.
   "unclean_restart_count": 0,
   "host": { "gpu_name": "NVIDIA GeForce RTX 5080", "driver": "580.00", "cpu_model": "…" },
   "workload": { "class": "gaming", "label": "kcd2" },
+  "cpu_source": "lhm-sidecar",
   "parquet_write_failures": 0,
   "prior_runs": [],
   "timing": {

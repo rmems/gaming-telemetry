@@ -86,15 +86,17 @@ fn current_user_identities() -> Vec<String> {
         }
     };
 
-    for key in ["USER", "LOGNAME"] {
+    for key in ["USER", "LOGNAME", "USERNAME"] {
         if let Some(value) = env::var_os(key) {
             push(&mut identities, value.to_string_lossy().trim().to_owned());
         }
     }
-    if let Some(home) = env::var_os("HOME")
-        && let Some(name) = Path::new(&home).file_name()
-    {
-        push(&mut identities, name.to_string_lossy().into_owned());
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(home) = env::var_os(key)
+            && let Some(name) = Path::new(&home).file_name()
+        {
+            push(&mut identities, name.to_string_lossy().into_owned());
+        }
     }
     identities
 }
@@ -140,6 +142,10 @@ fn root_anchored_username(parts: &[&str], index: usize) -> Option<usize> {
     }
     match parts[index] {
         "home" => skip_empty(parts, index + 1),
+        // `C:\Users\<name>` (normalized to `/` before this pass) puts the
+        // account at a fixed position, the Windows twin of `/home/<name>`.
+        // macOS `/Users/<name>` shares the same shape.
+        anchor if anchor.eq_ignore_ascii_case("users") => skip_empty(parts, index + 1),
         "media" => {
             let name = skip_empty(parts, index + 1)?;
             // udisks mounts one directory per account, so the volume beneath it
@@ -199,13 +205,22 @@ fn redact_user_named_parents(text: &str) -> String {
 
 /// Redact embedded occurrences of the user's `$HOME`.
 ///
-/// Returns the text unchanged when `HOME` is unset; `redact_personal_path` is the
-/// entry point that still strips the username in that case.
+/// `USERPROFILE` is tried as well — a native Windows process usually has no
+/// `HOME` at all. Each candidate is matched as spelled and again with
+/// backslashes normalized to `/`, since the passes around this one treat `/`
+/// as the only separator. Returns the text unchanged when neither is set;
+/// `redact_personal_path` is the entry point that still strips the username
+/// in that case.
 pub fn redact_home(text: &str) -> String {
-    match env::var_os("HOME") {
-        Some(home) => redact_with_home(text, home.to_string_lossy().as_ref()),
-        None => text.to_string(),
+    let mut redacted = text.to_string();
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(home) = env::var_os(key) {
+            let home = home.to_string_lossy();
+            redacted = redact_with_home(&redacted, &home);
+            redacted = redact_with_home(&redacted, &home.replace('\\', "/"));
+        }
     }
+    redacted
 }
 
 /// Strip the operator's identity from a path or an error message containing one.
@@ -221,8 +236,13 @@ pub fn redact_home(text: &str) -> String {
 /// substituting it first would consume the literal `home` text that the
 /// structural pass needs to recognize `/home/<name>` — hiding the anchor before
 /// the username under it was ever redacted.
+///
+/// Backslash separators are normalized to `/` first: every pass below splits on
+/// `/`, and a `C:\Users\<name>` path would otherwise pass through as one
+/// unredactable component. The normalized output (`C:/Users/$USER/…`) still
+/// reads unambiguously as the same path.
 pub fn redact_personal_path(path: &str) -> String {
-    let mut redacted = path.to_string();
+    let mut redacted = path.replace('\\', "/");
     for user in current_user_identities() {
         redacted = redact_user_components(&redacted, &user);
     }
@@ -322,6 +342,27 @@ mod tests {
         assert_eq!(
             redact_user_named_parents("/home/alice/neuromorphic_data/kcd2"),
             "/home/$USER/neuromorphic_data/kcd2"
+        );
+    }
+
+    /// The Windows twin of `/home/<name>`: `C:\Users\<name>` puts the account
+    /// at a fixed position, and `C:` ending in a colon anchors it as a path
+    /// root the same way a leading `/` does. Needs no environment identity —
+    /// the shape alone carries it.
+    #[test]
+    fn windows_profile_paths_are_redacted() {
+        assert_eq!(
+            redact_personal_path("could not spawn C:\\Users\\zztestuser\\tool.exe"),
+            "could not spawn C:/Users/$USER/tool.exe"
+        );
+        assert_eq!(
+            redact_user_named_parents("C:/Users/zztestuser/tool.exe"),
+            "C:/Users/$USER/tool.exe"
+        );
+        // A bare `Users` directory nested mid-path names no one.
+        assert_eq!(
+            redact_user_named_parents("C:/games/Users/saves/x"),
+            "C:/games/Users/saves/x"
         );
     }
 

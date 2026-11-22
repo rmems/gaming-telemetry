@@ -278,6 +278,24 @@ async fn drain_in_flight(in_flight: &mut JoinSet<Result<()>>, write_failures: &m
 ///
 /// Both shutdown paths (Ctrl+C, and Ctrl+C during write backpressure) converge
 /// here, so the manifest is finalized and rewritten exactly once per run.
+/// Fold the monitor's source record into the manifest, rewriting the file
+/// only when the recorded source actually changed. Bind/unbind transitions
+/// are rare, so the atomic write costs nothing per tick — while a crash
+/// between transitions would otherwise leave stale (or never-written)
+/// attribution on disk for rows a live source already fed.
+fn sync_cpu_source(
+    manifest: &mut SessionManifest,
+    cpu_monitor: &CpuMonitor,
+    output_dir: &Path,
+) -> Result<()> {
+    let source = cpu_monitor.bound_source().map(str::to_owned);
+    if source != manifest.cpu_source {
+        manifest.cpu_source = source;
+        manifest.write_atomic(output_dir)?;
+    }
+    Ok(())
+}
+
 async fn perform_shutdown(
     buffer: Vec<GpuSample>,
     batch_counter: u32,
@@ -416,7 +434,10 @@ async fn main() -> Result<()> {
     // sensor host fed this run's cpu_* columns — the answer to "why is every
     // cpu_* column null" must be on disk, not only on stderr.
     let mut cpu_monitor = CpuMonitor::new();
-    manifest.cpu_source = cpu_monitor.bound_source().map(str::to_owned);
+    // The first probe runs detached, so the source usually is not bound yet;
+    // the manifest records `null` at start and `sync_cpu_source` in the loop
+    // rewrites it the moment a source binds.
+    sync_cpu_source(&mut manifest, &cpu_monitor, &output_dir)?;
     // Publish only after the fallible resume scan succeeds, so an unreadable
     // existing directory cannot overwrite its prior completed manifest.
     manifest.write_atomic(&output_dir)?;
@@ -455,6 +476,10 @@ async fn main() -> Result<()> {
 
                 // CPU telemetry (poll for time-delta power calculation)
                 let cpu = cpu_monitor.poll();
+                // Keep on-disk source attribution current through binds and
+                // unbinds; cheap compare every tick, one tiny rewrite per
+                // transition — a crash between them must not misattribute rows.
+                sync_cpu_source(&mut manifest, &cpu_monitor, &output_dir)?;
 
                 let sample = GpuSample {
                     timestamp: Utc::now(),
@@ -500,10 +525,7 @@ async fn main() -> Result<()> {
                     .await?
                     {
                         println!("\nShutdown signal received during write backpressure...");
-                        // Record the last-bound CPU source: a mid-session rebind
-                        // should leave the manifest naming what actually fed the
-                        // columns at the end.
-                        manifest.cpu_source = cpu_monitor.bound_source().map(str::to_owned);
+                        sync_cpu_source(&mut manifest, &cpu_monitor, &output_dir)?;
                         perform_shutdown(
                             std::mem::take(&mut buffer),
                             batch_counter,
@@ -524,8 +546,7 @@ async fn main() -> Result<()> {
                             // still in flight. Converge on the same shutdown path
                             // Ctrl+C uses so nothing already captured is lost.
                             report_failure("Cannot start a new batch", &format!("{:?}", e));
-                            manifest.cpu_source =
-                                cpu_monitor.bound_source().map(str::to_owned);
+                            sync_cpu_source(&mut manifest, &cpu_monitor, &output_dir)?;
                             perform_shutdown(
                                 samples_to_write,
                                 batch_counter,
@@ -551,7 +572,7 @@ async fn main() -> Result<()> {
             signal = shutdown.recv() => {
                 signal?;
                 println!("\nShutdown signal received. Finalizing last batch...");
-                manifest.cpu_source = cpu_monitor.bound_source().map(str::to_owned);
+                sync_cpu_source(&mut manifest, &cpu_monitor, &output_dir)?;
                 perform_shutdown(
                     buffer,
                     batch_counter,

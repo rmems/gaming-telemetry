@@ -50,6 +50,31 @@ if (!IsAdministrator())
     return ExitNotElevated;
 }
 
+if (!PawnIoPresent())
+{
+    Console.Error.WriteLine(
+        "gaming-telemetry-cpu-sidecar: the PawnIO driver is not installed — " +
+        "LibreHardwareMonitor (0.9.5+) cannot read sensors without it. " +
+        "See https://pawnio.eu");
+    return ExitNoSensors;
+}
+
+// Self-reap when the collector dies: its stdin is a pipe it holds open for
+// exactly this purpose, so EOF means the parent is gone — crash, Task
+// Manager kill, console close — where its Drop cleanup never runs. The
+// broken-pipe catch in the write loop cannot be relied on: .NET's Windows
+// console stream treats ERROR_BROKEN_PIPE as success and drops the write.
+new Thread(static () =>
+{
+    try
+    {
+        while (Console.In.Read() != -1) { }
+    }
+    catch (IOException) { }
+    Environment.Exit(0);
+})
+{ IsBackground = true }.Start();
+
 Computer computer;
 try
 {
@@ -169,6 +194,29 @@ static IEnumerable<IHardware> WithSubHardware(IHardware hw)
     yield return hw;
     foreach (var sub in hw.SubHardware)
         yield return sub;
+}
+
+/// The device object PawnIO installs. Checking it directly matters: with the
+/// driver absent LHM still opens and still "reads" sensors — its register
+/// calls return zero-filled buffers that surface as a plausible 0 °C / 0 W —
+/// so sensor output cannot be trusted to tell "no driver" from "cold CPU".
+/// Any open result other than file-not-found means the device exists.
+static bool PawnIoPresent()
+{
+    try
+    {
+        using var stream = new FileStream(
+            @"\\.\PawnIO", FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        return true;
+    }
+    catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException)
+    {
+        return false;
+    }
+    catch
+    {
+        return true;
+    }
 }
 
 static bool IsAdministrator() =>

@@ -138,10 +138,11 @@ pub struct SessionManifest {
     pub workload: Workload,
     /// Sensor host that fed this run's `cpu_*` columns — `lhm-sidecar`,
     /// `hwinfo-shm`, `lhm-metrics`, or `linux-sysfs`. `null` means nothing
-    /// was bound, which is exactly what an all-null CPU block should record;
+    /// ever bound, which is exactly what an all-null CPU block should record;
     /// a silent 100%-null session must be distinguishable from a broken
-    /// build after the fact. Updated at finalize so it names the last bound
-    /// source when the binding changed mid-session.
+    /// build after the fact. Rewritten on every bind/unbind transition during
+    /// capture, so the name on disk is the last source that fed rows even
+    /// when the session ends uncleanly or the feed dies before shutdown.
     #[serde(default)]
     pub cpu_source: Option<String>,
     /// Total Parquet batches that failed during this session. A nonzero

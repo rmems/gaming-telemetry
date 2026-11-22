@@ -141,6 +141,20 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Test (default features)
         run: cargo test --locked
+      - name: Publish CPU sidecar (.NET)
+        # The runner image carries the .NET 8 SDK the sidecar targets; this
+        # proves the helper still restores and publishes on every PR, since
+        # the Rust spawn test exercises the pipe plumbing with cmd.exe only.
+        run: dotnet publish sidecar/GamingTelemetry.CpuSidecar.csproj -c Release -o sidecar/publish
+      - name: Sidecar unelevated smoke test
+        # Exit 3 when the runner's token is unelevated, 4 when elevated but
+        # PawnIO is absent (hosted runners have no PawnIO driver) — either is
+        # a correct gate exit. 0 or a crash would mean the gating broke.
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath sidecar/publish/gaming-telemetry-cpu-sidecar.exe -PassThru -NoNewWindow
+          if (-not $p.WaitForExit(30000)) { $p.Kill(); throw "sidecar hung on a driverless runner" }
+          if ($p.ExitCode -notin 3, 4) { throw "expected gate exit 3 or 4, got $($p.ExitCode)" }
 
   test-default:
     runs-on: ubuntu-latest

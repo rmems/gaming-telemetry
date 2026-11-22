@@ -68,6 +68,9 @@ pub struct CpuMonitor {
     next_probe_at: Instant,
     /// Receives the next probe's result while it runs detached.
     probe_rx: Option<mpsc::Receiver<ProbeResult>>,
+    /// Set once the loud "no source bound" report has fired — the first probe
+    /// result that finds nothing warns once, not on every re-probe.
+    warned_unbound: bool,
 }
 
 enum Source {
@@ -111,34 +114,24 @@ impl Default for CpuMonitor {
 }
 
 impl CpuMonitor {
-    /// Probe for a sensor host, reporting on stderr what was found — or, with
-    /// none, exactly what the operator can run. The report matters as much here
-    /// as on Linux: without it, an empty CPU column for a whole session is
-    /// indistinguishable from a broken build.
+    /// Start probing for a sensor host on the same detached thread the
+    /// re-probe path uses. The first probe cannot run synchronously here:
+    /// [`SidecarSource::connect`] may wait out [`SIDECAR_CONNECT`] for a
+    /// spawned helper that never produces a sample, which would stall the
+    /// manifest write and the first capture ticks. The result — a bound
+    /// source, or the loud no-source report — lands on the first `poll`
+    /// after the probe finishes instead.
     pub fn new() -> Self {
-        let now = Instant::now();
-        let ProbeResult(source, name) = probe(now);
-        let monitor = Self {
-            source,
-            next_probe_at: now + PROBE_RETRY,
-            probe_rx: None,
-        };
-        match name {
-            Some(name) => eprintln!("CPU telemetry via {name}."),
-            None => eprintln!(
-                "CPU telemetry unavailable: no Windows CPU sensor source bound. \
-                 Place the bundled {SIDECAR} next to the collector and run \
-                 elevated (it needs the PawnIO driver), or run HWiNFO64 with \
-                 \"Shared Memory Support\" enabled (Settings → General/User \
-                 Interface), or LibreHardwareMonitor with its remote web \
-                 server running (Options → Remote Web Server → Run, port \
-                 8085). The cpu_* columns will be empty for every tick until a \
-                 source binds; probing again every {}s.",
-                PROBE_RETRY.as_secs(),
-                SIDECAR = sidecar::SIDECAR_FILENAME
-            ),
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(probe(Instant::now()));
+        });
+        Self {
+            source: Source::Disconnected,
+            next_probe_at: Instant::now() + PROBE_RETRY,
+            probe_rx: Some(rx),
+            warned_unbound: false,
         }
-        monitor
     }
 
     /// A monitor bound to no source; every reading is `None`.
@@ -148,6 +141,7 @@ impl CpuMonitor {
             source: Source::Disconnected,
             next_probe_at: Instant::now() + Duration::from_secs(3600),
             probe_rx: None,
+            warned_unbound: false,
         }
     }
 
@@ -232,6 +226,9 @@ impl CpuMonitor {
                     self.source = source;
                     if let Some(name) = name {
                         eprintln!("CPU telemetry via {name}.");
+                    } else if !self.warned_unbound {
+                        self.warned_unbound = true;
+                        warn_unbound();
                     }
                 }
                 Err(TryRecvError::Empty) => {}
@@ -251,9 +248,9 @@ impl CpuMonitor {
 }
 
 /// Try each source in probe order; the result names what was found for
-/// logging. Runs on the detached probe thread (or once synchronously at
-/// startup) — it can take a full HTTP round-trip and must not run inside a
-/// capture tick.
+/// logging. Always runs on a detached probe thread — it can wait out a
+/// sidecar connect plus a full HTTP round-trip and must never run inside
+/// `new` or a capture tick.
 fn probe(now: Instant) -> ProbeResult {
     if let Some(src) = SidecarSource::connect(now) {
         return ProbeResult(
@@ -271,6 +268,24 @@ fn probe(now: Instant) -> ProbeResult {
         );
     }
     ProbeResult(Source::Disconnected, None)
+}
+
+/// The first probe that finds nothing reports it loudly, once: without this,
+/// an empty CPU column for a whole session is indistinguishable from a
+/// broken build.
+fn warn_unbound() {
+    eprintln!(
+        "CPU telemetry unavailable: no Windows CPU sensor source bound. \
+         Place the bundled {SIDECAR} next to the collector and run \
+         elevated (it needs the PawnIO driver), or run HWiNFO64 with \
+         \"Shared Memory Support\" enabled (Settings → General/User \
+         Interface), or LibreHardwareMonitor with its remote web \
+         server running (Options → Remote Web Server → Run, port \
+         8085). The cpu_* columns will be empty for every tick until a \
+         source binds; probing again every {}s.",
+        PROBE_RETRY.as_secs(),
+        SIDECAR = sidecar::SIDECAR_FILENAME
+    );
 }
 
 impl SidecarSource {
@@ -475,5 +490,17 @@ mod tests {
     fn a_monitor_without_a_source_reports_nothing_measured() {
         let mut monitor = CpuMonitor::disconnected();
         assert_eq!(monitor.poll(), CpuSample::EMPTY);
+    }
+
+    /// The first probe runs detached: neither construction nor the first tick
+    /// may wait out a stalled sidecar connect. On a box where the helper
+    /// exists but cannot produce, a synchronous probe would stall capture
+    /// start for the whole `SIDECAR_CONNECT` — this pins the regression.
+    #[test]
+    fn new_and_the_first_poll_do_not_wait_on_the_probe() {
+        let started = Instant::now();
+        let mut monitor = CpuMonitor::new();
+        let _ = monitor.poll();
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

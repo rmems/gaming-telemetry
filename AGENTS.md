@@ -18,7 +18,8 @@ Steam/Proton discovery or mod scanner, and graphics settings are an operator che
 | `src/bin/query.rs` | `query` binary (needs the `query` feature, which builds bundled DuckDB) |
 | `src/corinth_csv.rs` | Frozen vahtisiru telemetry CSV contract: writer, reader mirror, fail-loud gates |
 | `src/session.rs`, `src/manifest.rs`, `src/export.rs`, `src/privacy.rs`, `src/timing.rs` | Session/manifest handling, export, redaction, timing |
-| `src/cpu/` | `CpuMonitor` facade (`mod.rs`): `sysfs.rs` (Linux k10temp/RAPL), `windows.rs` (probe + dispatch), `hwinfo.rs` (HWiNFO64 shared memory), `lhm.rs` (LibreHardwareMonitor `/metrics`) |
+| `src/cpu/` | `CpuMonitor` facade (`mod.rs`): `sysfs.rs` (Linux k10temp/RAPL), `windows.rs` (probe + dispatch), `sidecar.rs` (bundled LHM sidecar spawn + JSON-lines protocol), `hwinfo.rs` (HWiNFO64 shared memory), `lhm.rs` (LibreHardwareMonitor `/metrics`) |
+| `sidecar/` | Windows-only .NET 8 CPU sensor helper (`gaming-telemetry-cpu-sidecar`, LibreHardwareMonitorLib/PawnIO); publish next to the collector exe |
 | `build.rs`, `src/build_info.rs` | Embeds the git SHA (`AGENTOS_GIT_SHA` override) as build info |
 
 ## Toolchain

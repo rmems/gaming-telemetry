@@ -39,10 +39,11 @@ anyhow = "1.0.104"
 duckdb = { version = "1.10505.0", features = ["bundled"], optional = true }
 fs2 = "0.4.3"
 
-# CPU telemetry on Windows reads a running sensor host: HWiNFO64's shared
-# memory mapping (OpenFileMapping/MapViewOfFile) or LibreHardwareMonitor's
-# loopback /metrics server. Windows-only so the Linux build's dependency tree
-# is unchanged.
+# CPU telemetry on Windows reads a sensor host: the bundled .NET sidecar the
+# collector spawns itself (no extra dependency — process pipes only), or an
+# operator-run host — HWiNFO64's shared memory mapping
+# (OpenFileMapping/MapViewOfFile) or LibreHardwareMonitor's loopback /metrics
+# server. Windows-only so the Linux build's dependency tree is unchanged.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",

@@ -412,10 +412,14 @@ async fn main() -> Result<()> {
     // Register before publishing the manifest so startup failure cannot leave a
     // newly-written manifest in an unfinished state.
     let mut shutdown = ShutdownSignal::new()?;
+    // Bind CPU sources before publishing the manifest, so it records which
+    // sensor host fed this run's cpu_* columns — the answer to "why is every
+    // cpu_* column null" must be on disk, not only on stderr.
+    let mut cpu_monitor = CpuMonitor::new();
+    manifest.cpu_source = cpu_monitor.bound_source().map(str::to_owned);
     // Publish only after the fallible resume scan succeeds, so an unreadable
     // existing directory cannot overwrite its prior completed manifest.
     manifest.write_atomic(&output_dir)?;
-    let mut cpu_monitor = CpuMonitor::new();
     let mut timing = TimingStats::new(poll_interval_ms);
     let mut in_flight: JoinSet<Result<()>> = JoinSet::new();
     let mut write_failures: u32 = 0;
@@ -496,6 +500,10 @@ async fn main() -> Result<()> {
                     .await?
                     {
                         println!("\nShutdown signal received during write backpressure...");
+                        // Record the last-bound CPU source: a mid-session rebind
+                        // should leave the manifest naming what actually fed the
+                        // columns at the end.
+                        manifest.cpu_source = cpu_monitor.bound_source().map(str::to_owned);
                         perform_shutdown(
                             std::mem::take(&mut buffer),
                             batch_counter,
@@ -516,6 +524,8 @@ async fn main() -> Result<()> {
                             // still in flight. Converge on the same shutdown path
                             // Ctrl+C uses so nothing already captured is lost.
                             report_failure("Cannot start a new batch", &format!("{:?}", e));
+                            manifest.cpu_source =
+                                cpu_monitor.bound_source().map(str::to_owned);
                             perform_shutdown(
                                 samples_to_write,
                                 batch_counter,
@@ -541,6 +551,7 @@ async fn main() -> Result<()> {
             signal = shutdown.recv() => {
                 signal?;
                 println!("\nShutdown signal received. Finalizing last batch...");
+                manifest.cpu_source = cpu_monitor.bound_source().map(str::to_owned);
                 perform_shutdown(
                     buffer,
                     batch_counter,

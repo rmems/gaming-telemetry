@@ -24,7 +24,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use super::{CpuSample, MAX_PLAUSIBLE_PACKAGE_POWER_W, contains_token};
+use super::{CpuSample, contains_token, plausible_power, plausible_temp};
 
 /// LHM's default listener. Only loopback is ever contacted.
 #[cfg(windows)]
@@ -299,9 +299,9 @@ fn pick(readings: &[&Reading], spec: &Spec) -> Option<f32> {
 
 fn plausible(v: f64, is_temp: bool) -> Option<f32> {
     if is_temp {
-        (v.is_finite() && (-50.0..=200.0).contains(&v)).then_some(v as f32)
+        plausible_temp(v)
     } else {
-        (v.is_finite() && (0.0..=MAX_PLAUSIBLE_PACKAGE_POWER_W).contains(&v)).then_some(v as f32)
+        plausible_power(v)
     }
 }
 

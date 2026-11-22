@@ -22,7 +22,7 @@
 
 use std::borrow::Cow;
 
-use super::{CpuSample, MAX_PLAUSIBLE_PACKAGE_POWER_W, contains_token};
+use super::{CpuSample, contains_token, plausible_power, plausible_temp};
 
 /// `HWiNFO_HEADER_MAGIC`, the multi-character constant `'SiWH'` — the bytes
 /// `"HWiS"` read as a little-endian `u32`.
@@ -193,17 +193,6 @@ impl Entry<'_> {
     fn matches(&self, needle: &str) -> bool {
         self.names.iter().any(|name| contains_token(name, needle))
     }
-}
-
-/// A plausible CPU temperature. Torn or corrupt reads land far outside this.
-fn plausible_temp(v: f64) -> Option<f32> {
-    (v.is_finite() && (-50.0..=200.0).contains(&v)).then_some(v as f32)
-}
-
-/// A plausible package power: finite, non-negative, and below the same ceiling
-/// the RAPL path uses to catch counter resets.
-fn plausible_power(v: f64) -> Option<f32> {
-    (v.is_finite() && (0.0..=MAX_PLAUSIBLE_PACKAGE_POWER_W).contains(&v)).then_some(v as f32)
 }
 
 fn section_in_bounds(buf_len: usize, off: usize, size: usize, count: usize) -> bool {

@@ -509,6 +509,22 @@ fn now_unix_secs() -> i64 {
 mod tests {
     use super::*;
 
+    /// A disconnected monitor with no probe in flight; tests override the
+    /// fields they exercise.
+    fn monitor() -> CpuMonitor {
+        CpuMonitor {
+            source: Source::Disconnected,
+            next_probe_at: Instant::now() + Duration::from_secs(3600),
+            probe_rx: None,
+            warned_unbound: false,
+            last_bound: None,
+        }
+    }
+
+    /// Serialises tests that bind or probe `127.0.0.1:8085`: a probe that
+    /// finds a stub server is no longer a "found nothing" probe.
+    static NET_LOCK: Mutex<()> = Mutex::new(());
+
     /// Same guarantee as the sysfs backend: no sensor host means no data, not
     /// zeros.
     #[test]
@@ -537,11 +553,8 @@ mod tests {
     fn a_stalled_probe_never_blocks_a_tick() {
         let (_tx, rx) = mpsc::channel();
         let mut monitor = CpuMonitor {
-            source: Source::Disconnected,
-            next_probe_at: Instant::now() + Duration::from_secs(3600),
             probe_rx: Some(rx),
-            warned_unbound: false,
-            last_bound: None,
+            ..monitor()
         };
         let started = Instant::now();
         for _ in 0..100 {
@@ -559,11 +572,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         tx.send(ProbeResult(Source::Disconnected, None)).unwrap();
         let mut monitor = CpuMonitor {
-            source: Source::Disconnected,
-            next_probe_at: Instant::now() + Duration::from_secs(3600),
             probe_rx: Some(rx),
-            warned_unbound: false,
-            last_bound: None,
+            ..monitor()
         };
         let _ = monitor.poll();
         assert!(monitor.probe_rx.is_none());
@@ -582,11 +592,8 @@ mod tests {
     #[test]
     fn bound_source_keeps_the_last_source_that_fed() {
         let monitor = CpuMonitor {
-            source: Source::Disconnected,
-            next_probe_at: Instant::now() + Duration::from_secs(3600),
-            probe_rx: None,
-            warned_unbound: false,
             last_bound: Some("hwinfo-shm"),
+            ..monitor()
         };
         assert_eq!(monitor.bound_source(), Some("hwinfo-shm"));
     }
@@ -600,10 +607,8 @@ mod tests {
                 shared: Arc::new(Mutex::new(FeedState::new())),
                 stop: Arc::new(AtomicBool::new(false)),
             }),
-            next_probe_at: Instant::now() + Duration::from_secs(3600),
-            probe_rx: None,
-            warned_unbound: false,
             last_bound: Some("hwinfo-shm"),
+            ..monitor()
         };
         assert_eq!(monitor.bound_source(), Some("lhm-metrics"));
     }
@@ -615,12 +620,10 @@ mod tests {
     /// the same pass.
     #[test]
     fn an_expired_probe_window_probes_detached_and_finds_nothing() {
+        let _net = NET_LOCK.lock().unwrap();
         let mut monitor = CpuMonitor {
-            source: Source::Disconnected,
             next_probe_at: Instant::now() - Duration::from_secs(1),
-            probe_rx: None,
-            warned_unbound: false,
-            last_bound: None,
+            ..monitor()
         };
         let _ = monitor.poll();
         assert!(monitor.probe_rx.is_some());
@@ -652,10 +655,8 @@ mod tests {
                 })),
                 stop: Arc::new(AtomicBool::new(false)),
             }),
-            next_probe_at: Instant::now() + Duration::from_secs(3600),
-            probe_rx: None,
-            warned_unbound: false,
             last_bound: Some("lhm-metrics"),
+            ..monitor()
         };
         assert_eq!(monitor.poll(), live);
 
@@ -684,7 +685,9 @@ mod tests {
     /// unspawnable target must not panic or fabricate a source.
     #[test]
     fn spawn_tolerates_an_unspawnable_env_override() {
-        let fake = std::env::temp_dir().join("gaming-telemetry-fake-sidecar.exe");
+        let fake = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("gaming-telemetry-fake-sidecar.exe");
         std::fs::write(&fake, b"not an executable").unwrap();
         // Other tests share this process's environment; pointing the override
         // at a file that can never spawn keeps every concurrent resolve_path
@@ -693,5 +696,65 @@ mod tests {
         // the unset state, and both resolve to "no spawnable sidecar".
         unsafe { std::env::set_var("CPU_SIDECAR_PATH", &fake) };
         assert!(sidecar::spawn().is_none());
+    }
+
+    /// The whole LHM path against a stub `/metrics` server: `connect`'s proof
+    /// fetch, the worker thread it spawns, the mailbox publish, and `poll`
+    /// serving the sample — every line an operator-run LHM would hit.
+    #[test]
+    fn an_lhm_server_binds_through_connect_and_serves() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let _net = NET_LOCK.lock().unwrap();
+        let Ok(listener) = TcpListener::bind(lhm::DEFAULT_ADDR) else {
+            // Another LHM (or a parallel run) owns the port — nothing to
+            // prove here, and no assertion is safe either way.
+            return;
+        };
+        listener.set_nonblocking(true).unwrap();
+        // `stop` joined before `NET_LOCK` drops: a server thread that outlived
+        // the test would let a later probe bind a ghost LHM source.
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !server_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                let Ok((mut conn, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
+                let mut req = [0u8; 4096];
+                let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
+                let _ = conn.read(&mut req);
+                let body = format!(
+                    "lhm_cpu_temperature_celsius {{\"sensorName\"=\"Core (Tctl/Tdie)\", \"sensorId\"=\"/temperature/2\", \"hardwareId\"=\"/amdcpu/0\"}} 61.5 {}\nlhm_cpu_power_watts {{\"sensorName\"=\"Package\", \"sensorId\"=\"/power/0\", \"hardwareId\"=\"/amdcpu/0\"}} 142.5 {}\n",
+                    now_unix_ms(),
+                    now_unix_ms()
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = conn.write_all(response.as_bytes());
+            }
+        });
+
+        let mut src = LhmSource::connect().expect("a live /metrics server binds");
+        // The worker keeps the mailbox fresh; poll serves the bound sample.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let sample = loop {
+            match src.poll(Instant::now()) {
+                Some(sample) if sample != CpuSample::EMPTY => break sample,
+                _ if Instant::now() >= deadline => panic!("no sample from a bound LHM source"),
+                _ => thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        assert_eq!(sample.tctl_c, Some(61.5));
+        assert_eq!(sample.package_power_w, Some(142.5));
+        drop(src);
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
     }
 }

@@ -103,6 +103,22 @@ directory or restore their original manifest before resuming.
 
 The export and query examples below reuse the `$SESSION_DIR` variable from the capture block you ran. If you used a different directory, substitute its name.
 
+### Capture titles
+
+The owner's current game library, with the `SESSION_LABEL` used for capture sessions:
+
+| Game | `SESSION_LABEL` |
+|------|-----------------|
+| Cyberpunk 2077 | `cp2077` |
+| Resident Evil 4 | `re4r` |
+| Resident Evil Requiem | `re_requiem` |
+| Resident Evil 2 | `re2r` |
+| Resident Evil 3 | `re3r` |
+| Battlefield™ 6 | `bf6` |
+| Grand Theft Auto IV: The Complete Edition | `gta4` |
+| Kingdom Come: Deliverance II | `kcd2` |
+| Max Payne 3 | `mp3` |
+
 ### The session manifest
 
 Written at start so the directory is self-describing during capture, then finalized on clean

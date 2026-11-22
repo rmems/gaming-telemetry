@@ -70,10 +70,12 @@ pub fn parse_sample(line: &str) -> Option<(CpuSample, Option<i64>)> {
 
 #[cfg(windows)]
 mod imp {
+    use std::ffi::OsString;
     use std::io::{BufRead, BufReader, Read};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -140,31 +142,38 @@ mod imp {
             .unwrap_or(false)
     }
 
-    /// Locate the sidecar exe: `CPU_SIDECAR_PATH` when set (also returned when
-    /// it points somewhere that does not exist, so the spawn error names what
-    /// the operator configured), else next to the collector binary — directly,
-    /// or under a `sidecar/` sibling directory.
+    /// Locate the sidecar exe: `override_path` (the `CPU_SIDECAR_PATH` value)
+    /// when set — also returned when it points somewhere that does not exist,
+    /// so the spawn error names what the operator configured — else next to
+    /// the collector binary, directly or under a `sidecar/` sibling directory.
+    /// The override is injected so tests can exercise this without touching
+    /// process-global environment state.
     ///
     /// The override is honoured only while the collector runs unelevated. An
     /// elevated collector spawning a path an unprivileged environment chose
     /// would hand administrator rights to whatever that variable points at, so
     /// the trusted locations are only the co-located ones.
-    pub fn resolve_path() -> Option<PathBuf> {
-        if let Some(path) = std::env::var_os("CPU_SIDECAR_PATH")
+    pub fn resolve_path(override_path: Option<OsString>) -> Option<PathBuf> {
+        if let Some(path) = override_path
             .map(PathBuf::from)
             .filter(|p| !p.as_os_str().is_empty())
         {
             match elevated() {
                 Some(false) => return Some(path),
                 verdict => {
-                    let why = match verdict {
-                        Some(true) => "the collector is elevated",
-                        _ => "the collector's elevation could not be determined",
-                    };
-                    eprintln!(
-                        "CPU telemetry: CPU_SIDECAR_PATH ignored — {why}, so only \
-                         a sidecar next to its binary is trusted."
-                    );
+                    // Once per process: probes re-resolve every ~30 s, and the
+                    // verdict is fixed at first query anyway.
+                    static WARNED: AtomicBool = AtomicBool::new(false);
+                    if !WARNED.swap(true, Ordering::Relaxed) {
+                        let why = match verdict {
+                            Some(true) => "the collector is elevated",
+                            _ => "the collector's elevation could not be determined",
+                        };
+                        eprintln!(
+                            "CPU telemetry: CPU_SIDECAR_PATH ignored — {why}, so only \
+                             a sidecar next to its binary is trusted."
+                        );
+                    }
                 }
             }
         }
@@ -182,8 +191,15 @@ mod imp {
     /// the token query failed — callers must distrust the env override in that
     /// case: the override is a development convenience, and declining to trust
     /// it costs a developer one stderr note while trusting it wrongly costs a
-    /// privilege boundary.
+    /// privilege boundary. The verdict cannot change for the life of the
+    /// process, so it is computed once.
     pub fn elevated() -> Option<bool> {
+        static VERDICT: OnceLock<Option<bool>> = OnceLock::new();
+        *VERDICT.get_or_init(query_elevation)
+    }
+
+    /// The one-shot token query behind [`elevated`].
+    fn query_elevation() -> Option<bool> {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::Security::{
             GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
@@ -221,7 +237,7 @@ mod imp {
         if disabled() {
             return None;
         }
-        let path = resolve_path()?;
+        let path = resolve_path(std::env::var_os("CPU_SIDECAR_PATH"))?;
         spawn_child(&path, &[])
     }
 
@@ -328,10 +344,11 @@ mod imp {
 }
 
 #[cfg(windows)]
-// `elevated`/`resolve_path` are re-exported for tests in `cpu::windows`,
-// so a non-test build has no consumer for them.
-#[allow(unused_imports)]
-pub use imp::{Sidecar, elevated, resolve_path, spawn};
+pub use imp::{Sidecar, spawn};
+
+/// Test-only surface for `cpu::windows` tests — not part of the shipped API.
+#[cfg(all(windows, test))]
+pub use imp::{elevated, resolve_path, spawn_child};
 
 #[cfg(test)]
 mod tests {

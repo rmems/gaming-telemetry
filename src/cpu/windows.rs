@@ -620,7 +620,7 @@ mod tests {
     /// the same pass.
     #[test]
     fn an_expired_probe_window_probes_detached_and_finds_nothing() {
-        let _net = NET_LOCK.lock().unwrap();
+        let _net = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut monitor = CpuMonitor {
             next_probe_at: Instant::now() - Duration::from_secs(1),
             ..monitor()
@@ -686,11 +686,12 @@ mod tests {
         assert_eq!(stamp_unix_secs(1_763_340_000_000), 1_763_340_000);
     }
 
-    /// The env override is honoured only while unelevated; either way an
-    /// unspawnable target must not panic or fabricate a source.
+    /// The override is honoured only while unelevated; either way an
+    /// unspawnable target must not panic or fabricate a source. The override
+    /// is injected as a parameter — no test ever mutates process-global
+    /// environment state a detached probe thread might race with.
     #[test]
-    fn spawn_tolerates_an_unspawnable_env_override() {
-        let _net = NET_LOCK.lock().unwrap();
+    fn an_unspawnable_override_falls_through_to_no_source() {
         let fake = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join("gaming-telemetry-fake-sidecar.exe");
@@ -698,32 +699,23 @@ mod tests {
         std::fs::create_dir_all(fake.parent().unwrap()).unwrap();
         std::fs::write(&fake, b"not an executable").unwrap();
 
-        // The variable is process-shared state — it and the file go away even
-        // when the assertion below panics.
         struct Cleanup(std::path::PathBuf);
         impl Drop for Cleanup {
             fn drop(&mut self) {
-                // SAFETY: same serialisation argument as the set_var below.
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                unsafe { std::env::remove_var("CPU_SIDECAR_PATH") };
                 let _ = std::fs::remove_file(&self.0);
             }
         }
         let _cleanup = Cleanup(fake.clone());
 
-        // SAFETY: while NET_LOCK is held no probe is in flight, and the other
-        // env-reading tests reach CPU_SIDECAR_PATH only through resolve_path —
-        // a reader sees either this value or the unset state, both of which
-        // resolve to "no spawnable sidecar" on this box.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe { std::env::set_var("CPU_SIDECAR_PATH", &fake) };
-
         if sidecar::elevated() == Some(false) {
             // Unelevated, the override is actually honoured: the resolver
             // picks the fake rather than falling back to co-located names.
-            assert_eq!(sidecar::resolve_path().as_deref(), Some(fake.as_path()));
+            assert_eq!(
+                sidecar::resolve_path(Some(std::ffi::OsString::from(&fake))).as_deref(),
+                Some(fake.as_path())
+            );
         }
-        assert!(sidecar::spawn().is_none());
+        assert!(sidecar::spawn_child(&fake, &[]).is_none());
     }
 
     /// Serve one canned Ryzen `/metrics` body per connection until `stop`
@@ -736,7 +728,8 @@ mod tests {
         use std::io::{Read, Write};
 
         let mut served = 0u32;
-        let deadline = Instant::now() + Duration::from_secs(15);
+        // Backstop only — callers `stop` and `join` in the normal path.
+        let deadline = Instant::now() + Duration::from_secs(8);
         while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
             let Ok((mut conn, _)) = listener.accept() else {
                 thread::sleep(Duration::from_millis(10));
@@ -761,6 +754,55 @@ mod tests {
         }
     }
 
+    /// `probe`'s bound arm: with a live `/metrics` stub the connect ladder
+    /// reports the LHM binding and its manifest name.
+    #[test]
+    fn a_probe_binds_a_live_lhm_server() {
+        use std::net::TcpListener;
+
+        let _net = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(listener) = TcpListener::bind(lhm::DEFAULT_ADDR) else {
+            return;
+        };
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || serve_stub_metrics(listener, stop)
+        });
+
+        let ProbeResult(source, name) = probe();
+        assert!(matches!(source, Source::Lhm(_)));
+        // The probe reports the human description; the manifest keeps the
+        // machine name.
+        assert_eq!(name, Some("LibreHardwareMonitor /metrics (loopback:8085)"));
+        assert_eq!(source.manifest_name(), Some("lhm-metrics"));
+        drop(source);
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+    }
+
+    /// A co-located but unspawnable sidecar exe exercises `resolve_path`'s
+    /// `current_exe` arm and `spawn`'s failed-spawn fall-through — the probe
+    /// just moves on to the next source.
+    #[test]
+    fn a_co_located_fake_sidecar_fails_spawn_cleanly() {
+        let fake = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(sidecar::SIDECAR_FILENAME);
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        std::fs::write(&fake, b"not an executable").unwrap();
+        let _cleanup = Cleanup(fake);
+        assert!(sidecar::spawn().is_none());
+    }
+
     /// The whole LHM path against a stub `/metrics` server: `connect`'s proof
     /// fetch, the worker thread it spawns, the mailbox publish, and `poll`
     /// serving the sample — every line an operator-run LHM would hit.
@@ -768,7 +810,7 @@ mod tests {
     fn an_lhm_server_binds_through_connect_and_serves() {
         use std::net::TcpListener;
 
-        let _net = NET_LOCK.lock().unwrap();
+        let _net = NET_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(listener) = TcpListener::bind(lhm::DEFAULT_ADDR) else {
             // Another LHM (or a parallel run) owns the port — nothing to
             // prove here, and no assertion is safe either way.

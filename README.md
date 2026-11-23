@@ -370,7 +370,9 @@ Probe order:
    licensing cliff. It embeds `LibreHardwareMonitorLib` — the same sensor
    stack the LHM app runs, on the signed PawnIO driver that replaced WinRing0
    in 0.9.5 — and prints one JSON sample per line on stdout. It needs:
-   - the **PawnIO driver**, installed once (<https://pawnio.eu>), and
+   - the **PawnIO driver**, installed once (<https://pawnio.eu> — or run
+     `scripts/install-windows-deps.ps1`, which downloads and installs it
+     unattended), and
    - an **elevated** collector; the sidecar inherits the collector's token.
 
    Build it once with the .NET 8 SDK (`sidecar/`):

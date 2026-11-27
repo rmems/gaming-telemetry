@@ -77,6 +77,34 @@ function Stop-Setup {
     exit $Code
 }
 
+function New-AdminOnlyDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+    # Protected DACL: SYSTEM and Administrators only. The default ProgramData
+    # ACL grants BUILTIN\Users (CI)(WD,AD,WEA,WA), which would otherwise be
+    # inherited and let a standard user plant PawnIO_setup.exe in the new
+    # folder before the download, keeping a writable security descriptor
+    # after Invoke-WebRequest -OutFile.
+    if (Test-Path -LiteralPath $Path) {
+        Stop-Setup "Staging path already exists: $Path"
+    }
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $full = [System.Security.AccessControl.FileSystemRights]::FullControl
+    $inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $propagate = [System.Security.AccessControl.PropagationFlags]::None
+    $allow = [System.Security.AccessControl.AccessControlType]::Allow
+    foreach ($sid in @(
+        [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
+        [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+    )) {
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sid, $full, $inherit, $propagate, $allow
+        )
+        $acl.AddAccessRule($rule)
+    }
+    [System.IO.Directory]::CreateDirectory($Path, $acl) | Out-Null
+}
+
 # A re-run on a machine that already has a compatible PawnIO is not a
 # failure; skip the installer - and the UAC prompt - entirely. Older
 # versions do NOT take this shortcut: PawnIO 2.1.0 dropped the \\.\PawnIO
@@ -135,13 +163,12 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 # Elevated from here on - either self-elevated or already launched as admin.
 $rebootRequired = $false
 
-# Stage in a fresh admin-only directory: the installer must not run elevated
-# from a user-writable path. A new ProgramData sub-directory inherits no user
-# write access, and a unique name cannot have been pre-created, so the file
-# verified below is the file that runs.
+# Stage under ProgramData in a fresh directory whose DACL is set at creation
+# to SYSTEM and Administrators only (protected, no inherited Users write).
+# The installer must not run elevated from a user-writable path.
 $stagingDir = Join-Path $env:ProgramData ('gaming-telemetry-' + [guid]::NewGuid().ToString('N'))
 try {
-    New-Item -ItemType Directory -Force $stagingDir | Out-Null
+    New-AdminOnlyDirectory $stagingDir
     $installer = Join-Path $stagingDir 'PawnIO_setup.exe'
 
     Write-Host "Downloading PawnIO $PawnIoVersion installer..." -ForegroundColor Cyan

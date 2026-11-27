@@ -39,8 +39,17 @@ $PawnIoUrl = "https://github.com/namazso/PawnIO.Setup/releases/download/$PawnIoV
 $PawnIoSha256 = '1F519A22E47187F70A1379A48CA604981C4FCF694F4E65B734AAA74A9FBA3032'
 
 # ERROR_SUCCESS_REBOOT_REQUIRED: the silent install succeeded but the driver
-# only activates after a restart. Not a failure.
+# only activates after a restart. Not a failure - but the script still exits
+# with it, the same contract msiexec and PawnIO_setup.exe itself keep, so a
+# caller can tell "success, restart pending" (3010) apart from "success,
+# ready" (0) and failure (any other nonzero code).
 $RebootRequiredCode = 3010
+
+# ERROR_ALREADY_EXISTS: the installer reports a driver is already present.
+# Reachable when an install was detected but its version could not satisfy
+# the compatibility check below; the post-install registry check decides
+# whether the install is real, so this code is not fatal.
+$AlreadyInstalledCode = 183
 
 function Get-PawnIoInstall {
     Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -67,14 +76,28 @@ function Stop-Setup {
     exit $Code
 }
 
-# A re-run on a machine that already has PawnIO is not a failure (the
-# installer can return e.g. 183); skip it - and the UAC prompt - entirely.
+# A re-run on a machine that already has a compatible PawnIO is not a
+# failure; skip the installer - and the UAC prompt - entirely. Older
+# versions do NOT take this shortcut: PawnIO 2.1.0 dropped the \\.\PawnIO
+# device alias the sidecar probes (restored in 2.2.0), so anything below
+# the pinned release falls through to the installer, which upgrades it in
+# place.
 $installed = Get-PawnIoInstall
 if ($installed) {
-    $version = if ($installed.DisplayVersion) { $installed.DisplayVersion } else { 'version unknown' }
-    Write-Host "PawnIO $version is already installed." -ForegroundColor Green
-    Write-CollectorInstructions
-    exit 0
+    $installedVersion = $null
+    if ($installed.DisplayVersion) {
+        try { $installedVersion = [version]$installed.DisplayVersion } catch { }
+    }
+    if ($installedVersion -and $installedVersion -ge [version]$PawnIoVersion) {
+        Write-Host "PawnIO $installedVersion is already installed." -ForegroundColor Green
+        Write-CollectorInstructions
+        exit 0
+    }
+    if ($installedVersion) {
+        Write-Host "PawnIO $installedVersion predates the pinned $PawnIoVersion; upgrading." -ForegroundColor Yellow
+    } else {
+        Write-Host "PawnIO is installed but its version is unreadable; running the pinned $PawnIoVersion installer." -ForegroundColor Yellow
+    }
 }
 
 # Self-elevate: the kernel-driver installer requires administrator rights.
@@ -103,6 +126,8 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
             Write-Host "Elevated setup did not complete (exit code $childCode)." -ForegroundColor Red
         }
     }
+    # Propagated intact: a child's 3010 is the success-with-restart code,
+    # not a failure (see $RebootRequiredCode above).
     exit $childCode
 }
 
@@ -145,6 +170,8 @@ try {
         } else {
             Write-Host 'PawnIO installed; its registry entry appears after the pending restart.' -ForegroundColor Yellow
         }
+    } elseif ($procCode -eq $AlreadyInstalledCode) {
+        Write-Host 'PawnIO installer reports a driver is already installed.' -ForegroundColor Yellow
     } elseif ($procCode -ne 0) {
         Stop-Setup "PawnIO installer exited with code $procCode" $procCode
     }
@@ -168,6 +195,9 @@ if ($rebootRequired) {
     Write-Host 'Restart Windows before collecting CPU telemetry - the PawnIO' -ForegroundColor Yellow
     Write-Host 'driver only activates after a restart.' -ForegroundColor Yellow
     Write-CollectorInstructions
+    # Deliberate: 3010 is the standard success-with-restart-required code
+    # ($RebootRequiredCode above), so a caller can distinguish it from a
+    # ready-now success. It is not a failure.
     exit $RebootRequiredCode
 }
 

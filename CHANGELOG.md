@@ -20,6 +20,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `CPU_SIDECAR_PATH` to relocate), the `cpu_*` columns stay null — never
   zeros.
 
+- **`scripts/install-windows-deps.ps1` unattended Windows prerequisite
+  setup.** The one-time PawnIO install is now a single command: the script
+  skips the installer entirely when PawnIO is already installed, downloads
+  the pinned 2.2.0 release into an admin-only staging directory, verifies
+  SHA-256 and the Authenticode signature before anything runs elevated,
+  treats `3010` (reboot-required) as success with a restart reminder, and
+  prints the elevated collector command in the terminal that launched it.
+
 - **Session manifest records `cpu_source`.** The bound Windows sensor host
   (`lhm-sidecar`, `hwinfo-shm`, `lhm-metrics`), `linux-sysfs`, or `null` when
   nothing was bound is written at capture start and refreshed at finalize, so

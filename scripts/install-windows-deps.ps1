@@ -9,11 +9,12 @@
     inside this repo - it is a separately signed driver - so this script
     downloads the official installer and runs it silently.
 
-    The installer is pinned to a fixed PawnIO release and verified by SHA-256
-    and Authenticode signature before it runs: the download executes with
-    administrator rights, so it is staged in a fresh admin-only directory
-    under ProgramData rather than a user-writable path, where it cannot be
-    swapped after verification.
+    The installer is pinned to a fixed PawnIO release. After the script
+    self-elevates, the download is staged in a fresh ProgramData directory
+    whose DACL allows write access only to SYSTEM and Administrators.
+    SHA-256 verification is required before the installer runs (a mismatch
+    refuses to execute it). An Authenticode status other than Valid is a
+    warning only, because the pinned hash already matched.
 
     The script self-elevates: PawnIO is a kernel driver and its installer
     requires administrator rights. On completion it prints the exact command
@@ -102,7 +103,14 @@ function New-AdminOnlyDirectory {
         )
         $acl.AddAccessRule($rule)
     }
-    [System.IO.Directory]::CreateDirectory($Path, $acl) | Out-Null
+    # Desktop (.NET Framework) exposes Directory.CreateDirectory(path, acl).
+    # PowerShell 7 (.NET) moved the ACL-aware create to FileSystemAclExtensions.
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        $dirInfo = [System.IO.DirectoryInfo]::new($Path)
+        [System.IO.FileSystemAclExtensions]::Create($dirInfo, $acl) | Out-Null
+    } else {
+        [System.IO.Directory]::CreateDirectory($Path, $acl) | Out-Null
+    }
 }
 
 # A re-run on a machine that already has a compatible PawnIO is not a

@@ -47,8 +47,9 @@ $RebootRequiredCode = 3010
 
 # ERROR_ALREADY_EXISTS: the installer reports a driver is already present.
 # Reachable when an install was detected but its version could not satisfy
-# the compatibility check below; the post-install registry check decides
-# whether the install is real, so this code is not fatal.
+# the compatibility check below. This code is not fatal by itself; the
+# post-install registry check fails if the registered version is still
+# below the pinned release (or is unreadable).
 $AlreadyInstalledCode = 183
 
 function Get-PawnIoInstall {
@@ -181,12 +182,22 @@ try {
     Remove-Item $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# Confirm the driver registered.
+# Confirm the driver registered, and that it is the pinned release.
+# Exit 183 (already installed) is not success if the registry still names a
+# version below $PawnIoVersion: the installer refused the in-place upgrade.
 $installed = Get-PawnIoInstall
 if (-not $installed -and -not $rebootRequired) {
     Stop-Setup 'PawnIO install finished but no registry entry was found.'
 }
 if ($installed -and -not $rebootRequired) {
+    $installedVersion = $null
+    if ($installed.DisplayVersion) {
+        try { $installedVersion = [version]$installed.DisplayVersion } catch { }
+    }
+    if (-not $installedVersion -or $installedVersion -lt [version]$PawnIoVersion) {
+        $shown = if ($installedVersion) { "$installedVersion" } else { 'an unreadable version' }
+        Stop-Setup "PawnIO $shown is still installed; uninstall it, then rerun this script to install $PawnIoVersion."
+    }
     Write-Host "PawnIO $($installed.DisplayVersion) installed." -ForegroundColor Green
 }
 

@@ -60,13 +60,15 @@ jobs:
                   f"rust-toolchain.toml {pinned}, .agents/setup {setup}"
               )
 
-          workflow = yaml.safe_load(open(".github/workflows/ci.yml", encoding="utf-8"))
-          pins = [
-              (job, str(step["with"]["toolchain"]))
-              for job, body in (workflow.get("jobs") or {}).items()
-              for step in (body.get("steps") or [])
-              if isinstance(step.get("with"), dict) and "toolchain" in step["with"]
-          ]
+          pins = []
+          for filename in ("ci.yml", "windows-bundle.yml"):
+              with open(f".github/workflows/{filename}", encoding="utf-8") as source:
+                  workflow = yaml.safe_load(source)
+              for job, body in workflow["jobs"].items():
+                  for step in body.get("steps", []):
+                      inputs = step.get("with", {})
+                      if "toolchain" in inputs:
+                          pins.append((f"{filename}/{job}", str(inputs["toolchain"])))
           if not pins:
               sys.exit("::error::no toolchain pins found; the guard would pass vacuously")
 

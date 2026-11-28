@@ -31,6 +31,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$InformationPreference = 'Continue'
 
 # Pinned release: https://github.com/namazso/PawnIO.Setup/releases/tag/2.2.0
 # PawnIoSha256 is the SHA-256 of that release's PawnIO_setup.exe; update both
@@ -61,22 +62,22 @@ function Get-PawnIoInstall {
 }
 
 function Write-CollectorInstructions {
-    Write-Host ''
-    Write-Host 'Next: run the collector from an elevated terminal so the sidecar' -ForegroundColor Yellow
-    Write-Host 'inherits admin rights (the PawnIO driver only serves elevated processes):' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host '  $env:SESSION_LABEL = "my-session"' -ForegroundColor White
+    Write-Information ''
+    Write-Information 'Next: run the collector from an elevated terminal so the sidecar'
+    Write-Information 'inherits admin rights (the PawnIO driver only serves elevated processes):'
+    Write-Information ''
+    Write-Information '  $env:SESSION_LABEL = "my-session"'
     if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'gaming-telemetry.exe') -PathType Leaf) {
-        Write-Host '  # From the extracted bundle directory:' -ForegroundColor White
-        Write-Host '  .\gaming-telemetry.exe' -ForegroundColor White
+        Write-Information '  # From the extracted bundle directory:'
+        Write-Information '  .\gaming-telemetry.exe'
     } else {
-        Write-Host '  .\target\release\gaming-telemetry.exe' -ForegroundColor White
+        Write-Information '  .\target\release\gaming-telemetry.exe'
     }
 }
 
-function Stop-Setup {
+function Exit-Setup {
     param([string]$Message, [int]$Code = 1)
-    Write-Host $Message -ForegroundColor Red
+    Write-Error -Message $Message -ErrorAction Continue
     # A self-elevated window closes on exit; keep failures readable there.
     # An already-elevated terminal keeps its output, so it does not pause.
     if ($ElevatedChild) { [void](Read-Host 'Press Enter to close this window') }
@@ -84,6 +85,7 @@ function Stop-Setup {
 }
 
 function New-AdminOnlyDirectory {
+    [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][string]$Path)
     # Protected DACL: SYSTEM and Administrators only. The default ProgramData
     # ACL grants BUILTIN\Users (CI)(WD,AD,WEA,WA), which would otherwise be
@@ -91,7 +93,10 @@ function New-AdminOnlyDirectory {
     # folder before the download, keeping a writable security descriptor
     # after Invoke-WebRequest -OutFile.
     if (Test-Path -LiteralPath $Path) {
-        Stop-Setup "Staging path already exists: $Path"
+        Exit-Setup "Staging path already exists: $Path"
+    }
+    if (-not $PSCmdlet.ShouldProcess($Path, 'Create private installer staging directory')) {
+        throw 'Installer staging directory creation was declined.'
     }
     $acl = New-Object System.Security.AccessControl.DirectorySecurity
     $acl.SetAccessRuleProtection($true, $false)
@@ -118,139 +123,122 @@ function New-AdminOnlyDirectory {
     }
 }
 
-# A re-run on a machine that already has a compatible PawnIO is not a
-# failure; skip the installer - and the UAC prompt - entirely. Older
-# versions do NOT take this shortcut: PawnIO 2.1.0 dropped the \\.\PawnIO
-# device alias the sidecar probes (restored in 2.2.0), so anything below
-# the pinned release falls through to the installer, which upgrades it in
-# place.
-$installed = Get-PawnIoInstall
-if ($installed) {
-    $installedVersion = $null
-    if ($installed.DisplayVersion) {
-        try { $installedVersion = [version]$installed.DisplayVersion } catch { }
-    }
-    if ($installedVersion -and $installedVersion -ge [version]$PawnIoVersion) {
-        Write-Host "PawnIO $installedVersion is already installed." -ForegroundColor Green
-        Write-CollectorInstructions
-        exit 0
-    }
-    if ($installedVersion) {
-        Write-Host "PawnIO $installedVersion predates the pinned $PawnIoVersion; upgrading." -ForegroundColor Yellow
-    } else {
-        Write-Host "PawnIO is installed but its version is unreadable; running the pinned $PawnIoVersion installer." -ForegroundColor Yellow
+function Get-PawnIoVersion {
+    $installed = Get-PawnIoInstall
+    $version = $null
+    if ([version]::TryParse([string]$installed.DisplayVersion, [ref]$version)) {
+        return $version
     }
 }
 
-# Self-elevate: the kernel-driver installer requires administrator rights.
-$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host 'Elevating for the kernel-driver install (UAC prompt)...' -ForegroundColor Cyan
+function Test-PawnIoDriver {
+    $driver = Get-Service -Name PawnIO -ErrorAction SilentlyContinue
+    return ($null -ne $driver -and $driver.Status -eq 'Running')
+}
+
+function Invoke-ElevatedSetup {
+    Write-Information 'Elevating for the kernel-driver install (UAC prompt)...'
     $elevateArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -ElevatedChild' -f $PSCommandPath
     try {
         $elevated = Start-Process powershell -ArgumentList $elevateArgs -Verb RunAs -Wait -PassThru
     } catch {
         # Includes the UAC prompt being declined.
-        Stop-Setup "Elevation failed or was declined: $($_.Exception.Message)"
+        Exit-Setup "Elevation failed or was declined: $($_.Exception.Message)"
     }
     $childCode = $elevated.ExitCode
     if ($null -eq $childCode) { $childCode = 1 }
     switch ($childCode) {
         0 {
-            Write-Host 'PawnIO setup completed.' -ForegroundColor Green
+            Write-Information 'PawnIO setup completed.'
             Write-CollectorInstructions
         }
         $RebootRequiredCode {
-            Write-Host 'PawnIO installed. Restart Windows before collecting CPU telemetry.' -ForegroundColor Yellow
+            Write-Information 'PawnIO installed. Restart Windows before collecting CPU telemetry.'
             Write-CollectorInstructions
         }
         default {
-            Write-Host "Elevated setup did not complete (exit code $childCode)." -ForegroundColor Red
+            Write-Information "Elevated setup did not complete (exit code $childCode)."
         }
     }
     # Propagated intact: a child's 3010 is the success-with-restart code,
     # not a failure (see $RebootRequiredCode above).
-    exit $childCode
+    return $childCode
 }
 
-# Elevated from here on - either self-elevated or already launched as admin.
-$rebootRequired = $false
-
-# Stage under ProgramData in a fresh directory whose DACL is set at creation
-# to SYSTEM and Administrators only (protected, no inherited Users write).
-# The installer must not run elevated from a user-writable path.
-$stagingDir = Join-Path $env:ProgramData ('gaming-telemetry-' + [guid]::NewGuid().ToString('N'))
-try {
+function Invoke-PawnIoInstaller {
+    # Stage under ProgramData in a fresh directory whose DACL is set at creation
+    # to SYSTEM and Administrators only (protected, no inherited Users write).
+    # The installer must not run elevated from a user-writable path.
+    $stagingDir = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) ('gaming-telemetry-' + [guid]::NewGuid().ToString('N'))
     New-AdminOnlyDirectory $stagingDir
-    $installer = Join-Path $stagingDir 'PawnIO_setup.exe'
+    try {
+        $installer = Join-Path $stagingDir 'PawnIO_setup.exe'
 
-    Write-Host "Downloading PawnIO $PawnIoVersion installer..." -ForegroundColor Cyan
-    Invoke-WebRequest -Uri $PawnIoUrl -OutFile $installer -UseBasicParsing
-
-    $hash = (Get-FileHash $installer -Algorithm SHA256).Hash
-    if ($hash -ne $PawnIoSha256) {
-        Stop-Setup "PawnIO installer SHA-256 mismatch (expected $PawnIoSha256, got $hash). Refusing to run it."
-    }
-    $sig = Get-AuthenticodeSignature $installer
-    if ($sig.Status -ne 'Valid') {
-        Write-Warning "PawnIO installer Authenticode status is '$($sig.Status)'; the pinned SHA-256 still matched."
-    }
-
-    Write-Host 'Installing PawnIO (signed kernel driver)...' -ForegroundColor Cyan
-    # PawnIO_setup.exe is a custom installer: -install -silent performs an
-    # unattended install; -uninstall -silent removes it.
-    $proc = Start-Process $installer -ArgumentList '-install','-silent' -Wait -PassThru
-    $procCode = $proc.ExitCode
-    if ($null -eq $procCode) {
-        Stop-Setup 'PawnIO installer ended without an exit code.'
-    } elseif ($procCode -eq $RebootRequiredCode) {
-        $rebootRequired = $true
-        $installed = Get-PawnIoInstall
-        if ($installed) {
-            Write-Host "PawnIO $($installed.DisplayVersion) installed." -ForegroundColor Green
-        } else {
-            Write-Host 'PawnIO installed; its registry entry appears after the pending restart.' -ForegroundColor Yellow
+        Write-Information "Downloading PawnIO $PawnIoVersion installer..."
+        if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
         }
-    } elseif ($procCode -eq $AlreadyInstalledCode) {
-        Write-Host 'PawnIO installer reports a driver is already installed.' -ForegroundColor Yellow
-    } elseif ($procCode -ne 0) {
-        Stop-Setup "PawnIO installer exited with code $procCode" $procCode
+        Invoke-WebRequest -Uri $PawnIoUrl -OutFile $installer -UseBasicParsing
+
+        $hash = (Get-FileHash $installer -Algorithm SHA256).Hash
+        if ($hash -ne $PawnIoSha256) {
+            Exit-Setup "PawnIO installer SHA-256 mismatch (expected $PawnIoSha256, got $hash). Refusing to run it."
+        }
+        $sig = Get-AuthenticodeSignature $installer
+        if ($sig.Status -ne 'Valid') {
+            Write-Warning "PawnIO installer Authenticode status is '$($sig.Status)'; the pinned SHA-256 still matched."
+        }
+
+        Write-Information 'Installing PawnIO (signed kernel driver)...'
+        # PawnIO_setup.exe is a custom installer: -install -silent performs an
+        # unattended install; -uninstall -silent removes it.
+        $proc = Start-Process $installer -ArgumentList '-install','-silent' -Wait -PassThru
+        $procCode = $proc.ExitCode
+        if ($null -eq $procCode) {
+            Exit-Setup 'PawnIO installer ended without an exit code.'
+        }
+        return $procCode
+    } finally {
+        Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
     }
-} catch {
-    Stop-Setup "Setup failed: $($_.Exception.Message)"
-} finally {
-    Remove-Item $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# Confirm the driver registered, and that it is the pinned release.
-# Exit 183 (already installed) is not success if the registry still names a
-# version below $PawnIoVersion: the installer refused the in-place upgrade.
-$installed = Get-PawnIoInstall
-if (-not $installed -and -not $rebootRequired) {
-    Stop-Setup 'PawnIO install finished but no registry entry was found.'
-}
-if ($installed -and -not $rebootRequired) {
-    $installedVersion = $null
-    if ($installed.DisplayVersion) {
-        try { $installedVersion = [version]$installed.DisplayVersion } catch { }
+function Invoke-PawnIoSetup {
+    $installedVersion = Get-PawnIoVersion
+    if ($installedVersion -ge [version]$PawnIoVersion -and (Test-PawnIoDriver)) {
+        Write-Information "PawnIO $installedVersion is already running."
+        Write-CollectorInstructions
+        return 0
     }
+
+    $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        return Invoke-ElevatedSetup
+    }
+
+    $result = Invoke-PawnIoInstaller
+    if ($result -eq $RebootRequiredCode) {
+        Write-Warning 'Restart Windows before collecting CPU telemetry.'
+        Write-CollectorInstructions
+        return $result
+    }
+    if ($result -notin 0, $AlreadyInstalledCode) {
+        Exit-Setup "PawnIO installer exited with code $result" $result
+    }
+    $installedVersion = Get-PawnIoVersion
     if (-not $installedVersion -or $installedVersion -lt [version]$PawnIoVersion) {
-        $shown = if ($installedVersion) { "$installedVersion" } else { 'an unreadable version' }
-        Stop-Setup "PawnIO $shown is still installed; uninstall it, then rerun this script to install $PawnIoVersion."
+        Exit-Setup "PawnIO $PawnIoVersion or newer did not register. Check the installed version before retrying."
     }
-    Write-Host "PawnIO $($installed.DisplayVersion) installed." -ForegroundColor Green
-}
-
-if ($rebootRequired) {
-    Write-Host ''
-    Write-Host 'Restart Windows before collecting CPU telemetry - the PawnIO' -ForegroundColor Yellow
-    Write-Host 'driver only activates after a restart.' -ForegroundColor Yellow
+    if (-not (Test-PawnIoDriver)) {
+        Exit-Setup 'The PawnIO driver is not running. Restart Windows and check the driver before collecting.'
+    }
+    Write-Information "PawnIO $installedVersion is running."
     Write-CollectorInstructions
-    # Deliberate: 3010 is the standard success-with-restart-required code
-    # ($RebootRequiredCode above), so a caller can distinguish it from a
-    # ready-now success. It is not a failure.
-    exit $RebootRequiredCode
+    return 0
 }
 
-Write-CollectorInstructions
-exit 0
+try {
+    exit (Invoke-PawnIoSetup)
+} catch {
+    Exit-Setup "Setup failed: $($_.Exception.Message)"
+}

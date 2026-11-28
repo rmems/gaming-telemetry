@@ -68,8 +68,11 @@ jobs:
           $message = Get-Content -Raw -LiteralPath $stderr
           $expected = switch ($process.ExitCode) {
             3 { 'administrator rights are required' }
-            4 { 'the PawnIO driver is not installed' }
+            4 { 'gaming-telemetry-cpu-sidecar: the PawnIO driver is not installed' }
             default { throw "Unexpected sidecar exit $($process.ExitCode): $message" }
+          }
+          if ([string]::IsNullOrWhiteSpace($message)) {
+            throw "Packaged sidecar exited $($process.ExitCode) with empty stderr"
           }
           if ($message -notmatch [regex]::Escape($expected)) {
             throw "Missing sidecar startup diagnostic '$expected': $message"

@@ -203,6 +203,17 @@ function Invoke-PawnIoInstaller {
     }
 }
 
+function Assert-PawnIoReady {
+    $installedVersion = Get-PawnIoVersion
+    if (-not $installedVersion -or $installedVersion -lt [version]$PawnIoVersion) {
+        Exit-Setup "PawnIO $PawnIoVersion or newer did not register. Check the installed version before retrying."
+    }
+    if (-not (Test-PawnIoDriver)) {
+        Exit-Setup 'The PawnIO driver is not running. Restart Windows and check the driver before collecting.'
+    }
+    Write-Information "PawnIO $installedVersion is running."
+}
+
 function Invoke-PawnIoSetup {
     $installedVersion = Get-PawnIoVersion
     if ($installedVersion -ge [version]$PawnIoVersion -and (Test-PawnIoDriver)) {
@@ -225,14 +236,7 @@ function Invoke-PawnIoSetup {
     if ($result -notin 0, $AlreadyInstalledCode) {
         Exit-Setup "PawnIO installer exited with code $result" $result
     }
-    $installedVersion = Get-PawnIoVersion
-    if (-not $installedVersion -or $installedVersion -lt [version]$PawnIoVersion) {
-        Exit-Setup "PawnIO $PawnIoVersion or newer did not register. Check the installed version before retrying."
-    }
-    if (-not (Test-PawnIoDriver)) {
-        Exit-Setup 'The PawnIO driver is not running. Restart Windows and check the driver before collecting.'
-    }
-    Write-Information "PawnIO $installedVersion is running."
+    Assert-PawnIoReady
     Write-CollectorInstructions
     return 0
 }

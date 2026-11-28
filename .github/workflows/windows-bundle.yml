@@ -45,3 +45,29 @@ jobs:
             'scripts/install-windows-deps.ps1'
           )
           Compress-Archive -LiteralPath $files -DestinationPath $env:BUNDLE_ZIP
+      - name: Smoke-test extracted bundle on the driverless runner
+        shell: pwsh
+        run: |
+          $unpacked = Join-Path $env:RUNNER_TEMP 'capture bundle'
+          Expand-Archive -LiteralPath $env:BUNDLE_ZIP -DestinationPath $unpacked
+          foreach ($name in 'gaming-telemetry.exe', 'gaming-telemetry-cpu-sidecar.exe', 'install-windows-deps.ps1') {
+            if (-not (Test-Path -LiteralPath (Join-Path $unpacked $name) -PathType Leaf)) {
+              throw "Bundle is missing $name at its root"
+            }
+          }
+          $stderr = Join-Path $env:RUNNER_TEMP 'bundle-sidecar.stderr'
+          $sidecar = Join-Path $unpacked 'gaming-telemetry-cpu-sidecar.exe'
+          $process = Start-Process -FilePath $sidecar -WorkingDirectory $unpacked -PassThru -NoNewWindow -RedirectStandardError $stderr
+          if (-not $process.WaitForExit(30000)) {
+            $process.Kill()
+            throw 'Packaged sidecar timed out on the driverless runner'
+          }
+          $message = Get-Content -Raw -LiteralPath $stderr
+          $expected = switch ($process.ExitCode) {
+            3 { 'administrator rights are required' }
+            4 { 'the PawnIO driver is not installed' }
+            default { throw "Unexpected sidecar exit $($process.ExitCode): $message" }
+          }
+          if ($message -notmatch [regex]::Escape($expected)) {
+            throw "Missing sidecar startup diagnostic '$expected': $message"
+          }

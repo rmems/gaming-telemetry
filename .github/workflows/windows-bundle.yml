@@ -27,6 +27,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.98.0"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.7.3
         with:
           shared-key: windows-capture-bundle
@@ -65,8 +68,11 @@ jobs:
           $message = Get-Content -Raw -LiteralPath $stderr
           $expected = switch ($process.ExitCode) {
             3 { 'administrator rights are required' }
-            4 { 'the PawnIO driver is not installed' }
+            4 { 'gaming-telemetry-cpu-sidecar: the PawnIO driver is not installed' }
             default { throw "Unexpected sidecar exit $($process.ExitCode): $message" }
+          }
+          if ([string]::IsNullOrWhiteSpace($message)) {
+            throw "Packaged sidecar exited $($process.ExitCode) with empty stderr"
           }
           if ($message -notmatch [regex]::Escape($expected)) {
             throw "Missing sidecar startup diagnostic '$expected': $message"

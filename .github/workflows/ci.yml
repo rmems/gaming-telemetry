@@ -291,7 +291,7 @@ jobs:
       - name: Upload coverage to Qlty
         # Fork PRs get no OIDC token; pushes to main still upload.
         if: ${{ !github.event.pull_request.head.repo.fork }}
-        uses: qltysh/qlty-action/coverage@10ccbe4bf74e9f71f24c9266a87f34265011ac1f # v2.7.0
+        uses: qltysh/qlty-action/coverage@0ff2178667bf8eb28ed0013a7ef54857a24d4056 # v2.7.0
         with:
           oidc: true
           files: lcov.info

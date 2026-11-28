@@ -132,7 +132,10 @@ jobs:
         run: |
           $probe = @{ driver = 'Running'; attemptedSetup = $false }
           function Get-ItemProperty { [pscustomobject]@{ DisplayName = 'PawnIO'; DisplayVersion = '2.2.0.0' } }
-          function Get-Service { [pscustomobject]@{ Status = $probe.driver } }
+          function Get-Service {
+            param([string]$Name)
+            if ($Name -eq 'PawnIO') { [pscustomobject]@{ Status = $probe.driver } }
+          }
           function Start-Process { $probe.attemptedSetup = $true; throw 'Unexpected process launch' }
           function Invoke-WebRequest { $probe.attemptedSetup = $true; throw 'Unexpected download' }
 

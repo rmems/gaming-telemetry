@@ -233,10 +233,10 @@ jobs:
           files: lcov.info
           fail_ci_if_error: false
           verbose: true
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: 8.0.x
       - name: Publish CPU sidecar (.NET)
-        # The runner image carries the .NET 8 SDK the sidecar targets; this
-        # proves the helper still restores and publishes on every PR, since
-        # the Rust spawn test exercises the pipe plumbing with cmd.exe only.
         run: dotnet publish sidecar/GamingTelemetry.CpuSidecar.csproj -c Release -o sidecar/publish
       - name: Sidecar unelevated smoke test
         # Exit 3 when the runner's token is unelevated, 4 when elevated but

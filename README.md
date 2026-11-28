@@ -382,12 +382,19 @@ Probe order:
    sidecar and PawnIO setup script come from the same commit. The capture PC needs
    neither Rust nor the .NET SDK.
 
-   Install PawnIO once with the included `install-windows-deps.ps1` and reboot if
-   prompted. From an elevated PowerShell in the extracted directory, start a session:
+   From the extracted directory, run the one-time PawnIO setup and approve the
+   administrator prompt if it appears:
+
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File .\install-windows-deps.ps1
+   ```
+
+   Restart Windows if requested. From an elevated PowerShell in the extracted
+   directory, start a fresh session:
 
    ```powershell
    $env:SESSION_LABEL = "my-session"
-   $env:SESSION_DIR = Join-Path $env:USERPROFILE ("telemetry-" + (Get-Date -Format yyyyMMdd-HHmmss))
+   $env:SESSION_DIR = Join-Path $env:USERPROFILE ("telemetry-" + [guid]::NewGuid().ToString('N'))
    .\gaming-telemetry.exe
    ```
 

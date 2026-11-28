@@ -375,7 +375,23 @@ Probe order:
      unattended), and
    - an **elevated** collector; the sidecar inherits the collector's token.
 
-   Build it once with the .NET 8 SDK (`sidecar/`):
+   **Windows x64 download.** Open a successful `main` run of the
+   [Windows capture bundle workflow](https://github.com/rmems/gaming-telemetry/actions/workflows/windows-bundle.yml?query=branch%3Amain).
+   Under **Artifacts**, download `gaming-telemetry-windows-x64-<commit>.zip`.
+   Extract it to an administrator-controlled directory. The collector, self-contained
+   sidecar and PawnIO setup script come from the same commit. The capture PC needs
+   neither Rust nor the .NET SDK.
+
+   Install PawnIO once with the included `install-windows-deps.ps1` and reboot if
+   prompted. From an elevated PowerShell in the extracted directory, start a session:
+
+   ```powershell
+   $env:SESSION_LABEL = "my-session"
+   $env:SESSION_DIR = Join-Path $env:USERPROFILE ("telemetry-" + (Get-Date -Format yyyyMMdd-HHmmss))
+   .\gaming-telemetry.exe
+   ```
+
+   **Building from source.** Publish the sidecar with the .NET 8 SDK:
 
    ```powershell
    dotnet publish sidecar/GamingTelemetry.CpuSidecar.csproj -c Release -o sidecar/publish

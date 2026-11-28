@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Successful Windows bundle builds on main publish a commit-named ZIP containing the
+  collector, self-contained CPU sidecar, and PawnIO setup script.
+
 - **Bundled LibreHardwareMonitor sidecar for Windows CPU telemetry.**
   `gaming-telemetry-cpu-sidecar` (C# helper under `sidecar/`, built on
   `LibreHardwareMonitorLib` 0.9.6 with the signed PawnIO driver) is spawned

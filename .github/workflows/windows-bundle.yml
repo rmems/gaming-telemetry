@@ -9,6 +9,7 @@ on:
       - Cargo.toml
       - Cargo.lock
       - rust-toolchain.toml
+      - global.json
       - build.rs
       - src/**
       - sidecar/**
@@ -37,6 +38,9 @@ jobs:
         run: cargo build --locked --release --bin gaming-telemetry
         env:
           AGENTOS_GIT_SHA: ${{ github.sha }}
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: 8.0.x
       - name: Publish self-contained sidecar
         run: dotnet publish sidecar/GamingTelemetry.CpuSidecar.csproj -c Release -o sidecar/publish
       - name: Package Windows capture tools

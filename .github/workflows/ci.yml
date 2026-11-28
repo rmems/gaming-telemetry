@@ -131,6 +131,24 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check compatible PawnIO driver readiness
+        shell: pwsh
+        run: |
+          $probe = @{ driver = 'Running'; attemptedSetup = $false }
+          function Get-ItemProperty { [pscustomobject]@{ DisplayName = 'PawnIO'; DisplayVersion = '2.2.0.0' } }
+          function Get-Service { [pscustomobject]@{ Status = $probe.driver } }
+          function Start-Process { $probe.attemptedSetup = $true; throw 'Unexpected process launch' }
+          function Invoke-WebRequest { $probe.attemptedSetup = $true; throw 'Unexpected download' }
+
+          & ./scripts/install-windows-deps.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'Compatible running driver failed setup' }
+          $probe.driver = 'Stopped'
+          $messages = & ./scripts/install-windows-deps.ps1 2>&1
+          if ($LASTEXITCODE -ne 1 -or ($messages -join ' ') -notmatch 'driver is not running') {
+            throw "Missing stopped-driver diagnostic: $messages"
+          }
+          if ($probe.attemptedSetup) { throw 'Setup attempted to reinstall a compatible driver' }
+          exit 0
       - name: Check installer staging in PowerShell 7
         shell: pwsh
         run: |

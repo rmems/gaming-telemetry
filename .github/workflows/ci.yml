@@ -127,6 +127,30 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check installer staging in PowerShell 7
+        shell: pwsh
+        run: |
+          # Exercise the real setup path on the hosted admin runner. Stop at
+          # the download boundary, before any network access or driver change.
+          $probe = @{ checked = $false; directory = $null }
+          function Get-ItemProperty { } # Simulate a clean install.
+          function Start-Process { throw 'Unexpected process launch during staging test' }
+          function Invoke-WebRequest {
+            param($Uri, $OutFile, [switch]$UseBasicParsing)
+            $probe.directory = Split-Path -Parent $OutFile
+            $acl = Get-Acl -LiteralPath $probe.directory
+            $rules = $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+            $actual = @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object)
+            if (-not $acl.AreAccessRulesProtected -or ($actual -join ',') -ne 'S-1-5-18,S-1-5-32-544') {
+              throw "Unexpected staging permissions: $($acl.Sddl)"
+            }
+            $probe.checked = $true
+            throw 'Intentional stop after staging inspection'
+          }
+          & ./scripts/install-windows-deps.ps1
+          if ($LASTEXITCODE -ne 1 -or -not $probe.checked) { throw 'Staging inspection did not complete' }
+          if (Test-Path -LiteralPath $probe.directory) { throw 'Setup did not clean up its staging directory' }
+          exit 0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: clippy, llvm-tools-preview

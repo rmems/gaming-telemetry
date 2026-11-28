@@ -69,8 +69,10 @@ jobs:
                       inputs = step.get("with", {})
                       if "toolchain" in inputs:
                           pins.append((f"{filename}/{job}", str(inputs["toolchain"])))
-          if not pins:
-              sys.exit("::error::no toolchain pins found; the guard would pass vacuously")
+          if not any(job == "windows-bundle.yml/bundle" for job, _ in pins):
+              sys.exit("::error::Windows capture bundle is missing its Rust toolchain pin")
+          if not any(job.startswith("ci.yml/") for job, _ in pins):
+              sys.exit("::error::CI workflow is missing its Rust toolchain pins")
 
           print(f"checked {len(pins)} job pin(s)")
           drifted = [(job, pin) for job, pin in pins if pin != declared]

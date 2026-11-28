@@ -1,0 +1,54 @@
+name: Windows capture bundle
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - .github/workflows/windows-bundle.yml
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - global.json
+      - build.rs
+      - src/**
+      - sidecar/**
+      - scripts/install-windows-deps.ps1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: windows-latest
+    env:
+      BUNDLE_ZIP: gaming-telemetry-windows-x64-${{ github.sha }}.zip
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.7.3
+        with:
+          shared-key: windows-capture-bundle
+      - name: Build release collector
+        run: cargo build --locked --release --bin gaming-telemetry
+        env:
+          AGENTOS_GIT_SHA: ${{ github.sha }}
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: 8.0.x
+      - name: Publish self-contained sidecar
+        run: dotnet publish sidecar/GamingTelemetry.CpuSidecar.csproj -c Release -o sidecar/publish
+      - name: Package Windows capture tools
+        shell: pwsh
+        run: |
+          $files = @(
+            'target/release/gaming-telemetry.exe'
+            'sidecar/publish/gaming-telemetry-cpu-sidecar.exe'
+            'scripts/install-windows-deps.ps1'
+          )
+          Compress-Archive -LiteralPath $files -DestinationPath $env:BUNDLE_ZIP

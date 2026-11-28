@@ -67,7 +67,12 @@ function Write-CollectorInstructions {
     Write-Information 'inherits admin rights (the PawnIO driver only serves elevated processes):'
     Write-Information ''
     Write-Information '  $env:SESSION_LABEL = "my-session"'
-    Write-Information '  .\target\release\gaming-telemetry.exe'
+    if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'gaming-telemetry.exe') -PathType Leaf) {
+        Write-Information '  # From the extracted bundle directory:'
+        Write-Information '  .\gaming-telemetry.exe'
+    } else {
+        Write-Information '  .\target\release\gaming-telemetry.exe'
+    }
 }
 
 function Exit-Setup {

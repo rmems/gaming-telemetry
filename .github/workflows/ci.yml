@@ -60,15 +60,19 @@ jobs:
                   f"rust-toolchain.toml {pinned}, .agents/setup {setup}"
               )
 
-          workflow = yaml.safe_load(open(".github/workflows/ci.yml", encoding="utf-8"))
-          pins = [
-              (job, str(step["with"]["toolchain"]))
-              for job, body in (workflow.get("jobs") or {}).items()
-              for step in (body.get("steps") or [])
-              if isinstance(step.get("with"), dict) and "toolchain" in step["with"]
-          ]
-          if not pins:
-              sys.exit("::error::no toolchain pins found; the guard would pass vacuously")
+          pins = []
+          for filename in ("ci.yml", "windows-bundle.yml"):
+              with open(f".github/workflows/{filename}", encoding="utf-8") as source:
+                  workflow = yaml.safe_load(source)
+              for job, body in workflow["jobs"].items():
+                  for step in body.get("steps", []):
+                      inputs = step.get("with", {})
+                      if "toolchain" in inputs:
+                          pins.append((f"{filename}/{job}", str(inputs["toolchain"])))
+          if not any(job == "windows-bundle.yml/bundle" for job, _ in pins):
+              sys.exit("::error::Windows capture bundle is missing its Rust toolchain pin")
+          if not any(job.startswith("ci.yml/") for job, _ in pins):
+              sys.exit("::error::CI workflow is missing its Rust toolchain pins")
 
           print(f"checked {len(pins)} job pin(s)")
           drifted = [(job, pin) for job, pin in pins if pin != declared]
@@ -232,10 +236,10 @@ jobs:
           files: lcov.info
           fail_ci_if_error: false
           verbose: true
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
+        with:
+          dotnet-version: 8.0.x
       - name: Publish CPU sidecar (.NET)
-        # The runner image carries the .NET 8 SDK the sidecar targets; this
-        # proves the helper still restores and publishes on every PR, since
-        # the Rust spawn test exercises the pipe plumbing with cmd.exe only.
         run: dotnet publish sidecar/GamingTelemetry.CpuSidecar.csproj -c Release -o sidecar/publish
       - name: Sidecar unelevated smoke test
         # Exit 3 when the runner's token is unelevated, 4 when elevated but
